@@ -66,3 +66,16 @@ You can also use the Actions page to run the workflow manually:
 
 - build any branch, commit, or tag with `workflow_dispatch`
 - optionally publish the produced assets to an existing tag by filling `release_tag`
+
+## macOS signing
+
+The workflow now always performs ad-hoc macOS signing so downloaded builds are not emitted as malformed app bundles.
+
+If you want macOS downloads to open without the manual Privacy & Security bypass, add Apple Developer signing and notarization secrets:
+
+- `APPLE_CERTIFICATE`
+- `APPLE_CERTIFICATE_PASSWORD`
+- `KEYCHAIN_PASSWORD`
+- plus either:
+  - `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
+  - or `APPLE_API_ISSUER`, `APPLE_API_KEY`

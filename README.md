@@ -55,9 +55,14 @@ npm run tauri:build:win:arm64
 
 The repository includes a GitHub Actions workflow that:
 
-- builds Windows x64 and ARM64 installers
-- builds macOS Apple Silicon bundles
+- builds the Windows x64 installer
+- builds the macOS Apple Silicon dmg
 - uploads artifacts
 - publishes a GitHub Release automatically when a tag is pushed
 
 Trigger a release by pushing a tag such as `v0.1.0`.
+
+You can also use the Actions page to run the workflow manually:
+
+- build any branch, commit, or tag with `workflow_dispatch`
+- optionally publish the produced assets to an existing tag by filling `release_tag`

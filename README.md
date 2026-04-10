@@ -79,3 +79,7 @@ If you want macOS downloads to open without the manual Privacy & Security bypass
 - plus either:
   - `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
   - or `APPLE_API_ISSUER`, `APPLE_API_KEY`
+
+Tagged releases and manual runs with `publish_release=true` now require valid Apple Developer signing and notarization secrets.
+If those secrets are missing, the macOS release job fails instead of publishing a DMG that Gatekeeper will block.
+Manual non-release builds still fall back to ad-hoc signing for local testing.

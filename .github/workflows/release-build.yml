@@ -34,6 +34,7 @@ concurrency:
 
 env:
   BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || github.ref }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-windows:
@@ -69,7 +70,7 @@ jobs:
         run: npm run tauri:build:win:x64
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-x64-installers
           path: |
@@ -110,7 +111,7 @@ jobs:
         run: npm run tauri:build:mac:arm64
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-dmg
           path: |
@@ -134,13 +135,13 @@ jobs:
           fi
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: windows-x64-installers
           path: release-assets
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: macos-dmg
           path: release-assets

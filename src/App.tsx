@@ -1109,15 +1109,13 @@ function App() {
                     >
                       根目录
                     </button>
-                    {activeModule === 'download' ? (
-                      <button
-                        className="secondary-button"
-                        disabled={!browser}
-                        onClick={() => void pickAndDownloadFolder()}
-                      >
-                        下载目录
-                      </button>
-                    ) : null}
+                    <button
+                      className="secondary-button"
+                      disabled={!browser}
+                      onClick={() => void pickAndDownloadFolder()}
+                    >
+                      下载当前文件夹
+                    </button>
                   </div>
                 </div>
 

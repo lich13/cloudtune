@@ -83,6 +83,9 @@ jobs:
     runs-on: macos-latest
     env:
       APPLE_SIGNING_IDENTITY: "-"
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -116,11 +119,7 @@ jobs:
         run: npm ci
 
       - name: Import Apple Developer certificate
-        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' }}
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        if: ${{ env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' }}
         shell: bash
         run: |
           echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
@@ -133,7 +132,7 @@ jobs:
           security find-identity -v -p codesigning build.keychain
 
       - name: Resolve signing identity
-        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' }}
+        if: ${{ env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' }}
         shell: bash
         run: |
           CERT_ID=$(security find-identity -v -p codesigning build.keychain | grep -E 'Developer ID Application|Apple Development|Apple Distribution' | head -n 1 | awk -F'"' '{print $2}')
@@ -144,10 +143,10 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
 
       - name: Write App Store Connect API key
-        if: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_ISSUER != '' }}
+        if: ${{ env.APPLE_API_KEY != '' && env.APPLE_API_ISSUER != '' }}
         shell: bash
         run: |
-          printf '%s' '${{ secrets.APPLE_API_KEY }}' > "$APPLE_API_KEY_PATH"
+          printf '%s' "$APPLE_API_KEY" > "$APPLE_API_KEY_PATH"
 
       - name: Build macOS ARM64 package
         run: npm run tauri:build:mac:arm64

@@ -17,6 +17,8 @@ const ROOT_BREADCRUMB = { id: null as string | null, name: '我的云盘' }
 type ModuleView = 'music' | 'video' | 'download'
 const ACCOUNT_NAME_STORAGE_KEY = 'cloudtune.accountName'
 const AUTHENTICATED_STORAGE_KEY = 'cloudtune.authenticated'
+const MAX_DOWNLOAD_THREADS = 16
+const MAX_CACHE_THREADS = 8
 
 function readStoredString(key: string) {
   if (typeof window === 'undefined') {
@@ -41,7 +43,9 @@ function writeStoredString(key: string, value: string | null) {
     } else {
       window.localStorage.setItem(key, value)
     }
-  } catch {}
+  } catch {
+    // Ignore storage write failures in restricted browser contexts.
+  }
 }
 
 function formatBytes(value: number) {
@@ -499,12 +503,12 @@ function App() {
   async function saveTransferTuning() {
     const downloadThreads = Number(downloadThreadsInput)
     const cacheThreads = Number(cacheThreadsInput)
-    if (!Number.isFinite(downloadThreads) || downloadThreads < 1 || downloadThreads > 64) {
-      setStatusMessage('下载线程范围是 1-64')
+    if (!Number.isFinite(downloadThreads) || downloadThreads < 1 || downloadThreads > MAX_DOWNLOAD_THREADS) {
+      setStatusMessage(`下载线程范围是 1-${MAX_DOWNLOAD_THREADS}`)
       return
     }
-    if (!Number.isFinite(cacheThreads) || cacheThreads < 1 || cacheThreads > 64) {
-      setStatusMessage('缓存线程范围是 1-64')
+    if (!Number.isFinite(cacheThreads) || cacheThreads < 1 || cacheThreads > MAX_CACHE_THREADS) {
+      setStatusMessage(`缓存线程范围是 1-${MAX_CACHE_THREADS}`)
       return
     }
 
@@ -726,7 +730,9 @@ function App() {
         }
         audio.currentTime = Math.min(audio.duration || audio.currentTime + 15, audio.currentTime + 15)
       })
-    } catch {}
+    } catch {
+      // Some browsers expose Media Session partially and reject unsupported handlers.
+    }
 
     if ('setPositionState' in navigator.mediaSession && duration > 0) {
       try {
@@ -735,7 +741,9 @@ function App() {
           playbackRate: audio.playbackRate || 1,
           position: Math.min(currentTime, duration),
         })
-      } catch {}
+      } catch {
+        // Position state updates are best-effort only.
+      }
     }
   }, [
     accountName,
@@ -973,7 +981,7 @@ function App() {
                   aria-label="下载线程"
                   type="number"
                   min="1"
-                  max="64"
+                  max={String(MAX_DOWNLOAD_THREADS)}
                   step="1"
                   value={downloadThreadsInput}
                   onChange={(event) => setDownloadThreadsInput(event.target.value)}
@@ -982,7 +990,7 @@ function App() {
                   aria-label="缓存线程"
                   type="number"
                   min="1"
-                  max="64"
+                  max={String(MAX_CACHE_THREADS)}
                   step="1"
                   value={cacheThreadsInput}
                   onChange={(event) => setCacheThreadsInput(event.target.value)}

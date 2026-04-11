@@ -51,6 +51,12 @@ npm run tauri:build:win:x64
 npm run tauri:build:win:arm64
 ```
 
+`npm run tauri:build:mac:arm64` now builds the `.app` first and then repacks a custom DMG that contains:
+
+- `CloudTune.app`
+- an `Applications` shortcut
+- `Fix CloudTune.command`, a one-click macOS permission repair helper for ad-hoc signed releases
+
 ## Release Workflow
 
 The repository includes a GitHub Actions workflow that:
@@ -82,4 +88,4 @@ If you want macOS downloads to open without the manual Privacy & Security bypass
 
 Tagged releases and manual runs with `publish_release=true` now require valid Apple Developer signing and notarization secrets.
 If those secrets are missing, the workflow falls back to ad-hoc signing and still publishes the DMG.
-That fallback avoids broken app bundles, but users will still need to manually bypass Gatekeeper on downloaded builds.
+That fallback avoids broken app bundles, and the DMG now includes `Fix CloudTune.command` to strip the quarantine attribute and install the app into `/Applications`. Fully unsigned ad-hoc builds can still require one manual allow in Privacy & Security on newer macOS versions.

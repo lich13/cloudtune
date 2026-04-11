@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_DOWNLOAD_THREADS: u16 = 8;
+pub const DEFAULT_CACHE_THREADS: u16 = 4;
+pub const MAX_DOWNLOAD_THREADS: u16 = 16;
+pub const MAX_CACHE_THREADS: u16 = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredConfig {
@@ -21,14 +26,19 @@ impl Default for StoredConfig {
             music_folder_id: None,
             music_folder_name: None,
             cache_limit_mb: 1024,
-            download_threads: 32,
-            cache_threads: 16,
+            download_threads: DEFAULT_DOWNLOAD_THREADS,
+            cache_threads: DEFAULT_CACHE_THREADS,
             playback_mode: "download_first".to_string(),
         }
     }
 }
 
 impl StoredConfig {
+    pub fn normalize_transfer_tuning(&mut self) {
+        self.download_threads = self.download_threads.clamp(1, MAX_DOWNLOAD_THREADS);
+        self.cache_threads = self.cache_threads.clamp(1, MAX_CACHE_THREADS);
+    }
+
     pub fn current_folder(&self) -> Option<FolderSelection> {
         match (&self.music_folder_id, &self.music_folder_name) {
             (Some(id), Some(name)) => Some(FolderSelection {

@@ -12,8 +12,9 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --target aarch64-apple-darwin",
-    "tauri:build:mac:arm64": "tauri build --target aarch64-apple-darwin",
+    "tauri:build": "bash ./scripts/build-mac-dmg-with-fix.sh aarch64-apple-darwin",
+    "tauri:build:mac:arm64": "bash ./scripts/build-mac-dmg-with-fix.sh aarch64-apple-darwin",
+    "tauri:build:mac:arm64:app": "npm exec tauri build -- --target aarch64-apple-darwin --bundles app",
     "tauri:build:win:x64": "tauri build --target x86_64-pc-windows-msvc",
     "tauri:build:win:arm64": "tauri build --target aarch64-pc-windows-msvc"
   },

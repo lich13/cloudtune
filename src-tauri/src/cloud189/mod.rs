@@ -40,7 +40,8 @@ const RETURN_URL: &str = "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index
 const PC_CLIENT: &str = "TELEPC";
 const VERSION: &str = "6.2";
 const CHANNEL_ID: &str = "web_cloud.189.cn";
-const CLOUDTUNE_USER_AGENT: &str = "CloudTune/0.1.0";
+pub const CLOUDTUNE_USER_AGENT: &str = "CloudTune/0.1.0";
+pub const CLOUD189_REFERER: &str = "https://cloud.189.cn/";
 const MIN_PARALLEL_DOWNLOAD_SIZE: u64 = 512 * 1024;
 const MAX_PARALLEL_DOWNLOADS: usize = 32;
 
@@ -189,7 +190,7 @@ impl Cloud189Client {
             ACCEPT,
             HeaderValue::from_static("application/json;charset=UTF-8"),
         );
-        default_headers.insert(REFERER, HeaderValue::from_static("https://cloud.189.cn/"));
+        default_headers.insert(REFERER, HeaderValue::from_static(CLOUD189_REFERER));
 
         let client = Client::builder()
             .cookie_store(true)
@@ -720,6 +721,7 @@ impl Cloud189Client {
         let head_result = self
             .client
             .head(url)
+            .header(ACCEPT, "*/*")
             .header("User-Agent", CLOUDTUNE_USER_AGENT)
             .send()
             .await;
@@ -746,6 +748,7 @@ impl Cloud189Client {
         let response = self
             .client
             .get(url)
+            .header(ACCEPT, "*/*")
             .header("User-Agent", CLOUDTUNE_USER_AGENT)
             .header(RANGE, "bytes=0-0")
             .send()
@@ -770,6 +773,7 @@ impl Cloud189Client {
         let mut response = self
             .client
             .get(url)
+            .header(ACCEPT, "*/*")
             .header("User-Agent", CLOUDTUNE_USER_AGENT)
             .send()
             .await?
@@ -1101,6 +1105,7 @@ async fn download_range_part(
 ) -> Result<()> {
     let mut response = client
         .get(&url)
+        .header(ACCEPT, "*/*")
         .header("User-Agent", CLOUDTUNE_USER_AGENT)
         .header(RANGE, format!("bytes={start}-{end}"))
         .send()
@@ -1144,6 +1149,19 @@ fn is_video_file(name: &str) -> bool {
     ]
     .iter()
     .any(|extension| lowered.ends_with(extension))
+}
+
+pub fn build_media_client() -> Result<Client> {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    default_headers.insert(REFERER, HeaderValue::from_static(CLOUD189_REFERER));
+
+    Ok(Client::builder()
+        .cookie_store(true)
+        .default_headers(default_headers)
+        .no_proxy()
+        .user_agent(CLOUDTUNE_USER_AGENT)
+        .build()?)
 }
 
 #[cfg(test)]

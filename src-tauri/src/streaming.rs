@@ -19,11 +19,11 @@ use tauri::{AppHandle, Manager};
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{models::TransferStatus, state::AppState};
+use crate::{cloud189::build_media_client, models::TransferStatus, state::AppState};
 
 pub type StreamSourceStore = Arc<Mutex<HashMap<String, StreamSource>>>;
 pub type TransferStore = Arc<Mutex<HashMap<String, TransferStatus>>>;
@@ -43,12 +43,14 @@ struct StreamServerState {
     client: Client,
     sources: StreamSourceStore,
     transfers: TransferStore,
+    remote_request_slots: Arc<Semaphore>,
 }
 
 pub fn start_stream_server(
     app_handle: AppHandle,
     sources: StreamSourceStore,
     transfers: TransferStore,
+    remote_request_slots: Arc<Semaphore>,
 ) -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -56,12 +58,10 @@ pub fn start_stream_server(
 
     let state = StreamServerState {
         app_handle,
-        client: Client::builder()
-            .no_proxy()
-            .user_agent("CloudTune/0.1.0")
-            .build()?,
+        client: build_media_client()?,
         sources,
         transfers,
+        remote_request_slots,
     };
 
     std::thread::spawn(move || {
@@ -96,7 +96,7 @@ async fn handle_stream(
         sources.get(&track_id).cloned()
     };
 
-    let Some(source) = source else {
+    let Some(mut source) = source else {
         return (StatusCode::NOT_FOUND, "stream source not found").into_response();
     };
 
@@ -105,21 +105,54 @@ async fn handle_stream(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let mut request = state.client.get(&source.playback_url);
-    if let Some(range) = &range_header {
-        request = request.header(REQWEST_RANGE, range.clone());
-    }
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
+    let request_slot = match state.remote_request_slots.clone().acquire_owned().await {
+        Ok(slot) => slot,
+        Err(_) => {
             return (
-                StatusCode::BAD_GATEWAY,
-                format!("failed to fetch remote media: {error}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream request queue is unavailable",
             )
                 .into_response();
         }
     };
+
+    let mut response =
+        match send_stream_request(&state.client, &source.playback_url, range_header.as_deref())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to fetch remote media: {error}"),
+                )
+                    .into_response();
+            }
+        };
+
+    if should_refresh_playback_url(response.status()) {
+        if let Some(refreshed_source) =
+            refresh_stream_source(&state.app_handle, &state.sources, &track_id).await
+        {
+            source = refreshed_source;
+            response = match send_stream_request(
+                &state.client,
+                &source.playback_url,
+                range_header.as_deref(),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("failed to refresh remote media: {error}"),
+                    )
+                        .into_response();
+                }
+            };
+        }
+    }
 
     let status = response.status();
     if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
@@ -158,6 +191,7 @@ async fn handle_stream(
         response,
         tx,
         can_cache,
+        request_slot,
     ));
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -179,28 +213,72 @@ async fn handle_stream_head(
         sources.get(&track_id).cloned()
     };
 
-    let Some(source) = source else {
+    let Some(mut source) = source else {
         return (StatusCode::NOT_FOUND, "stream source not found").into_response();
     };
 
-    let response = match state.client.head(&source.playback_url).send().await {
-        Ok(response) => response,
-        Err(error) => {
+    let request_slot = match state.remote_request_slots.clone().acquire_owned().await {
+        Ok(slot) => slot,
+        Err(_) => {
             return (
-                StatusCode::BAD_GATEWAY,
-                format!("failed to probe remote media: {error}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream request queue is unavailable",
             )
                 .into_response();
         }
     };
+
+    let mut response =
+        match send_stream_request(&state.client, &source.playback_url, Some("bytes=0-0")).await {
+            Ok(response) => response,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to probe remote media: {error}"),
+                )
+                    .into_response();
+            }
+        };
+    drop(request_slot);
+
+    if should_refresh_playback_url(response.status()) {
+        if let Some(refreshed_source) =
+            refresh_stream_source(&state.app_handle, &state.sources, &track_id).await
+        {
+            source = refreshed_source;
+            response =
+                match send_stream_request(&state.client, &source.playback_url, Some("bytes=0-0"))
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("failed to refresh remote media probe: {error}"),
+                        )
+                            .into_response();
+                    }
+                };
+        }
+    }
 
     let mut headers = HeaderMap::new();
     let content_type = guess_content_type(&source.label)
         .or_else(|| response.headers().get(CONTENT_TYPE).cloned())
         .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
     headers.insert(CONTENT_TYPE, content_type);
-    if let Some(value) = response.headers().get(CONTENT_LENGTH).cloned() {
-        headers.insert(CONTENT_LENGTH, value);
+    let total_length = total_size_from_content_range(response.headers().get(CONTENT_RANGE))
+        .or_else(|| {
+            header_to_u64(response.headers().get(CONTENT_LENGTH)).or(if source.expected_size > 0 {
+                Some(source.expected_size)
+            } else {
+                None
+            })
+        });
+    if let Some(total_length) = total_length {
+        if let Ok(value) = HeaderValue::from_str(&total_length.to_string()) {
+            headers.insert(CONTENT_LENGTH, value);
+        }
     }
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
@@ -221,6 +299,7 @@ async fn stream_and_cache_task(
     mut response: reqwest::Response,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     can_cache: bool,
+    _request_slot: OwnedSemaphorePermit,
 ) {
     let expected_total =
         header_to_u64(response.headers().get(CONTENT_LENGTH)).or(if source.expected_size > 0 {
@@ -262,40 +341,49 @@ async fn stream_and_cache_task(
     .await;
 
     let mut finished_without_error = true;
-    while let Some(chunk) = response.chunk().await.unwrap_or(None) {
-        transferred = transferred.saturating_add(chunk.len() as u64);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                transferred = transferred.saturating_add(chunk.len() as u64);
 
-        if let Some(writer_ref) = writer.as_mut() {
-            if writer_ref.write_all(&chunk).await.is_err() {
-                writer = None;
+                if let Some(writer_ref) = writer.as_mut() {
+                    if writer_ref.write_all(&chunk).await.is_err() {
+                        writer = None;
+                    }
+                }
+
+                if tx.send(Ok(chunk.clone())).await.is_err() {
+                    finished_without_error = false;
+                    break;
+                }
+
+                if last_tick.elapsed().as_millis() >= 350 {
+                    let delta_bytes = transferred.saturating_sub(last_transferred);
+                    let delta_secs = last_tick.elapsed().as_secs_f64().max(0.001);
+                    let speed = (delta_bytes as f64 / delta_secs) as u64;
+                    update_transfer(
+                        &transfers,
+                        transfer_id.clone(),
+                        source.label.clone(),
+                        "stream".to_string(),
+                        "running".to_string(),
+                        None,
+                        false,
+                        false,
+                        speed,
+                        transferred,
+                        expected_total,
+                    )
+                    .await;
+                    last_tick = Instant::now();
+                    last_transferred = transferred;
+                }
             }
-        }
-
-        if tx.send(Ok(chunk.clone())).await.is_err() {
-            finished_without_error = false;
-            break;
-        }
-
-        if last_tick.elapsed().as_millis() >= 350 {
-            let delta_bytes = transferred.saturating_sub(last_transferred);
-            let delta_secs = last_tick.elapsed().as_secs_f64().max(0.001);
-            let speed = (delta_bytes as f64 / delta_secs) as u64;
-            update_transfer(
-                &transfers,
-                transfer_id.clone(),
-                source.label.clone(),
-                "stream".to_string(),
-                "running".to_string(),
-                None,
-                false,
-                false,
-                speed,
-                transferred,
-                expected_total,
-            )
-            .await;
-            last_tick = Instant::now();
-            last_transferred = transferred;
+            Ok(None) => break,
+            Err(_) => {
+                finished_without_error = false;
+                break;
+            }
         }
     }
 
@@ -375,10 +463,51 @@ async fn remove_transfer(store: &TransferStore, id: &str) {
     transfers.remove(id);
 }
 
+async fn send_stream_request(
+    client: &Client,
+    playback_url: &str,
+    range_header: Option<&str>,
+) -> reqwest::Result<reqwest::Response> {
+    let mut request = client.get(playback_url);
+    if let Some(range) = range_header {
+        request = request.header(REQWEST_RANGE, range);
+    }
+    request.send().await
+}
+
+async fn refresh_stream_source(
+    app_handle: &AppHandle,
+    sources: &StreamSourceStore,
+    track_id: &str,
+) -> Option<StreamSource> {
+    let playback_url = {
+        let state = app_handle.state::<AppState>();
+        let mut runtime = state.inner.lock().await;
+        runtime.cloud.playback_url(track_id).await.ok()?
+    };
+
+    let mut source_store = sources.lock().await;
+    let source = source_store.get_mut(track_id)?;
+    source.playback_url = playback_url;
+    Some(source.clone())
+}
+
+fn should_refresh_playback_url(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
+    )
+}
+
 fn header_to_u64(value: Option<&HeaderValue>) -> Option<u64> {
     value
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn total_size_from_content_range(value: Option<&HeaderValue>) -> Option<u64> {
+    let text = value?.to_str().ok()?;
+    text.rsplit('/').next()?.parse::<u64>().ok()
 }
 
 fn guess_content_type(name: &str) -> Option<HeaderValue> {

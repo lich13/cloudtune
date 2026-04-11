@@ -11,15 +11,18 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 use tauri::{AppHandle, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::streaming::{StreamSource, StreamSourceStore, TransferStore, start_stream_server};
+
+const MAX_CONCURRENT_REMOTE_REQUESTS: usize = 8;
 
 pub struct AppState {
     pub inner: Mutex<RuntimeState>,
     pub stream_sources: StreamSourceStore,
     pub transfer_statuses: TransferStore,
     pub transfer_controls: TransferControlStore,
+    pub remote_request_slots: Arc<Semaphore>,
     pub stream_server_port: u16,
 }
 
@@ -65,11 +68,12 @@ impl AppState {
 
         fs::create_dir_all(&cache_dir)?;
 
-        let config = if config_path.exists() {
+        let mut config = if config_path.exists() {
             serde_json::from_str(&fs::read_to_string(&config_path)?).unwrap_or_default()
         } else {
             StoredConfig::default()
         };
+        config.normalize_transfer_tuning();
 
         let cache_index = CacheIndex::load(&cache_index_path);
         let cloud = Cloud189Client::new()?;
@@ -79,16 +83,19 @@ impl AppState {
             Arc::new(Mutex::new(HashMap::<String, TransferStatus>::new()));
         let transfer_controls: TransferControlStore =
             Arc::new(Mutex::new(HashMap::<String, TransferControl>::new()));
+        let remote_request_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REMOTE_REQUESTS));
         let stream_server_port = start_stream_server(
             app_handle.clone(),
             stream_sources.clone(),
             transfer_statuses.clone(),
+            remote_request_slots.clone(),
         )?;
 
         Ok(Self {
             stream_sources,
             transfer_statuses,
             transfer_controls,
+            remote_request_slots,
             stream_server_port,
             inner: Mutex::new(RuntimeState {
                 app_handle,

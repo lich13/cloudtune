@@ -1,8 +1,8 @@
 use crate::{
-    cloud189::ROOT_FOLDER_ID,
+    cloud189::{ROOT_FOLDER_ID, build_media_client},
     models::{
-        BootstrapPayload, NowPlayingMetadata, PreparedTrack, SettingsPayload, TrackSummary,
-        TransferSnapshotPayload,
+        BootstrapPayload, MAX_CACHE_THREADS, MAX_DOWNLOAD_THREADS, NowPlayingMetadata,
+        PreparedTrack, SettingsPayload, TrackSummary, TransferSnapshotPayload,
     },
     state::{AppState, DownloadSpec, RuntimeState, TransferControl},
 };
@@ -13,8 +13,8 @@ use lofty::{
     probe::Probe,
 };
 use reqwest::{
-    Client,
-    header::{CONTENT_LENGTH, RANGE},
+    Client, StatusCode,
+    header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE},
 };
 use sha1::{Digest, Sha1};
 use std::{
@@ -318,10 +318,8 @@ async fn run_download_task(
         );
     }
 
-    let client = Client::builder()
-        .no_proxy()
-        .user_agent("CloudTune/0.1.0")
-        .build()?;
+    let client = build_media_client()?;
+    let remote_request_slots = state.remote_request_slots.clone();
 
     let parts_dir = spec.destination.with_extension("parts");
     if let Some(parent) = spec.destination.parent() {
@@ -329,7 +327,14 @@ async fn run_download_task(
     }
     let _ = fs::create_dir_all(&parts_dir).await;
 
-    let total_size = probe_total_size(&client, &playback_url, spec.size_bytes).await?;
+    let total_size = {
+        let _request_slot = remote_request_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("request slot closed"))?;
+        probe_total_size(&client, &playback_url, spec.size_bytes).await?
+    };
     upsert_transfer_status(
         &state,
         &task_id,
@@ -367,7 +372,12 @@ async fn run_download_task(
         let playback_url = playback_url.clone();
         let transferred = transferred.clone();
         let cancel = cancel_flag.clone();
+        let remote_request_slots = remote_request_slots.clone();
         jobs.spawn(async move {
+            let _request_slot = remote_request_slots
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("request slot closed"))?;
             let response = client
                 .get(&playback_url)
                 .header(RANGE, format!("bytes={}-{}", start + existing, end))
@@ -508,14 +518,28 @@ fn spawn_download_task(
 }
 
 async fn probe_total_size(client: &Client, url: &str, fallback: u64) -> Result<u64> {
-    let response = client.head(url).send().await?;
-    let size = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(fallback);
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await?
+        .error_for_status()?;
+    let size = if response.status() == StatusCode::PARTIAL_CONTENT {
+        total_size_from_content_range(response.headers().get(CONTENT_RANGE))
+    } else {
+        response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+    .unwrap_or(fallback);
     Ok(size.max(fallback))
+}
+
+fn total_size_from_content_range(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    let text = value?.to_str().ok()?;
+    text.rsplit('/').next()?.parse::<u64>().ok()
 }
 
 fn split_ranges(total_size: u64, parts: usize) -> Vec<(u64, u64)> {
@@ -923,11 +947,11 @@ pub async fn update_transfer_tuning(
     download_threads: u16,
     cache_threads: u16,
 ) -> Result<SettingsPayload, String> {
-    if !(1..=64).contains(&download_threads) {
-        return Err("下载线程范围是 1-64".to_string());
+    if !(1..=MAX_DOWNLOAD_THREADS).contains(&download_threads) {
+        return Err(format!("下载线程范围是 1-{MAX_DOWNLOAD_THREADS}"));
     }
-    if !(1..=64).contains(&cache_threads) {
-        return Err("缓存线程范围是 1-64".to_string());
+    if !(1..=MAX_CACHE_THREADS).contains(&cache_threads) {
+        return Err(format!("缓存线程范围是 1-{MAX_CACHE_THREADS}"));
     }
 
     let mut runtime = state.inner.lock().await;

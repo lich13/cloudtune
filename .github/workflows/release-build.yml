@@ -214,12 +214,25 @@ jobs:
           echo "macOS package will be published with ad-hoc signing only."
           echo "Downloaded builds will require manual Gatekeeper bypass on end-user machines."
 
+      - name: Package macOS artifact archive
+        shell: bash
+        run: |
+          DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)
+          if [[ -z "$DMG_PATH" ]]; then
+            echo "No dmg found to archive" >&2
+            exit 1
+          fi
+          mkdir -p release-artifacts
+          ARCHIVE_PATH="release-artifacts/$(basename "$DMG_PATH").zip"
+          ditto -c -k --sequesterRsrc "$DMG_PATH" "$ARCHIVE_PATH"
+          ls -lh "$ARCHIVE_PATH"
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v6
         with:
           name: macos-dmg
           path: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/**/*.dmg
+            release-artifacts/*.zip
           if-no-files-found: error
 
   publish-release:
@@ -249,6 +262,20 @@ jobs:
         with:
           name: macos-dmg
           path: release-assets
+
+      - name: Unpack macOS dmg archive
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(release-assets/*.zip)
+          if (( ${#archives[@]} == 0 )); then
+            echo "No macOS archive found" >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            ditto -x -k "$archive" "$(dirname "$archive")"
+            rm -f "$archive"
+          done
 
       - name: Compute release metadata
         id: release_meta

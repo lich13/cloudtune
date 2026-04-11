@@ -34,7 +34,6 @@ concurrency:
 
 env:
   BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || github.ref }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-windows:
@@ -174,6 +173,22 @@ jobs:
       - name: Build macOS ARM64 package
         run: npm run tauri:build:mac:arm64
 
+      - name: Verify macOS dmg size
+        shell: bash
+        run: |
+          DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)
+          if [[ -z "$DMG_PATH" ]]; then
+            echo "No dmg found" >&2
+            exit 1
+          fi
+          ls -lh "$DMG_PATH"
+          DMG_SIZE_BYTES=$(stat -f%z "$DMG_PATH")
+          echo "macOS dmg size: $DMG_SIZE_BYTES bytes"
+          if (( DMG_SIZE_BYTES > 512 * 1024 * 1024 )); then
+            echo "macOS dmg is unexpectedly large" >&2
+            exit 1
+          fi
+
       - name: Verify macOS app bundle signature integrity
         shell: bash
         run: |
@@ -224,13 +239,13 @@ jobs:
           fi
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: windows-x64-installers
           path: release-assets
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: macos-dmg
           path: release-assets
@@ -252,12 +267,22 @@ jobs:
           echo "name=${name}" >> "${GITHUB_OUTPUT}"
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_meta.outputs.tag }}
-          name: ${{ steps.release_meta.outputs.name }}
-          files: |
-            release-assets/*.exe
-            release-assets/*.msi
-            release-assets/*.dmg
-          generate_release_notes: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+          RELEASE_NAME: ${{ steps.release_meta.outputs.name }}
+        run: |
+          shopt -s nullglob
+          files=(release-assets/*.exe release-assets/*.msi release-assets/*.dmg)
+          if (( ${#files[@]} == 0 )); then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_NAME"
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" --title "$RELEASE_NAME" --generate-notes
+          fi

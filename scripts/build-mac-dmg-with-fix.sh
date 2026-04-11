@@ -13,9 +13,11 @@ APP_BUNDLE_DIR="$REPO_ROOT/src-tauri/target/$TARGET_TRIPLE/release/bundle/macos"
 APP_PATH="$APP_BUNDLE_DIR/$APP_NAME.app"
 DMG_DIR="$REPO_ROOT/src-tauri/target/$TARGET_TRIPLE/release/bundle/dmg"
 STAGING_DIR="$DMG_DIR/${APP_NAME}-dmg-root"
+TEMP_DMG_PATH="$DMG_DIR/${APP_NAME}_${VERSION}_${TARGET_TRIPLE}.tmp.dmg"
 DMG_PATH="$DMG_DIR/${APP_NAME}_${VERSION}_${TARGET_TRIPLE}.dmg"
 FIX_SCRIPT_SOURCE="$REPO_ROOT/scripts/macos-permission-fix.command"
 FIX_SCRIPT_NAME="Fix CloudTune.command"
+MAX_DMG_SIZE_BYTES=$((512 * 1024 * 1024))
 
 echo "Building $APP_NAME.app for $TARGET_TRIPLE..."
 npm exec tauri build -- --target "$TARGET_TRIPLE" --bundles app
@@ -32,6 +34,7 @@ fi
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 mkdir -p "$DMG_DIR"
+rm -f "$TEMP_DMG_PATH"
 rm -f "$DMG_PATH"
 
 ditto "$APP_PATH" "$STAGING_DIR/$APP_NAME.app"
@@ -41,10 +44,27 @@ ln -s /Applications "$STAGING_DIR/Applications"
 
 echo "Packing custom DMG with repair script..."
 hdiutil create \
+  -fs HFS+ \
   -volname "$APP_NAME" \
   -srcfolder "$STAGING_DIR" \
   -ov \
+  -format UDRW \
+  "$TEMP_DMG_PATH" >/dev/null
+
+hdiutil convert \
+  "$TEMP_DMG_PATH" \
+  -ov \
   -format UDZO \
-  "$DMG_PATH" >/dev/null
+  -imagekey zlib-level=9 \
+  -o "$DMG_PATH" >/dev/null
+
+rm -f "$TEMP_DMG_PATH"
+
+DMG_SIZE_BYTES="$(stat -f%z "$DMG_PATH")"
+echo "Final DMG size: ${DMG_SIZE_BYTES} bytes"
+if (( DMG_SIZE_BYTES > MAX_DMG_SIZE_BYTES )); then
+  echo "DMG is unexpectedly large: ${DMG_SIZE_BYTES} bytes" >&2
+  exit 1
+fi
 
 echo "Created $DMG_PATH"

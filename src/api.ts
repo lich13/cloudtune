@@ -20,12 +20,18 @@ export const api = {
   saveMusicFolder: (folderId: string, folderName: string) =>
     invoke<SettingsPayload>('save_music_folder', { folderId, folderName }),
   scanLibrary: () => invoke<TrackSummary[]>('scan_library'),
-  prepareTrack: (trackId: string, fileName: string, sizeBytes: number) =>
+  prepareTrack: (
+    trackId: string,
+    fileName: string,
+    sizeBytes: number,
+    playbackModeOverride?: 'download_first' | 'stream_cache',
+  ) =>
     invoke<PreparedTrack>('prepare_track', {
       trackId,
       fileName,
       sizeBytes,
       forPlayback: true,
+      ...(playbackModeOverride ? { playbackModeOverride } : {}),
     }),
   prefetchTrack: (trackId: string, fileName: string, sizeBytes: number) =>
     invoke<PreparedTrack>('prepare_track', {

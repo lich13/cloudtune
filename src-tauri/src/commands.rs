@@ -778,6 +778,7 @@ pub async fn prepare_track(
     file_name: String,
     size_bytes: u64,
     for_playback: bool,
+    playback_mode_override: Option<String>,
 ) -> Result<PreparedTrack, String> {
     let mut runtime = state.inner.lock().await;
     ensure_authenticated(&mut runtime)
@@ -787,7 +788,8 @@ pub async fn prepare_track(
     let cache_limit_bytes = runtime.config.cache_limit_bytes();
     let cache_threads = runtime.config.cache_threads as usize;
     let download_threads = runtime.config.download_threads as usize;
-    let playback_mode = runtime.config.playback_mode.clone();
+    let playback_mode = playback_mode_override
+        .unwrap_or_else(|| runtime.config.playback_mode.clone());
 
     if let Some(cached_path) = runtime.cache_index.existing_path(&track_id, &cache_dir) {
         let cache_usage_bytes = runtime

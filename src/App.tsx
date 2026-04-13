@@ -19,6 +19,65 @@ const ACCOUNT_NAME_STORAGE_KEY = 'cloudtune.accountName'
 const AUTHENTICATED_STORAGE_KEY = 'cloudtune.authenticated'
 const MAX_DOWNLOAD_THREADS = 16
 const MAX_CACHE_THREADS = 8
+const MAX_PLAYBACK_RECOVERY_ATTEMPTS = 8
+const PLAYBACK_RECOVERY_DELAY_MS = 1800
+const PLAYBACK_RECOVERY_MAX_DELAY_MS = 6000
+const PLAYBACK_BUFFERING_TIMEOUT_MS = 8000
+const PLAYBACK_RECENT_ACTIVITY_WINDOW_MS = 45000
+const PLAYBACK_SWITCH_RECOVERY_WINDOW_MS = 12000
+
+type PlaybackModeOverride = 'download_first' | 'stream_cache'
+
+interface PlayTrackOptions {
+  playbackModeOverride?: PlaybackModeOverride
+  recoveryReason?: string | null
+  resumeTime?: number
+}
+
+function normalizeResumeTime(value?: number) {
+  if (!Number.isFinite(value) || value == null || value <= 0) {
+    return 0
+  }
+
+  return value
+}
+
+function isNotSupportedPlaybackError(error: unknown) {
+  if (error instanceof DOMException && error.name === 'NotSupportedError') {
+    return true
+  }
+
+  return String(error).includes('NotSupportedError')
+}
+
+async function waitForAudioReady(
+  audio: HTMLAudioElement,
+  timeoutMs = PLAYBACK_BUFFERING_TIMEOUT_MS,
+) {
+  if (audio.readyState > 0) {
+    return
+  }
+
+  await new Promise<void>((resolve) => {
+    const events = ['loadedmetadata', 'canplay', 'canplaythrough', 'error']
+    const timeout = window.setTimeout(() => {
+      cleanup()
+      resolve()
+    }, timeoutMs)
+
+    const onReady = () => {
+      cleanup()
+      resolve()
+    }
+
+    const cleanup = () => {
+      window.clearTimeout(timeout)
+      events.forEach((eventName) => audio.removeEventListener(eventName, onReady))
+    }
+
+    events.forEach((eventName) => audio.addEventListener(eventName, onReady, { once: true }))
+  })
+}
 
 function readStoredString(key: string) {
   if (typeof window === 'undefined') {
@@ -103,6 +162,15 @@ function App() {
   const qrPolling = useRef(false)
   const prefetchedTrackId = useRef<string | null>(null)
   const prefetchingTrackId = useRef<string | null>(null)
+  const playbackRequestId = useRef(0)
+  const recoveryAttemptRef = useRef(0)
+  const lastPlaybackStartRef = useRef(0)
+  const recoveryTimerRef = useRef<number | null>(null)
+  const lastTrackRef = useRef<TrackSummary | null>(null)
+  const currentTrackRef = useRef<TrackSummary | null>(null)
+  const loadingTrackIdRef = useRef<string | null>(null)
+  const isPlayingRef = useRef(false)
+  const lastTrackSwitchAtRef = useRef(0)
 
   const [bootstrapping, setBootstrapping] = useState(true)
   const [busyLabel, setBusyLabel] = useState<string | null>(null)
@@ -178,6 +246,78 @@ function App() {
       return null
     }
   })()
+
+  useEffect(() => {
+    currentTrackRef.current = currentTrack
+  }, [currentTrack])
+
+  useEffect(() => {
+    loadingTrackIdRef.current = loadingTrackId
+  }, [loadingTrackId])
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying
+  }, [isPlaying])
+
+  function clearRecoveryTimer() {
+    if (recoveryTimerRef.current != null) {
+      window.clearTimeout(recoveryTimerRef.current)
+      recoveryTimerRef.current = null
+    }
+  }
+
+  async function recoverPlayback(reason: string) {
+    const track = currentTrackRef.current ?? lastTrackRef.current
+    const audio = audioRef.current
+    if (!track || !audio || !audio.currentSrc) {
+      return
+    }
+    if (audio.ended || audio.seeking) {
+      return
+    }
+    const elapsedSinceStart = Date.now() - lastPlaybackStartRef.current
+    const elapsedSinceSwitch = Date.now() - lastTrackSwitchAtRef.current
+    const inSwitchRecoveryWindow = elapsedSinceSwitch < PLAYBACK_SWITCH_RECOVERY_WINDOW_MS
+    const recentlyActive =
+      isPlayingRef.current ||
+      audio.currentTime > 0 ||
+      elapsedSinceStart < PLAYBACK_RECENT_ACTIVITY_WINDOW_MS ||
+      inSwitchRecoveryWindow
+    if (!recentlyActive) {
+      return
+    }
+    if (
+      loadingTrackIdRef.current &&
+      !(inSwitchRecoveryWindow && loadingTrackIdRef.current === track.id)
+    ) {
+      return
+    }
+    if (recoveryAttemptRef.current >= MAX_PLAYBACK_RECOVERY_ATTEMPTS) {
+      setStatusMessage(`播放异常，已停止自动重试《${track.name}》`)
+      setIsPlaying(false)
+      return
+    }
+
+    recoveryAttemptRef.current += 1
+    const resumeTime = audio.currentTime
+    const nextDelay = Math.min(
+      PLAYBACK_RECOVERY_DELAY_MS * recoveryAttemptRef.current,
+      PLAYBACK_RECOVERY_MAX_DELAY_MS,
+    )
+    clearRecoveryTimer()
+    recoveryTimerRef.current = window.setTimeout(() => {
+      recoveryTimerRef.current = null
+      void playTrack(track, {
+        playbackModeOverride: reason === 'NotSupportedError' ? 'download_first' : undefined,
+        recoveryReason: reason,
+        resumeTime,
+      })
+    }, nextDelay)
+    setIsPlaying(false)
+    setStatusMessage(
+      `播放异常，正在重试《${track.name}》(${recoveryAttemptRef.current}/${MAX_PLAYBACK_RECOVERY_ATTEMPTS})`,
+    )
+  }
 
   async function loadBootstrap(showBusy = true) {
     if (showBusy) {
@@ -296,7 +436,12 @@ function App() {
     }
   }
 
-  async function playTrack(track: TrackSummary) {
+  async function playTrack(track: TrackSummary, options?: PlayTrackOptions) {
+    const requestId = playbackRequestId.current + 1
+    playbackRequestId.current = requestId
+    lastTrackRef.current = track
+    lastTrackSwitchAtRef.current = Date.now()
+    clearRecoveryTimer()
     setLoadingTrackId(track.id)
 
     try {
@@ -306,9 +451,10 @@ function App() {
         track.id,
         track.name,
         track.sizeBytes,
+        options?.playbackModeOverride,
       )
       const audio = audioRef.current
-      if (!audio) {
+      if (!audio || requestId !== playbackRequestId.current) {
         return
       }
 
@@ -316,30 +462,57 @@ function App() {
         ? payload.playbackUrl
         : convertFileSrc(payload.localPath)
       audio.load()
+      await waitForAudioReady(audio, PLAYBACK_BUFFERING_TIMEOUT_MS)
       try {
         await audio.play()
       } catch (error) {
-        if (payload.isStreaming && error instanceof DOMException && error.name === 'NotSupportedError') {
-          audio.src = payload.playbackUrl
-          audio.load()
-          await audio.play()
-        } else {
-          throw error
+        if (
+          payload.isStreaming &&
+          isNotSupportedPlaybackError(error) &&
+          options?.playbackModeOverride !== 'download_first'
+        ) {
+          await playTrack(track, {
+            playbackModeOverride: 'download_first',
+            recoveryReason: options?.recoveryReason ?? 'NotSupportedError',
+            resumeTime: options?.resumeTime,
+          })
+          return
         }
+
+        throw error
       }
+
+      if (requestId !== playbackRequestId.current) {
+        return
+      }
+
+      const resumeTime = normalizeResumeTime(options?.resumeTime)
+      if (resumeTime > 0) {
+        audio.currentTime = Math.min(resumeTime, audio.duration || resumeTime)
+      }
+
       setCurrentTrackId(payload.trackId)
       setCurrentLocalPath(payload.localPath)
       setNowPlayingMetadata(null)
       setCacheUsageBytes(payload.cacheUsageBytes)
       setIsPlaying(true)
-      setStatusMessage(
-        payload.isStreaming ? `边播边缓存 ${track.name}` : `正在播放 ${track.name}`,
-      )
+      recoveryAttemptRef.current = 0
+      lastPlaybackStartRef.current = Date.now()
+      const playbackStatusLabel = options?.recoveryReason
+        ? `已恢复播放《${track.name}》`
+        : payload.isStreaming
+          ? `边播边缓存《${track.name}》`
+          : `正在播放《${track.name}》`
+      setStatusMessage(playbackStatusLabel)
     } catch (error) {
-      setStatusMessage(String(error))
-      setIsPlaying(false)
+      if (requestId === playbackRequestId.current) {
+        setStatusMessage(String(error))
+        setIsPlaying(false)
+      }
     } finally {
-      setLoadingTrackId(null)
+      if (requestId === playbackRequestId.current) {
+        setLoadingTrackId(null)
+      }
     }
   }
 
@@ -592,11 +765,16 @@ function App() {
       return
     }
 
-    const onPlay = () => setIsPlaying(true)
+    const onPlay = () => {
+      clearRecoveryTimer()
+      setIsPlaying(true)
+    }
     const onPause = () => setIsPlaying(false)
     const onTimeUpdate = () => setCurrentTime(audio.currentTime)
     const onLoadedMetadata = () => setDuration(audio.duration)
     const onEnded = async () => {
+      clearRecoveryTimer()
+      recoveryAttemptRef.current = 0
       if (loopMode === 'one' && currentTrack) {
         audio.currentTime = 0
         await audio.play()
@@ -612,19 +790,30 @@ function App() {
         setIsPlaying(false)
       }
     }
+    const onPlaybackProblem = () => {
+      const reason = audio.error?.code === 4 ? 'NotSupportedError' : 'playback-interrupted'
+      void recoverPlayback(reason)
+    }
 
     audio.addEventListener('play', onPlay)
     audio.addEventListener('pause', onPause)
     audio.addEventListener('timeupdate', onTimeUpdate)
     audio.addEventListener('loadedmetadata', onLoadedMetadata)
     audio.addEventListener('ended', onEnded)
+    audio.addEventListener('error', onPlaybackProblem)
+    audio.addEventListener('stalled', onPlaybackProblem)
+    audio.addEventListener('emptied', onPlaybackProblem)
 
     return () => {
+      clearRecoveryTimer()
       audio.removeEventListener('play', onPlay)
       audio.removeEventListener('pause', onPause)
       audio.removeEventListener('timeupdate', onTimeUpdate)
       audio.removeEventListener('loadedmetadata', onLoadedMetadata)
       audio.removeEventListener('ended', onEnded)
+      audio.removeEventListener('error', onPlaybackProblem)
+      audio.removeEventListener('stalled', onPlaybackProblem)
+      audio.removeEventListener('emptied', onPlaybackProblem)
     }
   }, [currentTrack, currentTrackId, loopMode, shuffle, tracks])
 

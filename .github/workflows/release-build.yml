@@ -304,7 +304,7 @@ jobs:
           RELEASE_NAME: ${{ steps.release_meta.outputs.name }}
         run: |
           shopt -s nullglob
-          files=(release-assets/*.exe release-assets/*.msi release-assets/*.dmg)
+          files=(release-assets/**/*.exe release-assets/**/*.msi release-assets/**/*.dmg)
           if (( ${#files[@]} == 0 )); then
             echo "No release assets found" >&2
             exit 1

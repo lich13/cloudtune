@@ -273,7 +273,7 @@ jobs:
             exit 1
           fi
           for archive in "${archives[@]}"; do
-            ditto -x -k "$archive" "$(dirname "$archive")"
+            unzip -o "$archive" -d release-assets
             rm -f "$archive"
           done
 

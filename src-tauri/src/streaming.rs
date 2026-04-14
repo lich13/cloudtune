@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::TcpListener, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
-use log::{info, warn};
+use tauri_plugin_log::log::{info, warn};
 use axum::{
     Router,
     body::Body,

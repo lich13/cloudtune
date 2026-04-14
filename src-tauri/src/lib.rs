@@ -60,8 +60,8 @@ fn toggle_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()
 
 fn build_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let menu = Menu::new(app)?;
-    let toggle = MenuItemBuilder::with_id(TRAY_TOGGLE_ID, "鏄剧ず / 闅愯棌绐楀彛").build(app)?;
-    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "閫€鍑?).build(app)?;
+    let toggle = MenuItemBuilder::with_id(TRAY_TOGGLE_ID, "Toggle Window").build(app)?;
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "Quit").build(app)?;
     menu.append(&toggle)?;
     menu.append(&quit)?;
 

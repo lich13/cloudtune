@@ -4,6 +4,7 @@ use crate::{
         BootstrapPayload, MAX_CACHE_THREADS, MAX_DOWNLOAD_THREADS, NowPlayingMetadata,
         PreparedTrack, SettingsPayload, TrackSummary, TransferSnapshotPayload,
     },
+    runtime_paths::RuntimePaths,
     state::{AppState, DownloadSpec, RuntimeState, TransferControl},
 };
 use anyhow::{Context, Result};
@@ -59,7 +60,7 @@ async fn ensure_authenticated(runtime: &mut RuntimeState) -> Result<()> {
         .refresh_token
         .clone()
         .filter(|token| !token.trim().is_empty())
-        .context("请先扫码登录天翼云盘")?;
+        .context("璇峰厛鎵爜鐧诲綍澶╃考浜戠洏")?;
     runtime
         .cloud
         .restore_from_refresh_token(refresh_token)
@@ -143,7 +144,7 @@ fn parse_track_metadata(
         local_path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("未知曲目")
+            .unwrap_or("鏈煡鏇茬洰")
             .to_string()
     } else {
         fallback_name
@@ -237,13 +238,12 @@ fn parse_track_metadata(
 }
 
 async fn persist_artwork_file(
-    app_data_dir: &Path,
+    artwork_dir: &Path,
     local_path: &str,
     bytes: &[u8],
     extension: &str,
 ) -> Result<String> {
-    let artwork_dir = app_data_dir.join("artwork");
-    fs::create_dir_all(&artwork_dir).await?;
+    fs::create_dir_all(artwork_dir).await?;
 
     let mut hasher = Sha1::new();
     hasher.update(local_path.as_bytes());
@@ -757,7 +757,7 @@ pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<TrackSummary
     let current_folder = runtime
         .config
         .current_folder()
-        .context("请先选择音乐目录")
+        .context("璇峰厛閫夋嫨闊充箰鐩綍")
         .map_err(to_command_error)?;
 
     runtime
@@ -934,7 +934,7 @@ pub async fn update_cache_limit(
     limit_mb: u64,
 ) -> Result<SettingsPayload, String> {
     if limit_mb < 256 {
-        return Err("缓存上限至少设置为 256 MB".to_string());
+        return Err("缂撳瓨涓婇檺鑷冲皯璁剧疆涓?256 MB".to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -950,10 +950,10 @@ pub async fn update_transfer_tuning(
     cache_threads: u16,
 ) -> Result<SettingsPayload, String> {
     if !(1..=MAX_DOWNLOAD_THREADS).contains(&download_threads) {
-        return Err(format!("下载线程范围是 1-{MAX_DOWNLOAD_THREADS}"));
+        return Err(format!("涓嬭浇绾跨▼鑼冨洿鏄?1-{MAX_DOWNLOAD_THREADS}"));
     }
     if !(1..=MAX_CACHE_THREADS).contains(&cache_threads) {
-        return Err(format!("缓存线程范围是 1-{MAX_CACHE_THREADS}"));
+        return Err(format!("缂撳瓨绾跨▼鑼冨洿鏄?1-{MAX_CACHE_THREADS}"));
     }
 
     let mut runtime = state.inner.lock().await;
@@ -969,7 +969,7 @@ pub async fn update_playback_mode(
     playback_mode: String,
 ) -> Result<SettingsPayload, String> {
     if playback_mode != "download_first" && playback_mode != "stream_cache" {
-        return Err("播放模式不合法".to_string());
+        return Err("鎾斁妯″紡涓嶅悎娉?.to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -1142,9 +1142,7 @@ pub async fn read_track_metadata(
         let runtime = state.inner.lock().await;
         runtime.app_handle.clone()
     };
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
+    let runtime_paths = RuntimePaths::resolve(&app_handle)
         .map_err(|error| error.to_string())?;
 
     let parsed = tokio::task::spawn_blocking({
@@ -1157,7 +1155,7 @@ pub async fn read_track_metadata(
     let artwork_path = if let (Some(bytes), Some(extension)) =
         (&parsed.artwork_bytes, &parsed.artwork_extension)
     {
-        persist_artwork_file(&app_data_dir, &local_path, bytes, extension)
+        persist_artwork_file(&runtime_paths.artwork_dir, &local_path, bytes, extension)
             .await
             .ok()
     } else {
@@ -1205,7 +1203,7 @@ pub async fn resume_transfer(state: State<'_, AppState>, id: String) -> Result<(
         controls
             .get(&id)
             .and_then(|control| control.download.clone())
-            .context("该任务不支持继续")
+            .context("璇ヤ换鍔′笉鏀寔缁х画")
             .map_err(to_command_error)?
     };
 

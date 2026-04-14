@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::TcpListener, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
+use log::{info, warn};
 use axum::{
     Router,
     body::Body,
@@ -14,7 +15,7 @@ use axum::{
 };
 use bytes::Bytes;
 use mime_guess::MimeGuess;
-use reqwest::{Client, header::RANGE as REQWEST_RANGE};
+use reqwest::{Client, StatusCode as ReqwestStatusCode, header::RANGE as REQWEST_RANGE};
 use tauri::{AppHandle, Manager};
 use tokio::{
     fs,
@@ -24,6 +25,9 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{cloud189::build_media_client, models::TransferStatus, state::AppState};
+
+const MAX_STREAM_RESUME_ATTEMPTS: u8 = 6;
+const STREAM_RESUME_DELAY_MS: u64 = 900;
 
 pub type StreamSourceStore = Arc<Mutex<HashMap<String, StreamSource>>>;
 pub type TransferStore = Arc<Mutex<HashMap<String, TransferStatus>>>;
@@ -325,6 +329,7 @@ async fn stream_and_cache_task(
     let mut transferred = 0_u64;
     let mut last_tick = Instant::now();
     let mut last_transferred = 0_u64;
+    let mut resume_attempts = 0_u8;
     update_transfer(
         &transfers,
         transfer_id.clone(),
@@ -345,6 +350,7 @@ async fn stream_and_cache_task(
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 transferred = transferred.saturating_add(chunk.len() as u64);
+                resume_attempts = 0;
 
                 if let Some(writer_ref) = writer.as_mut() {
                     if writer_ref.write_all(&chunk).await.is_err() {
@@ -380,9 +386,47 @@ async fn stream_and_cache_task(
                 }
             }
             Ok(None) => break,
-            Err(_) => {
-                finished_without_error = false;
-                break;
+            Err(error) => {
+                if transferred == 0 || resume_attempts >= MAX_STREAM_RESUME_ATTEMPTS {
+                    warn!(target: "cloudtune::streaming", "stream {} stopped after {} bytes: {}", source.track_id, transferred, error);
+                    finished_without_error = false;
+                    break;
+                }
+
+                resume_attempts = resume_attempts.saturating_add(1);
+                warn!(target: "cloudtune::streaming", "stream {} interrupted, resume attempt {} from byte {}", source.track_id, resume_attempts, transferred);
+                let resume_range = format!("bytes={}-", transferred);
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    STREAM_RESUME_DELAY_MS * u64::from(resume_attempts),
+                ))
+                .await;
+
+                match send_stream_request(
+                    &build_media_client().unwrap_or_else(|_| Client::new()),
+                    &source.playback_url,
+                    Some(&resume_range),
+                )
+                .await
+                {
+                    Ok(next_response)
+                        if next_response.status().is_success()
+                            || next_response.status() == ReqwestStatusCode::PARTIAL_CONTENT =>
+                    {
+                        info!(target: "cloudtune::streaming", "stream {} resumed from byte {}", source.track_id, transferred);
+                        response = next_response;
+                        continue;
+                    }
+                    Ok(next_response) => {
+                        warn!(target: "cloudtune::streaming", "stream {} resume returned {}", source.track_id, next_response.status());
+                        finished_without_error = false;
+                        break;
+                    }
+                    Err(resume_error) => {
+                        warn!(target: "cloudtune::streaming", "stream {} resume failed: {}", source.track_id, resume_error);
+                        finished_without_error = false;
+                        break;
+                    }
+                }
             }
         }
     }

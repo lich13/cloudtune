@@ -2,6 +2,7 @@ use crate::{
     cache::CacheIndex,
     cloud189::Cloud189Client,
     models::{StoredConfig, TrackSummary, TransferStatus},
+    runtime_paths::RuntimePaths,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -57,16 +58,11 @@ pub struct RuntimeState {
 
 impl AppState {
     pub fn new(app_handle: AppHandle) -> Result<Self> {
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .context("failed to resolve app data directory")?;
-        let cache_dir = app_data_dir.join("cache");
-        let config_path = app_data_dir.join("settings.json");
-        let cache_index_path = cache_dir.join("index.json");
-        let library_index_path = app_data_dir.join("library.json");
-
-        fs::create_dir_all(&cache_dir)?;
+        let runtime_paths = RuntimePaths::resolve(&app_handle)?;
+        let cache_dir = runtime_paths.cache_dir.clone();
+        let config_path = runtime_paths.config_path.clone();
+        let cache_index_path = runtime_paths.cache_index_path.clone();
+        let library_index_path = runtime_paths.library_index_path.clone();
 
         let mut config = if config_path.exists() {
             serde_json::from_str(&fs::read_to_string(&config_path)?).unwrap_or_default()

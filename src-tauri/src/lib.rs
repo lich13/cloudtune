@@ -2,6 +2,7 @@ mod cache;
 mod cloud189;
 mod commands;
 mod models;
+mod runtime_paths;
 mod state;
 mod streaming;
 
@@ -12,6 +13,7 @@ use tauri::{
     menu::{Menu, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_log::{Target, TargetKind};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "main-tray";
@@ -58,8 +60,8 @@ fn toggle_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()
 
 fn build_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let menu = Menu::new(app)?;
-    let toggle = MenuItemBuilder::with_id(TRAY_TOGGLE_ID, "显示 / 隐藏窗口").build(app)?;
-    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "退出").build(app)?;
+    let toggle = MenuItemBuilder::with_id(TRAY_TOGGLE_ID, "鏄剧ず / 闅愯棌绐楀彛").build(app)?;
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "閫€鍑?).build(app)?;
     menu.append(&toggle)?;
     menu.append(&quit)?;
 
@@ -100,8 +102,18 @@ fn build_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
         .setup(|app| {
+            let runtime_paths = runtime_paths::RuntimePaths::resolve(&app.handle())?;
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .clear_targets()
+                    .target(Target::new(TargetKind::Stdout))
+                    .target(Target::new(TargetKind::Folder {
+                        path: runtime_paths.logs_dir.clone(),
+                        file_name: Some("CloudTune".into()),
+                    }))
+                    .build(),
+            )?;
             let shared_state = state::AppState::new(app.handle().clone())?;
             app.manage(shared_state);
             app.manage(ShellState::default());

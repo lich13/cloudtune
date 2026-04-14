@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "CloudTune",
         "width": 1460,
         "height": 930,

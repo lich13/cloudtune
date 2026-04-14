@@ -9,7 +9,7 @@ mod streaming;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{
-    Manager, Runtime, WindowEvent,
+    Manager, Runtime, WebviewWindowBuilder, WindowEvent,
     menu::{Menu, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -104,6 +104,14 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let runtime_paths = runtime_paths::RuntimePaths::resolve(&app.handle())?;
+            let main_window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == MAIN_WINDOW_LABEL)
+                .cloned()
+                .expect("missing main window config");
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .clear_targets()
@@ -130,6 +138,17 @@ pub fn run() {
                 "logs dir: {}",
                 runtime_paths.logs_dir.display(),
             );
+            tauri_plugin_log::log::info!(
+                target: "cloudtune::runtime",
+                "webview dir: {}",
+                runtime_paths.webview_dir.display(),
+            );
+            let mut window_builder = WebviewWindowBuilder::from_config(app, &main_window_config)?;
+            #[cfg(target_os = "windows")]
+            {
+                window_builder = window_builder.data_directory(runtime_paths.webview_dir.clone());
+            }
+            window_builder.build()?;
             let shared_state = state::AppState::new(app.handle().clone())?;
             app.manage(shared_state);
             app.manage(ShellState::default());

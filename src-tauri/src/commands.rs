@@ -60,7 +60,7 @@ async fn ensure_authenticated(runtime: &mut RuntimeState) -> Result<()> {
         .refresh_token
         .clone()
         .filter(|token| !token.trim().is_empty())
-        .context("璇峰厛鎵爜鐧诲綍澶╃考浜戠洏")?;
+        .context("please sign in to Tianyi Cloud first")?;
     runtime
         .cloud
         .restore_from_refresh_token(refresh_token)
@@ -144,7 +144,7 @@ fn parse_track_metadata(
         local_path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("鏈煡鏇茬洰")
+            .unwrap_or("Unknown track")
             .to_string()
     } else {
         fallback_name
@@ -757,7 +757,7 @@ pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<TrackSummary
     let current_folder = runtime
         .config
         .current_folder()
-        .context("璇峰厛閫夋嫨闊充箰鐩綍")
+        .context("please choose a music directory first")
         .map_err(to_command_error)?;
 
     runtime
@@ -934,7 +934,7 @@ pub async fn update_cache_limit(
     limit_mb: u64,
 ) -> Result<SettingsPayload, String> {
     if limit_mb < 256 {
-        return Err("缂撳瓨涓婇檺鑷冲皯璁剧疆涓?256 MB".to_string());
+        return Err("cache limit must be at least 256 MB".to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -950,10 +950,10 @@ pub async fn update_transfer_tuning(
     cache_threads: u16,
 ) -> Result<SettingsPayload, String> {
     if !(1..=MAX_DOWNLOAD_THREADS).contains(&download_threads) {
-        return Err(format!("涓嬭浇绾跨▼鑼冨洿鏄?1-{MAX_DOWNLOAD_THREADS}"));
+        return Err(format!("download threads must be within 1-{MAX_DOWNLOAD_THREADS}"));
     }
     if !(1..=MAX_CACHE_THREADS).contains(&cache_threads) {
-        return Err(format!("缂撳瓨绾跨▼鑼冨洿鏄?1-{MAX_CACHE_THREADS}"));
+        return Err(format!("cache threads must be within 1-{MAX_CACHE_THREADS}"));
     }
 
     let mut runtime = state.inner.lock().await;
@@ -969,7 +969,7 @@ pub async fn update_playback_mode(
     playback_mode: String,
 ) -> Result<SettingsPayload, String> {
     if playback_mode != "download_first" && playback_mode != "stream_cache" {
-        return Err("鎾斁妯″紡涓嶅悎娉?.to_string());
+        return Err("invalid playback mode".to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -1203,7 +1203,7 @@ pub async fn resume_transfer(state: State<'_, AppState>, id: String) -> Result<(
         controls
             .get(&id)
             .and_then(|control| control.download.clone())
-            .context("璇ヤ换鍔′笉鏀寔缁х画")
+            .context("transfer cannot be resumed")
             .map_err(to_command_error)?
     };
 

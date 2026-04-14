@@ -19,12 +19,12 @@ const ACCOUNT_NAME_STORAGE_KEY = 'cloudtune.accountName'
 const AUTHENTICATED_STORAGE_KEY = 'cloudtune.authenticated'
 const MAX_DOWNLOAD_THREADS = 16
 const MAX_CACHE_THREADS = 8
-const MAX_PLAYBACK_RECOVERY_ATTEMPTS = 8
-const PLAYBACK_RECOVERY_DELAY_MS = 1800
-const PLAYBACK_RECOVERY_MAX_DELAY_MS = 6000
-const PLAYBACK_BUFFERING_TIMEOUT_MS = 8000
-const PLAYBACK_RECENT_ACTIVITY_WINDOW_MS = 45000
-const PLAYBACK_SWITCH_RECOVERY_WINDOW_MS = 12000
+const MAX_PLAYBACK_RECOVERY_ATTEMPTS = 12
+const PLAYBACK_RECOVERY_DELAY_MS = 2500
+const PLAYBACK_RECOVERY_MAX_DELAY_MS = 15000
+const PLAYBACK_BUFFERING_TIMEOUT_MS = 15000
+const PLAYBACK_RECENT_ACTIVITY_WINDOW_MS = 120000
+const PLAYBACK_SWITCH_RECOVERY_WINDOW_MS = 30000
 
 type PlaybackModeOverride = 'download_first' | 'stream_cache'
 
@@ -167,6 +167,7 @@ function App() {
   const lastPlaybackStartRef = useRef(0)
   const recoveryTimerRef = useRef<number | null>(null)
   const lastTrackRef = useRef<TrackSummary | null>(null)
+  const pendingTrackRef = useRef<TrackSummary | null>(null)
   const currentTrackRef = useRef<TrackSummary | null>(null)
   const loadingTrackIdRef = useRef<string | null>(null)
   const isPlayingRef = useRef(false)
@@ -266,10 +267,25 @@ function App() {
     }
   }
 
+  function resolveRecoveryTrack() {
+    const loadingTrackId = loadingTrackIdRef.current
+    if (loadingTrackId && pendingTrackRef.current?.id === loadingTrackId) {
+      return pendingTrackRef.current
+    }
+
+    return currentTrackRef.current ?? pendingTrackRef.current ?? lastTrackRef.current
+  }
+
   async function recoverPlayback(reason: string) {
-    const track = currentTrackRef.current ?? lastTrackRef.current
+    const track = resolveRecoveryTrack()
     const audio = audioRef.current
-    if (!track || !audio || !audio.currentSrc) {
+    if (!track || !audio) {
+      return
+    }
+    if (recoveryTimerRef.current != null) {
+      return
+    }
+    if (!audio.currentSrc && loadingTrackIdRef.current == null) {
       return
     }
     if (audio.ended || audio.seeking) {
@@ -440,6 +456,7 @@ function App() {
     const requestId = playbackRequestId.current + 1
     playbackRequestId.current = requestId
     lastTrackRef.current = track
+    pendingTrackRef.current = track
     lastTrackSwitchAtRef.current = Date.now()
     clearRecoveryTimer()
     setLoadingTrackId(track.id)
@@ -496,6 +513,7 @@ function App() {
       setNowPlayingMetadata(null)
       setCacheUsageBytes(payload.cacheUsageBytes)
       setIsPlaying(true)
+      pendingTrackRef.current = null
       recoveryAttemptRef.current = 0
       lastPlaybackStartRef.current = Date.now()
       const playbackStatusLabel = options?.recoveryReason
@@ -508,6 +526,10 @@ function App() {
       if (requestId === playbackRequestId.current) {
         setStatusMessage(String(error))
         setIsPlaying(false)
+        const reason = isNotSupportedPlaybackError(error)
+          ? 'NotSupportedError'
+          : 'playback-interrupted'
+        void recoverPlayback(reason)
       }
     } finally {
       if (requestId === playbackRequestId.current) {
@@ -1227,7 +1249,7 @@ function App() {
             <div className="auth-visual">
               {qrImage ? (
                 <div className="qr-box qr-box-large">
-                  <img src={qrImage} alt="189 Cloud QR" />
+                  <img src={qrImage} alt="天翼云盘扫码二维码" />
                   <div className="qr-meta">
                     <p className="qr-heading">打开天翼云盘 App 扫码</p>
                     <p>{qrHint}</p>

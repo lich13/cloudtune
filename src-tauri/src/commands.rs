@@ -788,8 +788,8 @@ pub async fn prepare_track(
     let cache_limit_bytes = runtime.config.cache_limit_bytes();
     let cache_threads = runtime.config.cache_threads as usize;
     let download_threads = runtime.config.download_threads as usize;
-    let playback_mode = playback_mode_override
-        .unwrap_or_else(|| runtime.config.playback_mode.clone());
+    let playback_mode =
+        playback_mode_override.unwrap_or_else(|| runtime.config.playback_mode.clone());
 
     if let Some(cached_path) = runtime.cache_index.existing_path(&track_id, &cache_dir) {
         let cache_usage_bytes = runtime
@@ -1142,8 +1142,7 @@ pub async fn read_track_metadata(
         let runtime = state.inner.lock().await;
         runtime.app_handle.clone()
     };
-    let runtime_paths = RuntimePaths::resolve(&app_handle)
-        .map_err(|error| error.to_string())?;
+    let runtime_paths = RuntimePaths::resolve(&app_handle).map_err(|error| error.to_string())?;
 
     let parsed = tokio::task::spawn_blocking({
         let local_path = local_path.clone();

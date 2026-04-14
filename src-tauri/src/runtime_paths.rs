@@ -4,8 +4,24 @@ use tauri::{AppHandle, Manager};
 
 const PORTABLE_DATA_DIR: &str = "data";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRootKind {
+    Portable,
+    AppDataFallback,
+}
+
+impl RuntimeRootKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Portable => "portable-data",
+            Self::AppDataFallback => "app-data-fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
+    pub root_kind: RuntimeRootKind,
     pub root_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub config_path: PathBuf,
@@ -22,7 +38,9 @@ impl RuntimePaths {
             .app_data_dir()
             .context("failed to resolve app data directory")?;
 
-        let root_dir = resolve_preferred_root(app_handle).unwrap_or(fallback_root);
+        let (root_dir, root_kind) = resolve_preferred_root(app_handle)
+            .map(|path| (path, RuntimeRootKind::Portable))
+            .unwrap_or((fallback_root, RuntimeRootKind::AppDataFallback));
         let cache_dir = root_dir.join("cache");
         let artwork_dir = root_dir.join("artwork");
         let logs_dir = root_dir.join("logs");
@@ -32,6 +50,7 @@ impl RuntimePaths {
         fs::create_dir_all(&logs_dir)?;
 
         Ok(Self {
+            root_kind,
             root_dir: root_dir.clone(),
             cache_dir: cache_dir.clone(),
             config_path: root_dir.join("settings.json"),

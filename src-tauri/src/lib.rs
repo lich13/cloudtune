@@ -114,6 +114,22 @@ pub fn run() {
                     }))
                     .build(),
             )?;
+            tauri_plugin_log::log::info!(
+                target: "cloudtune::runtime",
+                "runtime data root [{}]: {}",
+                runtime_paths.root_kind.label(),
+                runtime_paths.root_dir.display(),
+            );
+            tauri_plugin_log::log::info!(
+                target: "cloudtune::runtime",
+                "cache dir: {}",
+                runtime_paths.cache_dir.display(),
+            );
+            tauri_plugin_log::log::info!(
+                target: "cloudtune::runtime",
+                "logs dir: {}",
+                runtime_paths.logs_dir.display(),
+            );
             let shared_state = state::AppState::new(app.handle().clone())?;
             app.manage(shared_state);
             app.manage(ShellState::default());

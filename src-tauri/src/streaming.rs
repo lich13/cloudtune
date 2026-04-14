@@ -1,7 +1,6 @@
 use std::{collections::HashMap, net::TcpListener, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
-use tauri_plugin_log::log::{info, warn};
 use axum::{
     Router,
     body::Body,
@@ -17,6 +16,7 @@ use bytes::Bytes;
 use mime_guess::MimeGuess;
 use reqwest::{Client, StatusCode as ReqwestStatusCode, header::RANGE as REQWEST_RANGE};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_log::log::{info, warn};
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
@@ -26,8 +26,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{cloud189::build_media_client, models::TransferStatus, state::AppState};
 
-const MAX_STREAM_RESUME_ATTEMPTS: u8 = 6;
-const STREAM_RESUME_DELAY_MS: u64 = 900;
+const MAX_STREAM_RESUME_ATTEMPTS: u8 = 12;
+const STREAM_RESUME_DELAY_MS: u64 = 1500;
+const STREAM_RESUME_MAX_DELAY_MS: u64 = 12000;
 
 pub type StreamSourceStore = Arc<Mutex<HashMap<String, StreamSource>>>;
 pub type TransferStore = Arc<Mutex<HashMap<String, TransferStatus>>>;
@@ -189,6 +190,8 @@ async fn handle_stream(
 
     tokio::spawn(stream_and_cache_task(
         state.app_handle.clone(),
+        state.client.clone(),
+        state.sources.clone(),
         state.transfers.clone(),
         transfer_id,
         source,
@@ -297,9 +300,11 @@ async fn handle_stream_head(
 
 async fn stream_and_cache_task(
     app_handle: AppHandle,
+    client: Client,
+    sources: StreamSourceStore,
     transfers: TransferStore,
     transfer_id: String,
-    source: StreamSource,
+    mut source: StreamSource,
     mut response: reqwest::Response,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     can_cache: bool,
@@ -387,46 +392,74 @@ async fn stream_and_cache_task(
             }
             Ok(None) => break,
             Err(error) => {
-                if transferred == 0 || resume_attempts >= MAX_STREAM_RESUME_ATTEMPTS {
-                    warn!(target: "cloudtune::streaming", "stream {} stopped after {} bytes: {}", source.track_id, transferred, error);
-                    finished_without_error = false;
-                    break;
-                }
+                warn!(
+                    target: "cloudtune::streaming",
+                    "stream {} interrupted after {} bytes: {}",
+                    source.track_id,
+                    transferred,
+                    error
+                );
 
-                resume_attempts = resume_attempts.saturating_add(1);
-                warn!(target: "cloudtune::streaming", "stream {} interrupted, resume attempt {} from byte {}", source.track_id, resume_attempts, transferred);
-                let resume_range = format!("bytes={}-", transferred);
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    STREAM_RESUME_DELAY_MS * u64::from(resume_attempts),
-                ))
-                .await;
+                let mut resumed = false;
+                while resume_attempts < MAX_STREAM_RESUME_ATTEMPTS {
+                    resume_attempts = resume_attempts.saturating_add(1);
+                    let delay_ms = (STREAM_RESUME_DELAY_MS * u64::from(resume_attempts))
+                        .min(STREAM_RESUME_MAX_DELAY_MS);
+                    warn!(
+                        target: "cloudtune::streaming",
+                        "stream {} resume attempt {}/{} from byte {} after {} ms",
+                        source.track_id,
+                        resume_attempts,
+                        MAX_STREAM_RESUME_ATTEMPTS,
+                        transferred,
+                        delay_ms
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
 
-                match send_stream_request(
-                    &build_media_client().unwrap_or_else(|_| Client::new()),
-                    &source.playback_url,
-                    Some(&resume_range),
-                )
-                .await
-                {
-                    Ok(next_response)
-                        if next_response.status().is_success()
-                            || next_response.status() == ReqwestStatusCode::PARTIAL_CONTENT =>
+                    match reopen_stream_response(
+                        &client,
+                        &app_handle,
+                        &sources,
+                        &mut source,
+                        transferred,
+                    )
+                    .await
                     {
-                        info!(target: "cloudtune::streaming", "stream {} resumed from byte {}", source.track_id, transferred);
-                        response = next_response;
-                        continue;
-                    }
-                    Ok(next_response) => {
-                        warn!(target: "cloudtune::streaming", "stream {} resume returned {}", source.track_id, next_response.status());
-                        finished_without_error = false;
-                        break;
-                    }
-                    Err(resume_error) => {
-                        warn!(target: "cloudtune::streaming", "stream {} resume failed: {}", source.track_id, resume_error);
-                        finished_without_error = false;
-                        break;
+                        Ok(next_response) => {
+                            info!(
+                                target: "cloudtune::streaming",
+                                "stream {} resumed from byte {}",
+                                source.track_id,
+                                transferred
+                            );
+                            response = next_response;
+                            resumed = true;
+                            break;
+                        }
+                        Err(resume_error) => {
+                            warn!(
+                                target: "cloudtune::streaming",
+                                "stream {} resume attempt {} failed: {}",
+                                source.track_id,
+                                resume_attempts,
+                                resume_error
+                            );
+                        }
                     }
                 }
+
+                if resumed {
+                    continue;
+                }
+
+                warn!(
+                    target: "cloudtune::streaming",
+                    "stream {} stopped permanently after {} resume attempts",
+                    source.track_id,
+                    resume_attempts
+                );
+                finished_without_error = false;
+                break;
             }
         }
     }
@@ -534,6 +567,48 @@ async fn refresh_stream_source(
     let source = source_store.get_mut(track_id)?;
     source.playback_url = playback_url;
     Some(source.clone())
+}
+
+async fn reopen_stream_response(
+    client: &Client,
+    app_handle: &AppHandle,
+    sources: &StreamSourceStore,
+    source: &mut StreamSource,
+    transferred: u64,
+) -> Result<reqwest::Response, String> {
+    let resume_range = format!("bytes={transferred}-");
+    let response = send_stream_request(client, &source.playback_url, Some(&resume_range))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if response.status().is_success() || response.status() == ReqwestStatusCode::PARTIAL_CONTENT {
+        return Ok(response);
+    }
+
+    if should_refresh_playback_url(response.status()) {
+        let refreshed = refresh_stream_source(app_handle, sources, &source.track_id)
+            .await
+            .ok_or_else(|| "failed to refresh playback url".to_string())?;
+        *source = refreshed;
+
+        let refreshed_response =
+            send_stream_request(client, &source.playback_url, Some(&resume_range))
+                .await
+                .map_err(|error| error.to_string())?;
+
+        if refreshed_response.status().is_success()
+            || refreshed_response.status() == ReqwestStatusCode::PARTIAL_CONTENT
+        {
+            return Ok(refreshed_response);
+        }
+
+        return Err(format!(
+            "refreshed stream returned {}",
+            refreshed_response.status()
+        ));
+    }
+
+    Err(format!("resume returned {}", response.status()))
 }
 
 fn should_refresh_playback_url(status: StatusCode) -> bool {

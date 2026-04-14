@@ -99,6 +99,38 @@ fn build_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
+fn allow_runtime_asset_paths<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    runtime_paths: &runtime_paths::RuntimePaths,
+) -> tauri::Result<()> {
+    let asset_scope = app.asset_protocol_scope();
+    asset_scope.allow_directory(&runtime_paths.root_dir, true)?;
+    asset_scope.allow_directory(&runtime_paths.cache_dir, true)?;
+    asset_scope.allow_directory(&runtime_paths.artwork_dir, true)?;
+
+    let mut allowed_patterns = asset_scope
+        .allowed_patterns()
+        .into_iter()
+        .map(|pattern| pattern.as_str().to_string())
+        .collect::<Vec<_>>();
+    allowed_patterns.sort();
+
+    let cache_probe = runtime_paths.cache_dir.join("__asset_scope_probe__.m4a");
+    tauri_plugin_log::log::info!(
+        target: "cloudtune::runtime",
+        "asset scope probe [{}] => {}",
+        cache_probe.display(),
+        asset_scope.is_allowed(&cache_probe),
+    );
+    tauri_plugin_log::log::info!(
+        target: "cloudtune::runtime",
+        "asset scope patterns: {}",
+        allowed_patterns.join(" | "),
+    );
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -143,6 +175,7 @@ pub fn run() {
                 "webview dir: {}",
                 runtime_paths.webview_dir.display(),
             );
+            allow_runtime_asset_paths(&app.handle(), &runtime_paths)?;
             let mut window_builder = WebviewWindowBuilder::from_config(app, &main_window_config)?;
             #[cfg(target_os = "windows")]
             {

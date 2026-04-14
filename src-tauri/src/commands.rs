@@ -60,7 +60,7 @@ async fn ensure_authenticated(runtime: &mut RuntimeState) -> Result<()> {
         .refresh_token
         .clone()
         .filter(|token| !token.trim().is_empty())
-        .context("please sign in to Tianyi Cloud first")?;
+        .context("请先扫码登录天翼云盘")?;
     runtime
         .cloud
         .restore_from_refresh_token(refresh_token)
@@ -144,7 +144,7 @@ fn parse_track_metadata(
         local_path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("Unknown track")
+            .unwrap_or("未知曲目")
             .to_string()
     } else {
         fallback_name
@@ -757,7 +757,7 @@ pub async fn scan_library(state: State<'_, AppState>) -> Result<Vec<TrackSummary
     let current_folder = runtime
         .config
         .current_folder()
-        .context("please choose a music directory first")
+        .context("请先选择音乐目录")
         .map_err(to_command_error)?;
 
     runtime
@@ -934,7 +934,7 @@ pub async fn update_cache_limit(
     limit_mb: u64,
 ) -> Result<SettingsPayload, String> {
     if limit_mb < 256 {
-        return Err("cache limit must be at least 256 MB".to_string());
+        return Err("缓存上限至少设置为 256 MB".to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -950,10 +950,10 @@ pub async fn update_transfer_tuning(
     cache_threads: u16,
 ) -> Result<SettingsPayload, String> {
     if !(1..=MAX_DOWNLOAD_THREADS).contains(&download_threads) {
-        return Err(format!("download threads must be within 1-{MAX_DOWNLOAD_THREADS}"));
+        return Err(format!("下载线程范围是 1-{MAX_DOWNLOAD_THREADS}"));
     }
     if !(1..=MAX_CACHE_THREADS).contains(&cache_threads) {
-        return Err(format!("cache threads must be within 1-{MAX_CACHE_THREADS}"));
+        return Err(format!("缓存线程范围是 1-{MAX_CACHE_THREADS}"));
     }
 
     let mut runtime = state.inner.lock().await;
@@ -969,7 +969,7 @@ pub async fn update_playback_mode(
     playback_mode: String,
 ) -> Result<SettingsPayload, String> {
     if playback_mode != "download_first" && playback_mode != "stream_cache" {
-        return Err("invalid playback mode".to_string());
+        return Err("播放模式不合法".to_string());
     }
 
     let mut runtime = state.inner.lock().await;
@@ -1203,7 +1203,7 @@ pub async fn resume_transfer(state: State<'_, AppState>, id: String) -> Result<(
         controls
             .get(&id)
             .and_then(|control| control.download.clone())
-            .context("transfer cannot be resumed")
+            .context("该任务不支持继续")
             .map_err(to_command_error)?
     };
 

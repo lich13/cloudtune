@@ -52,6 +52,7 @@ impl RuntimePaths {
 
         if root_kind == RuntimeRootKind::Portable {
             migrate_legacy_root(app_handle.path().app_data_dir().ok().as_deref(), &root_dir)?;
+            migrate_legacy_webview_root(app_handle, &webview_dir)?;
         }
 
         fs::create_dir_all(&cache_dir)?;
@@ -126,6 +127,10 @@ fn move_directory_contents(source_root: &Path, destination_root: &Path) -> Resul
 }
 
 fn move_entry(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+
     if destination.exists() {
         if source.is_dir() && destination.is_dir() {
             move_directory_contents(source, destination)?;
@@ -163,6 +168,22 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
         }
         fs::copy(source, destination)?;
         fs::remove_file(source)?;
+    }
+
+    Ok(())
+}
+
+fn migrate_legacy_webview_root(app_handle: &AppHandle, portable_webview_dir: &Path) -> Result<()> {
+    let Some(legacy_local_root) = app_handle.path().app_local_data_dir().ok() else {
+        return Ok(());
+    };
+
+    let legacy_webview_root = legacy_local_root.join("EBWebView");
+    let destination_webview_root = portable_webview_dir.join("EBWebView");
+    move_entry(&legacy_webview_root, &destination_webview_root)?;
+
+    if legacy_local_root.exists() && legacy_local_root.read_dir()?.next().is_none() {
+        let _ = fs::remove_dir(&legacy_local_root);
     }
 
     Ok(())

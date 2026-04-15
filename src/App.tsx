@@ -1002,7 +1002,12 @@ function App() {
   ])
 
   useEffect(() => {
-    if (!authenticated || !currentTrack || loopMode === 'one') {
+    if (
+      !authenticated ||
+      !currentTrack ||
+      loopMode === 'one' ||
+      playbackMode !== 'stream_cache'
+    ) {
       return
     }
 
@@ -1039,7 +1044,7 @@ function App() {
           prefetchingTrackId.current = null
         }
       })
-  }, [authenticated, currentTrack, currentTime, duration, loopMode, shuffle, tracks])
+  }, [authenticated, currentTrack, currentTime, duration, loopMode, playbackMode, shuffle, tracks])
 
   useEffect(() => {
     if (!authenticated) {

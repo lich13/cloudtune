@@ -41,6 +41,7 @@ const DOWNLOAD_PART_RETRY_DELAY_MS: u64 = 1500;
 const DOWNLOAD_PART_RETRY_MAX_DELAY_MS: u64 = 12000;
 const TOTAL_SIZE_PROBE_RETRY_ATTEMPTS: u8 = 4;
 const PLAYBACK_DOWNLOAD_THREAD_LIMIT: usize = 1;
+const PREFETCH_CACHE_THREAD_LIMIT: usize = 1;
 
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
@@ -313,6 +314,10 @@ fn effective_download_thread_count(task_id: &str, requested: usize) -> usize {
     } else {
         requested
     }
+}
+
+fn effective_prefetch_thread_count(requested: usize) -> usize {
+    requested.min(PREFETCH_CACHE_THREAD_LIMIT).max(1)
 }
 
 fn next_download_retry_delay_ms(attempt: u8) -> u64 {
@@ -1148,6 +1153,16 @@ pub async fn prepare_track(
         .map_err(to_command_error)?;
     let app_handle = runtime.app_handle.clone();
     if !for_playback && !runtime.active_cache_downloads.contains(&track_id) {
+        let prefetch_threads = effective_prefetch_thread_count(cache_threads);
+        if prefetch_threads != cache_threads.max(1) {
+            info!(
+                target: "cloudtune::download",
+                "track {} limited prefetch threads from {} to {}",
+                track_id,
+                cache_threads.max(1),
+                prefetch_threads
+            );
+        }
         runtime.active_cache_downloads.insert(track_id.clone());
         spawn_background_cache(
             app_handle.clone(),
@@ -1156,7 +1171,7 @@ pub async fn prepare_track(
             destination.clone(),
             playback_url.clone(),
             size_bytes,
-            cache_threads.max(1),
+            prefetch_threads,
         );
     }
 

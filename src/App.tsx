@@ -549,7 +549,7 @@ function App() {
           options?.recoveryReason !== 'NotSupportedError' &&
           isTransientDownloadError(error)
         ) {
-          setStatusMessage(`《${track.name}》下载后播放失败，改用边播边缓存继续播放`)
+          setStatusMessage(`《${track.name}》优先缓存失败，改用边播边缓存继续播放`)
           await playTrack(track, {
             playbackModeOverride: 'stream_cache',
             recoveryReason: options?.recoveryReason ?? 'download-timeout-fallback',
@@ -767,7 +767,7 @@ function App() {
       setCacheThreadsInput(String(payload.cacheThreads))
       setCacheUsageBytes(payload.cacheUsageBytes)
       setStatusMessage(
-        mode === 'download_first' ? '已切到下载完成后播放' : '已切到边播边缓存',
+        mode === 'download_first' ? '已切到优先缓存播放' : '已切到边播边缓存',
       )
     } catch (error) {
       setStatusMessage(String(error))
@@ -1203,7 +1203,7 @@ function App() {
           </div>
           <div className="metric-block">
             <span>播放模式</span>
-            <strong>{playbackMode === 'download_first' ? '下载后播放' : '边播边缓存'}</strong>
+            <strong>{playbackMode === 'download_first' ? '优先缓存' : '边播边缓存'}</strong>
           </div>
           <div className="metric-block">
             <span>实时速度</span>
@@ -1254,7 +1254,7 @@ function App() {
                   className={`toggle-chip ${playbackMode === 'download_first' ? 'active' : ''}`}
                   onClick={() => void savePlaybackMode('download_first')}
                 >
-                  下载后播放
+                    优先缓存
                 </button>
                 <button
                   className={`toggle-chip ${playbackMode === 'stream_cache' ? 'active' : ''}`}

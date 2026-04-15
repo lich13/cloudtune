@@ -1100,7 +1100,6 @@ pub async fn prepare_track(
     let cache_dir = runtime.cache_dir.clone();
     let cache_limit_bytes = runtime.config.cache_limit_bytes();
     let cache_threads = runtime.config.cache_threads as usize;
-    let download_threads = runtime.config.download_threads as usize;
     let playback_mode =
         playback_mode_override.unwrap_or_else(|| runtime.config.playback_mode.clone());
 
@@ -1127,7 +1126,7 @@ pub async fn prepare_track(
         drop(runtime);
 
         if let Some((cached_path, cache_usage_bytes)) =
-            wait_for_prefetched_track(&state, &track_id, Duration::from_secs(45)).await
+            wait_for_prefetched_track(&state, &track_id, Duration::from_secs(6)).await
         {
             return Ok(PreparedTrack {
                 track_id,
@@ -1175,52 +1174,16 @@ pub async fn prepare_track(
         );
     }
 
-    if for_playback && playback_mode == "download_first" {
-        let task_id = format!("playback:{}", track_id);
-        drop(runtime);
-        run_download_task(
-            app_handle.clone(),
-            task_id,
-            DownloadSpec {
-                track_id: track_id.clone(),
-                file_name: file_name.clone(),
-                size_bytes,
-                destination: destination.clone(),
-                thread_count: download_threads.max(1),
-            },
-            playback_url.clone(),
-        )
-        .await
-        .map_err(to_command_error)?;
-        let downloaded_size = fs::metadata(&destination)
-            .await
-            .map(|meta| meta.len())
-            .map_err(|error| to_command_error(error.into()))?;
-
-        let mut runtime = state.inner.lock().await;
-        runtime.cache_index.record(
-            track_id.clone(),
-            cache_file_name,
-            downloaded_size.max(size_bytes),
-        );
-        let cache_usage_bytes = runtime
-            .cache_index
-            .prune_to_limit(&cache_dir, cache_limit_bytes, Some(track_id.as_str()))
-            .map_err(to_command_error)?;
-        runtime.save_cache_index().map_err(to_command_error)?;
-
-        return Ok(PreparedTrack {
-            track_id,
-            local_path: destination.to_string_lossy().into_owned(),
-            playback_url: destination.to_string_lossy().into_owned(),
-            is_streaming: false,
-            cache_usage_bytes,
-        });
-    }
-
     let cache_usage_bytes = runtime.cache_index.usage_bytes(&cache_dir);
     runtime.save_cache_index().map_err(to_command_error)?;
     let playback_target = if for_playback {
+        if playback_mode == "download_first" {
+            info!(
+                target: "cloudtune::playback",
+                "track {} cache miss under preferred-cache mode, switching to resilient streaming",
+                track_id
+            );
+        }
         let mut sources = state.stream_sources.lock().await;
         sources.insert(
             track_id.clone(),

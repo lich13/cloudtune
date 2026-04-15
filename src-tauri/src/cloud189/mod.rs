@@ -201,6 +201,9 @@ impl Cloud189Client {
             .default_headers(default_headers)
             .no_proxy()
             .user_agent(CLOUDTUNE_USER_AGENT)
+            // Some 189 endpoints close idle keep-alive sockets abruptly, which shows up
+            // as `hyper::Error(IncompleteMessage)` on the next reused request.
+            .pool_max_idle_per_host(0)
             .build()?;
 
         Ok(Self {
@@ -1300,6 +1303,8 @@ pub fn build_media_client() -> Result<Client> {
         .default_headers(default_headers)
         .no_proxy()
         .user_agent(CLOUDTUNE_USER_AGENT)
+        // Use fresh connections for media fetches to avoid reusing half-closed idle sockets.
+        .pool_max_idle_per_host(0)
         .build()?)
 }
 

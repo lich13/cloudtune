@@ -56,6 +56,8 @@ function isTransientDownloadError(error: unknown) {
     'timed out',
     'tcp connect error',
     'client error (connect)',
+    'incompletemessage',
+    'incomplete message',
     'deadline has elapsed',
     'connection reset',
     'connection aborted',

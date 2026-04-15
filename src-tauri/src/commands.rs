@@ -40,7 +40,7 @@ const MAX_DOWNLOAD_PART_RETRY_ATTEMPTS: u8 = 12;
 const DOWNLOAD_PART_RETRY_DELAY_MS: u64 = 1500;
 const DOWNLOAD_PART_RETRY_MAX_DELAY_MS: u64 = 12000;
 const TOTAL_SIZE_PROBE_RETRY_ATTEMPTS: u8 = 4;
-const PLAYBACK_DOWNLOAD_THREAD_LIMIT: usize = 4;
+const PLAYBACK_DOWNLOAD_THREAD_LIMIT: usize = 1;
 
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
@@ -631,6 +631,13 @@ async fn run_download_task(
         )
         .await?
     };
+    info!(
+        target: "cloudtune::download",
+        "task {} preparing download for track {} with known size {}",
+        task_id,
+        spec.track_id,
+        total_size
+    );
     upsert_transfer_status(
         &state,
         &task_id,
@@ -779,6 +786,13 @@ async fn run_download_task(
             Some(total_size),
         )
         .await;
+        warn!(
+            target: "cloudtune::download",
+            "task {} failed after {} bytes: {}",
+            task_id,
+            transferred,
+            error
+        );
         anyhow::bail!(error);
     }
 

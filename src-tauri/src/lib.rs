@@ -13,7 +13,7 @@ use tauri::{
     menu::{Menu, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tauri_plugin_log::{Target, TargetKind};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "main-tray";
@@ -146,6 +146,8 @@ pub fn run() {
                 .expect("missing main window config");
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
+                    .max_file_size(1_000_000)
+                    .rotation_strategy(RotationStrategy::KeepSome(5))
                     .clear_targets()
                     .target(Target::new(TargetKind::Stdout))
                     .target(Target::new(TargetKind::Folder {

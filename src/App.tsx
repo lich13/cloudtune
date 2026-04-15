@@ -50,6 +50,22 @@ function isNotSupportedPlaybackError(error: unknown) {
   return String(error).includes('NotSupportedError')
 }
 
+function isTransientDownloadError(error: unknown) {
+  const text = String(error).toLowerCase()
+  return [
+    'timed out',
+    'tcp connect error',
+    'client error (connect)',
+    'deadline has elapsed',
+    'connection reset',
+    'connection aborted',
+    'connection refused',
+    '10060',
+    '连接尝试失败',
+    '没有反应',
+  ].some((fragment) => text.includes(fragment))
+}
+
 async function waitForAudioReady(
   audio: HTMLAudioElement,
   timeoutMs = PLAYBACK_BUFFERING_TIMEOUT_MS,
@@ -524,6 +540,22 @@ function App() {
       setStatusMessage(playbackStatusLabel)
     } catch (error) {
       if (requestId === playbackRequestId.current) {
+        const effectivePlaybackMode = options?.playbackModeOverride ?? playbackMode
+        if (
+          effectivePlaybackMode === 'download_first' &&
+          options?.playbackModeOverride !== 'stream_cache' &&
+          options?.recoveryReason !== 'NotSupportedError' &&
+          isTransientDownloadError(error)
+        ) {
+          setStatusMessage(`《${track.name}》下载后播放失败，改用边播边缓存继续播放`)
+          await playTrack(track, {
+            playbackModeOverride: 'stream_cache',
+            recoveryReason: options?.recoveryReason ?? 'download-timeout-fallback',
+            resumeTime: options?.resumeTime,
+          })
+          return
+        }
+
         setStatusMessage(String(error))
         setIsPlaying(false)
         const reason = isNotSupportedPlaybackError(error)

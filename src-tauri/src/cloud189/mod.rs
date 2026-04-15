@@ -22,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
     time::SystemTime,
 };
+use tauri_plugin_log::log::{info, warn};
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
@@ -44,6 +45,9 @@ pub const CLOUDTUNE_USER_AGENT: &str = "CloudTune/0.1.0";
 pub const CLOUD189_REFERER: &str = "https://cloud.189.cn/";
 const MIN_PARALLEL_DOWNLOAD_SIZE: u64 = 512 * 1024;
 const MAX_PARALLEL_DOWNLOADS: usize = 32;
+const MAX_PARALLEL_RANGE_RETRY_ATTEMPTS: u8 = 10;
+const PARALLEL_RANGE_RETRY_DELAY_MS: u64 = 1200;
+const PARALLEL_RANGE_RETRY_MAX_DELAY_MS: u64 = 10000;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -1096,6 +1100,10 @@ fn split_ranges(content_length: u64, parts: usize) -> Vec<(u64, u64)> {
     ranges
 }
 
+fn next_parallel_range_retry_delay_ms(attempt: u8) -> u64 {
+    (PARALLEL_RANGE_RETRY_DELAY_MS * u64::from(attempt)).min(PARALLEL_RANGE_RETRY_MAX_DELAY_MS)
+}
+
 async fn download_range_part(
     client: Client,
     url: String,
@@ -1103,25 +1111,156 @@ async fn download_range_part(
     end: u64,
     destination: PathBuf,
 ) -> Result<()> {
-    let mut response = client
-        .get(&url)
-        .header(ACCEPT, "*/*")
-        .header("User-Agent", CLOUDTUNE_USER_AGENT)
-        .header(RANGE, format!("bytes={start}-{end}"))
-        .send()
-        .await?
-        .error_for_status()?;
+    let expected_len = end - start + 1;
+    let mut written = 0_u64;
+    let mut retry_streak = 0_u8;
+    let mut last_error = String::from("range download interrupted");
 
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        bail!("range request was not honored");
+    while written < expected_len {
+        let range_start = start + written;
+        let response = client
+            .get(&url)
+            .header(ACCEPT, "*/*")
+            .header("User-Agent", CLOUDTUNE_USER_AGENT)
+            .header(RANGE, format!("bytes={range_start}-{end}"))
+            .send()
+            .await;
+
+        let mut response = match response {
+            Ok(response) => {
+                let status = response.status();
+                if status == StatusCode::PARTIAL_CONTENT {
+                    response
+                } else {
+                    last_error = format!("range request returned {}", status.as_u16());
+                    retry_streak = retry_streak.saturating_add(1);
+                    warn!(
+                        target: "cloudtune::cloud189",
+                        "parallel range {}-{} attempt {}/{} returned {}",
+                        start,
+                        end,
+                        retry_streak,
+                        MAX_PARALLEL_RANGE_RETRY_ATTEMPTS,
+                        status
+                    );
+
+                    if retry_streak >= MAX_PARALLEL_RANGE_RETRY_ATTEMPTS {
+                        bail!(last_error);
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        next_parallel_range_retry_delay_ms(retry_streak),
+                    ))
+                    .await;
+                    continue;
+                }
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                retry_streak = retry_streak.saturating_add(1);
+                warn!(
+                    target: "cloudtune::cloud189",
+                    "parallel range {}-{} attempt {}/{} failed: {}",
+                    start,
+                    end,
+                    retry_streak,
+                    MAX_PARALLEL_RANGE_RETRY_ATTEMPTS,
+                    error
+                );
+
+                if retry_streak >= MAX_PARALLEL_RANGE_RETRY_ATTEMPTS {
+                    return Err(error.into());
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    next_parallel_range_retry_delay_ms(retry_streak),
+                ))
+                .await;
+                continue;
+            }
+        };
+
+        let file = if written > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&destination)
+                .await?
+        } else {
+            fs::File::create(&destination).await?
+        };
+        let mut writer = BufWriter::new(file);
+        let mut progressed = false;
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    writer.write_all(&chunk).await?;
+                    written = written.saturating_add(chunk.len() as u64).min(expected_len);
+                    progressed = true;
+                }
+                Ok(None) => {
+                    writer.flush().await?;
+                    break;
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    warn!(
+                        target: "cloudtune::cloud189",
+                        "parallel range {}-{} interrupted after {} bytes: {}",
+                        start,
+                        end,
+                        written,
+                        error
+                    );
+                    let _ = writer.flush().await;
+                    break;
+                }
+            }
+        }
+
+        if written >= expected_len {
+            if retry_streak > 0 {
+                info!(
+                    target: "cloudtune::cloud189",
+                    "parallel range {}-{} recovered after retries",
+                    start,
+                    end
+                );
+            }
+            return Ok(());
+        }
+
+        if progressed {
+            retry_streak = 0;
+        } else {
+            retry_streak = retry_streak.saturating_add(1);
+        }
+
+        if retry_streak >= MAX_PARALLEL_RANGE_RETRY_ATTEMPTS {
+            bail!(
+                "range {}-{} failed after {} retries: {}",
+                start,
+                end,
+                MAX_PARALLEL_RANGE_RETRY_ATTEMPTS,
+                last_error
+            );
+        }
+
+        warn!(
+            target: "cloudtune::cloud189",
+            "parallel range {}-{} retrying from byte {} ({}/{})",
+            start,
+            end,
+            start + written,
+            retry_streak,
+            MAX_PARALLEL_RANGE_RETRY_ATTEMPTS
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(
+            next_parallel_range_retry_delay_ms(retry_streak),
+        ))
+        .await;
     }
 
-    let file = fs::File::create(destination).await?;
-    let mut writer = BufWriter::new(file);
-    while let Some(chunk) = response.chunk().await? {
-        writer.write_all(&chunk).await?;
-    }
-    writer.flush().await?;
     Ok(())
 }
 

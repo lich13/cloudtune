@@ -68,6 +68,14 @@ function isTransientDownloadError(error: unknown) {
   ].some((fragment) => text.includes(fragment))
 }
 
+function isLoopbackStreamUrl(value: string | null | undefined) {
+  if (!value) {
+    return false
+  }
+
+  return value.startsWith('http://127.0.0.1:')
+}
+
 async function waitForAudioReady(
   audio: HTMLAudioElement,
   timeoutMs = PLAYBACK_BUFFERING_TIMEOUT_MS,
@@ -847,7 +855,27 @@ function App() {
       }
     }
     const onPlaybackError = () => {
-      const reason = audio.error?.code === 4 ? 'NotSupportedError' : 'playback-interrupted'
+      if (loadingTrackIdRef.current) {
+        return
+      }
+
+      const mediaError = audio.error
+      if (!mediaError || mediaError.code === MediaError.MEDIA_ERR_ABORTED) {
+        return
+      }
+
+      if (
+        isLoopbackStreamUrl(audio.currentSrc) &&
+        mediaError.code !== MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+      ) {
+        setStatusMessage(`流式连接波动，等待后台续传《${currentTrackRef.current?.name ?? ''}》`)
+        return
+      }
+
+      const reason =
+        mediaError.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+          ? 'NotSupportedError'
+          : 'playback-interrupted'
       void recoverPlayback(reason)
     }
 
@@ -998,12 +1026,7 @@ function App() {
   ])
 
   useEffect(() => {
-    if (
-      !authenticated ||
-      !currentTrack ||
-      loopMode === 'one' ||
-      playbackMode !== 'stream_cache'
-    ) {
+    if (!authenticated || !currentTrack || loopMode === 'one') {
       return
     }
 
@@ -1029,11 +1052,13 @@ function App() {
       .prefetchTrack(nextTrack.id, nextTrack.name, nextTrack.sizeBytes)
       .then(() => {
         prefetchedTrackId.current = nextTrack.id
+        void api.updatePlaybackContext(currentTrackId, nextTrack.id)
       })
       .catch(() => {
         if (prefetchedTrackId.current === nextTrack.id) {
           prefetchedTrackId.current = null
         }
+        void api.updatePlaybackContext(currentTrackId, null)
       })
       .finally(() => {
         if (prefetchingTrackId.current === nextTrack.id) {
@@ -1041,6 +1066,14 @@ function App() {
         }
       })
   }, [authenticated, currentTrack, currentTime, duration, loopMode, playbackMode, shuffle, tracks])
+
+  useEffect(() => {
+    if (!authenticated) {
+      return
+    }
+
+    void api.updatePlaybackContext(currentTrackId, prefetchedTrackId.current)
+  }, [authenticated, currentTrackId, tracks, shuffle, loopMode])
 
   useEffect(() => {
     if (!authenticated) {

@@ -998,12 +998,7 @@ function App() {
   ])
 
   useEffect(() => {
-    if (
-      !authenticated ||
-      !currentTrack ||
-      loopMode === 'one' ||
-      playbackMode !== 'stream_cache'
-    ) {
+    if (!authenticated || !currentTrack || loopMode === 'one') {
       return
     }
 
@@ -1029,11 +1024,13 @@ function App() {
       .prefetchTrack(nextTrack.id, nextTrack.name, nextTrack.sizeBytes)
       .then(() => {
         prefetchedTrackId.current = nextTrack.id
+        void api.updatePlaybackContext(currentTrackId, nextTrack.id)
       })
       .catch(() => {
         if (prefetchedTrackId.current === nextTrack.id) {
           prefetchedTrackId.current = null
         }
+        void api.updatePlaybackContext(currentTrackId, null)
       })
       .finally(() => {
         if (prefetchingTrackId.current === nextTrack.id) {
@@ -1041,6 +1038,14 @@ function App() {
         }
       })
   }, [authenticated, currentTrack, currentTime, duration, loopMode, playbackMode, shuffle, tracks])
+
+  useEffect(() => {
+    if (!authenticated) {
+      return
+    }
+
+    void api.updatePlaybackContext(currentTrackId, prefetchedTrackId.current)
+  }, [authenticated, currentTrackId, tracks, shuffle, loopMode])
 
   useEffect(() => {
     if (!authenticated) {

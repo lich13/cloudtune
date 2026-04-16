@@ -218,6 +218,7 @@ pub fn run() {
             commands::update_cache_limit,
             commands::update_transfer_tuning,
             commands::update_playback_mode,
+            commands::update_playback_context,
             commands::get_transfer_snapshot,
             commands::pick_download_directory,
             commands::download_track_to_directory,

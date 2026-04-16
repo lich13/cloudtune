@@ -918,13 +918,9 @@ async fn wait_for_prefetched_track(
         {
             let mut runtime = state.inner.lock().await;
             let cache_dir = runtime.cache_dir.clone();
-            let cache_limit_bytes = runtime.config.cache_limit_bytes();
 
             if let Some(cached_path) = runtime.cache_index.existing_path(track_id, &cache_dir) {
-                let cache_usage_bytes = runtime
-                    .cache_index
-                    .prune_to_limit(&cache_dir, cache_limit_bytes, Some(track_id))
-                    .ok()?;
+                let cache_usage_bytes = runtime.prune_cache_to_limit(&[track_id]).ok()?;
                 let _ = runtime.save_cache_index();
                 return Some((
                     cached_path.to_string_lossy().into_owned(),
@@ -975,18 +971,12 @@ fn spawn_background_cache(
         runtime.active_cache_downloads.remove(&track_id);
 
         if let Ok(downloaded_size) = result {
-            let cache_dir = runtime.cache_dir.clone();
-            let cache_limit_bytes = runtime.config.cache_limit_bytes();
             runtime.cache_index.record(
                 track_id.clone(),
                 cache_file_name,
                 downloaded_size.max(expected_size),
             );
-            let _ = runtime.cache_index.prune_to_limit(
-                &cache_dir,
-                cache_limit_bytes,
-                Some(track_id.as_str()),
-            );
+            let _ = runtime.prune_cache_to_limit(&[track_id.as_str()]);
             let _ = runtime.save_cache_index();
         }
     });
@@ -1098,15 +1088,13 @@ pub async fn prepare_track(
         .await
         .map_err(to_command_error)?;
     let cache_dir = runtime.cache_dir.clone();
-    let cache_limit_bytes = runtime.config.cache_limit_bytes();
     let cache_threads = runtime.config.cache_threads as usize;
     let playback_mode =
         playback_mode_override.unwrap_or_else(|| runtime.config.playback_mode.clone());
 
     if let Some(cached_path) = runtime.cache_index.existing_path(&track_id, &cache_dir) {
         let cache_usage_bytes = runtime
-            .cache_index
-            .prune_to_limit(&cache_dir, cache_limit_bytes, Some(track_id.as_str()))
+            .prune_cache_to_limit(&[track_id.as_str()])
             .map_err(to_command_error)?;
         runtime.save_cache_index().map_err(to_command_error)?;
 
@@ -1262,6 +1250,25 @@ pub async fn update_playback_mode(
     runtime.config.playback_mode = playback_mode;
     runtime.save_config().map_err(to_command_error)?;
     build_settings_payload(&mut runtime).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn update_playback_context(
+    state: State<'_, AppState>,
+    current_track_id: Option<String>,
+    next_track_id: Option<String>,
+) -> Result<(), String> {
+    let mut runtime = state.inner.lock().await;
+    runtime.protected_cache_tracks.clear();
+    if let Some(current_track_id) = current_track_id.filter(|value| !value.trim().is_empty()) {
+        runtime.protected_cache_tracks.insert(current_track_id);
+    }
+    if let Some(next_track_id) = next_track_id.filter(|value| !value.trim().is_empty()) {
+        runtime.protected_cache_tracks.insert(next_track_id);
+    }
+    let _ = runtime.prune_cache_to_limit(&[]);
+    runtime.save_cache_index().map_err(to_command_error)?;
+    Ok(())
 }
 
 #[tauri::command]

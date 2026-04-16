@@ -84,8 +84,8 @@ async function waitForAudioReady(
     return
   }
 
-  await new Promise<void>((resolve) => {
-    const events = ['loadedmetadata', 'canplay', 'canplaythrough', 'error']
+  await new Promise<void>((resolve, reject) => {
+    const readyEvents = ['loadedmetadata', 'canplay', 'canplaythrough']
     const timeout = window.setTimeout(() => {
       cleanup()
       resolve()
@@ -96,12 +96,19 @@ async function waitForAudioReady(
       resolve()
     }
 
-    const cleanup = () => {
-      window.clearTimeout(timeout)
-      events.forEach((eventName) => audio.removeEventListener(eventName, onReady))
+    const onError = () => {
+      cleanup()
+      reject(audio.error ?? new Error('audio element reported an error'))
     }
 
-    events.forEach((eventName) => audio.addEventListener(eventName, onReady, { once: true }))
+    const cleanup = () => {
+      window.clearTimeout(timeout)
+      readyEvents.forEach((eventName) => audio.removeEventListener(eventName, onReady))
+      audio.removeEventListener('error', onError)
+    }
+
+    readyEvents.forEach((eventName) => audio.addEventListener(eventName, onReady, { once: true }))
+    audio.addEventListener('error', onError, { once: true })
   })
 }
 
@@ -506,24 +513,7 @@ function App() {
         : convertFileSrc(payload.localPath)
       audio.load()
       await waitForAudioReady(audio, PLAYBACK_BUFFERING_TIMEOUT_MS)
-      try {
-        await audio.play()
-      } catch (error) {
-        if (
-          payload.isStreaming &&
-          isNotSupportedPlaybackError(error) &&
-          options?.playbackModeOverride !== 'download_first'
-        ) {
-          await playTrack(track, {
-            playbackModeOverride: 'download_first',
-            recoveryReason: options?.recoveryReason ?? 'NotSupportedError',
-            resumeTime: options?.resumeTime,
-          })
-          return
-        }
-
-        throw error
-      }
+      await audio.play()
 
       if (requestId !== playbackRequestId.current) {
         return
@@ -550,6 +540,7 @@ function App() {
       setStatusMessage(playbackStatusLabel)
     } catch (error) {
       if (requestId === playbackRequestId.current) {
+        const audio = audioRef.current
         const effectivePlaybackMode = options?.playbackModeOverride ?? playbackMode
         if (
           effectivePlaybackMode === 'download_first' &&
@@ -568,6 +559,9 @@ function App() {
 
         setStatusMessage(String(error))
         setIsPlaying(false)
+        if (isLoopbackStreamUrl(audio?.currentSrc)) {
+          return
+        }
         const reason = isNotSupportedPlaybackError(error)
           ? 'NotSupportedError'
           : 'playback-interrupted'

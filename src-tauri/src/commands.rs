@@ -40,7 +40,7 @@ const MAX_DOWNLOAD_PART_RETRY_ATTEMPTS: u8 = 12;
 const DOWNLOAD_PART_RETRY_DELAY_MS: u64 = 1500;
 const DOWNLOAD_PART_RETRY_MAX_DELAY_MS: u64 = 12000;
 const TOTAL_SIZE_PROBE_RETRY_ATTEMPTS: u8 = 4;
-const PLAYBACK_DOWNLOAD_THREAD_LIMIT: usize = 1;
+const FULL_DOWNLOAD_PLAYBACK_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREFETCH_CACHE_THREAD_LIMIT: usize = 1;
 
 fn to_command_error(error: anyhow::Error) -> String {
@@ -307,10 +307,21 @@ fn transfer_kind_from_id(id: &str) -> String {
     }
 }
 
-fn effective_download_thread_count(task_id: &str, requested: usize) -> usize {
+fn playback_download_thread_target(size_bytes: u64) -> usize {
+    match size_bytes {
+        0..=8_388_607 => 2,
+        8_388_608..=25_165_823 => 4,
+        25_165_824..=67_108_863 => 6,
+        _ => 8,
+    }
+}
+
+fn effective_download_thread_count(task_id: &str, requested: usize, size_bytes: u64) -> usize {
     let requested = requested.max(1);
     if task_id.starts_with("playback:") {
-        requested.min(PLAYBACK_DOWNLOAD_THREAD_LIMIT).max(1)
+        requested
+            .min(playback_download_thread_target(size_bytes))
+            .max(1)
     } else {
         requested
     }
@@ -658,7 +669,8 @@ async fn run_download_task(
     )
     .await;
 
-    let effective_threads = effective_download_thread_count(&task_id, spec.thread_count);
+    let effective_threads =
+        effective_download_thread_count(&task_id, spec.thread_count, spec.size_bytes);
     if effective_threads != spec.thread_count.max(1) {
         info!(
             target: "cloudtune::download",
@@ -1089,6 +1101,7 @@ pub async fn prepare_track(
         .map_err(to_command_error)?;
     let cache_dir = runtime.cache_dir.clone();
     let cache_threads = runtime.config.cache_threads as usize;
+    let download_threads = runtime.config.download_threads as usize;
     let playback_mode =
         playback_mode_override.unwrap_or_else(|| runtime.config.playback_mode.clone());
 
@@ -1160,6 +1173,65 @@ pub async fn prepare_track(
             size_bytes,
             prefetch_threads,
         );
+    }
+
+    let should_download_before_playback = for_playback
+        && (playback_mode == "download_first"
+            || size_bytes >= FULL_DOWNLOAD_PLAYBACK_THRESHOLD_BYTES);
+
+    if should_download_before_playback {
+        let task_id = format!("playback:{}", track_id);
+        let reason_label = if playback_mode == "download_first" {
+            "preferred-cache mode"
+        } else {
+            "large-file guard"
+        };
+        info!(
+            target: "cloudtune::playback",
+            "track {} will download fully before playback ({}, {} bytes)",
+            track_id,
+            reason_label,
+            size_bytes
+        );
+        drop(runtime);
+        run_download_task(
+            app_handle.clone(),
+            task_id,
+            DownloadSpec {
+                track_id: track_id.clone(),
+                file_name: file_name.clone(),
+                size_bytes,
+                destination: destination.clone(),
+                thread_count: download_threads.max(1),
+            },
+            playback_url.clone(),
+        )
+        .await
+        .map_err(to_command_error)?;
+
+        let downloaded_size = fs::metadata(&destination)
+            .await
+            .map(|meta| meta.len())
+            .map_err(|error| to_command_error(error.into()))?;
+
+        let mut runtime = state.inner.lock().await;
+        runtime.cache_index.record(
+            track_id.clone(),
+            cache_file_name,
+            downloaded_size.max(size_bytes),
+        );
+        let cache_usage_bytes = runtime
+            .prune_cache_to_limit(&[track_id.as_str()])
+            .map_err(to_command_error)?;
+        runtime.save_cache_index().map_err(to_command_error)?;
+
+        return Ok(PreparedTrack {
+            track_id,
+            local_path: destination.to_string_lossy().into_owned(),
+            playback_url: destination.to_string_lossy().into_owned(),
+            is_streaming: false,
+            cache_usage_bytes,
+        });
     }
 
     let cache_usage_bytes = runtime.cache_index.usage_bytes(&cache_dir);

@@ -2,6 +2,7 @@ mod cache;
 mod cloud189;
 mod commands;
 mod models;
+mod native_playback;
 mod runtime_paths;
 mod state;
 mod streaming;
@@ -219,6 +220,12 @@ pub fn run() {
             commands::update_transfer_tuning,
             commands::update_playback_mode,
             commands::update_playback_context,
+            commands::play_native_track,
+            commands::pause_native_playback,
+            commands::resume_native_playback,
+            commands::seek_native_playback,
+            commands::stop_native_playback,
+            commands::get_native_playback_snapshot,
             commands::get_transfer_snapshot,
             commands::pick_download_directory,
             commands::download_track_to_directory,

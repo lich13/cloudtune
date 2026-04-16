@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type {
   BootstrapPayload,
   FolderBrowsePayload,
+  NativePlaybackSnapshot,
   NowPlayingMetadata,
   PreparedTrack,
   QrLoginStart,
@@ -54,6 +55,22 @@ export const api = {
       currentTrackId,
       nextTrackId,
     }),
+  playNativeTrack: (trackId: string, localPath: string, positionSeconds?: number) =>
+    invoke<NativePlaybackSnapshot>('play_native_track', {
+      trackId,
+      localPath,
+      ...(positionSeconds != null ? { positionSeconds } : {}),
+    }),
+  pauseNativePlayback: () =>
+    invoke<NativePlaybackSnapshot>('pause_native_playback'),
+  resumeNativePlayback: () =>
+    invoke<NativePlaybackSnapshot>('resume_native_playback'),
+  seekNativePlayback: (positionSeconds: number) =>
+    invoke<NativePlaybackSnapshot>('seek_native_playback', { positionSeconds }),
+  stopNativePlayback: () =>
+    invoke<NativePlaybackSnapshot>('stop_native_playback'),
+  getNativePlaybackSnapshot: () =>
+    invoke<NativePlaybackSnapshot>('get_native_playback_snapshot'),
   getTransferSnapshot: () =>
     invoke<TransferSnapshotPayload>('get_transfer_snapshot'),
   pickDownloadDirectory: () => invoke<string | null>('pick_download_directory'),

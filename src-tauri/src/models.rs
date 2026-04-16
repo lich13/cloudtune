@@ -74,6 +74,7 @@ pub struct BootstrapPayload {
     pub download_threads: u16,
     pub cache_threads: u16,
     pub playback_mode: String,
+    pub native_playback_supported: bool,
     pub cache_usage_bytes: u64,
     pub last_error: Option<String>,
 }

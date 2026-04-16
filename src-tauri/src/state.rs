@@ -2,6 +2,7 @@ use crate::{
     cache::CacheIndex,
     cloud189::Cloud189Client,
     models::{StoredConfig, TrackSummary, TransferStatus},
+    native_playback::NativePlaybackController,
     runtime_paths::RuntimePaths,
 };
 use anyhow::Result;
@@ -25,6 +26,7 @@ pub struct AppState {
     pub transfer_controls: TransferControlStore,
     pub remote_request_slots: Arc<Semaphore>,
     pub stream_server_port: u16,
+    pub native_playback: NativePlaybackController,
 }
 
 pub type TransferControlStore = Arc<Mutex<HashMap<String, TransferControl>>>;
@@ -87,6 +89,7 @@ impl AppState {
             transfer_statuses.clone(),
             remote_request_slots.clone(),
         )?;
+        let native_playback = NativePlaybackController::new();
 
         Ok(Self {
             stream_sources,
@@ -94,6 +97,7 @@ impl AppState {
             transfer_controls,
             remote_request_slots,
             stream_server_port,
+            native_playback,
             inner: Mutex::new(RuntimeState {
                 app_handle,
                 config_path,

@@ -1,12 +1,13 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
 import QRCode from 'qrcode'
-import { startTransition, useDeferredValue, useEffect, useRef, useState } from 'react'
+import { startTransition, useDeferredValue, useEffect, useEffectEvent, useRef, useState } from 'react'
 import { api } from './api'
 import type {
   BootstrapPayload,
   FolderBrowsePayload,
   FolderSelection,
   LoopMode,
+  NativePlaybackSnapshot,
   NowPlayingMetadata,
   PreparedTrack,
   TrackSummary,
@@ -25,6 +26,7 @@ const PLAYBACK_RECOVERY_MAX_DELAY_MS = 15000
 const PLAYBACK_BUFFERING_TIMEOUT_MS = 15000
 const PLAYBACK_RECENT_ACTIVITY_WINDOW_MS = 120000
 const PLAYBACK_SWITCH_RECOVERY_WINDOW_MS = 30000
+const NATIVE_PLAYBACK_POLL_MS = 500
 
 type PlaybackModeOverride = 'download_first' | 'stream_cache'
 
@@ -210,6 +212,8 @@ function App() {
   const loadingTrackIdRef = useRef<string | null>(null)
   const isPlayingRef = useRef(false)
   const lastTrackSwitchAtRef = useRef(0)
+  const nativePlaybackEndedTrackIdRef = useRef<string | null>(null)
+  const nativePlaybackErrorRef = useRef<string | null>(null)
 
   const [bootstrapping, setBootstrapping] = useState(true)
   const [busyLabel, setBusyLabel] = useState<string | null>(null)
@@ -227,6 +231,7 @@ function App() {
   const [downloadThreadsInput, setDownloadThreadsInput] = useState('16')
   const [cacheThreadsInput, setCacheThreadsInput] = useState('16')
   const [playbackMode, setPlaybackMode] = useState('download_first')
+  const [nativePlaybackSupported, setNativePlaybackSupported] = useState(false)
   const [cacheUsageBytes, setCacheUsageBytes] = useState(0)
 
   const [qrText, setQrText] = useState<string | null>(null)
@@ -312,6 +317,67 @@ function App() {
     }
 
     return currentTrackRef.current ?? pendingTrackRef.current ?? lastTrackRef.current
+  }
+
+  function clearHtmlAudio() {
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+
+    audio.pause()
+    audio.removeAttribute('src')
+    audio.load()
+  }
+
+  function syncNativePlaybackSnapshot(snapshot: NativePlaybackSnapshot) {
+    if (!snapshot.supported) {
+      return
+    }
+
+    setCurrentTime(snapshot.positionSeconds)
+    setDuration(snapshot.durationSeconds ?? 0)
+    setIsPlaying(snapshot.state === 'playing')
+  }
+
+  const handlePlaybackEnded = useEffectEvent(async () => {
+    clearRecoveryTimer()
+    recoveryAttemptRef.current = 0
+
+    const activeTrack = currentTrackRef.current
+    if (loopMode === 'one' && activeTrack) {
+      await playTrack(activeTrack)
+      return
+    }
+
+    const nextTrack = resolveUpcomingTrack()
+    prefetchedTrackId.current = null
+    prefetchingTrackId.current = null
+    if (nextTrack) {
+      await playTrack(nextTrack)
+    } else {
+      setIsPlaying(false)
+    }
+  })
+
+  async function seekPlayback(nextTime: number) {
+    if (nativePlaybackSupported) {
+      try {
+        const snapshot = await api.seekNativePlayback(nextTime)
+        syncNativePlaybackSnapshot(snapshot)
+      } catch (error) {
+        setStatusMessage(String(error))
+      }
+      return
+    }
+
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+
+    audio.currentTime = nextTime
+    setCurrentTime(nextTime)
   }
 
   async function recoverPlayback(reason: string) {
@@ -406,6 +472,7 @@ function App() {
     setDownloadThreadsInput(String(payload.downloadThreads))
     setCacheThreadsInput(String(payload.cacheThreads))
     setPlaybackMode(payload.playbackMode)
+    setNativePlaybackSupported(payload.nativePlaybackSupported)
     setCacheUsageBytes(payload.cacheUsageBytes)
     setStatusMessage(payload.lastError)
 
@@ -503,14 +570,16 @@ function App() {
     try {
       prefetchedTrackId.current = null
       prefetchingTrackId.current = null
+      const requestedPlaybackMode = nativePlaybackSupported
+        ? 'download_first'
+        : options?.playbackModeOverride
       preparedTrack = await api.prepareTrack(
         track.id,
         track.name,
         track.sizeBytes,
-        options?.playbackModeOverride,
+        requestedPlaybackMode,
       )
-      const audio = audioRef.current
-      if (!audio || requestId !== playbackRequestId.current) {
+      if (requestId !== playbackRequestId.current) {
         return
       }
 
@@ -519,24 +588,42 @@ function App() {
       setNowPlayingMetadata(null)
       setCacheUsageBytes(preparedTrack.cacheUsageBytes)
 
-      audio.src = preparedTrack.isStreaming
-        ? preparedTrack.playbackUrl
-        : convertFileSrc(preparedTrack.localPath)
-      audio.load()
-      await waitForAudioReady(
-        audio,
-        PLAYBACK_BUFFERING_TIMEOUT_MS,
-        !preparedTrack.isStreaming,
-      )
-      await audio.play()
-
-      if (requestId !== playbackRequestId.current) {
-        return
-      }
-
       const resumeTime = normalizeResumeTime(options?.resumeTime)
-      if (resumeTime > 0) {
-        audio.currentTime = Math.min(resumeTime, audio.duration || resumeTime)
+      if (nativePlaybackSupported) {
+        clearHtmlAudio()
+        const snapshot = await api.playNativeTrack(
+          preparedTrack.trackId,
+          preparedTrack.localPath,
+          resumeTime > 0 ? resumeTime : undefined,
+        )
+        if (requestId !== playbackRequestId.current) {
+          return
+        }
+        syncNativePlaybackSnapshot(snapshot)
+      } else {
+        const audio = audioRef.current
+        if (!audio) {
+          return
+        }
+
+        audio.src = preparedTrack.isStreaming
+          ? preparedTrack.playbackUrl
+          : convertFileSrc(preparedTrack.localPath)
+        audio.load()
+        await waitForAudioReady(
+          audio,
+          PLAYBACK_BUFFERING_TIMEOUT_MS,
+          !preparedTrack.isStreaming,
+        )
+        await audio.play()
+
+        if (requestId !== playbackRequestId.current) {
+          return
+        }
+
+        if (resumeTime > 0) {
+          audio.currentTime = Math.min(resumeTime, audio.duration || resumeTime)
+        }
       }
 
       setIsPlaying(true)
@@ -545,14 +632,19 @@ function App() {
       lastPlaybackStartRef.current = Date.now()
       const playbackStatusLabel = options?.recoveryReason
         ? `已恢复播放《${track.name}》`
-        : preparedTrack.isStreaming
-          ? `边播边缓存《${track.name}》`
-          : `正在播放《${track.name}》`
+        : nativePlaybackSupported
+          ? `正在使用 Windows 原生解码播放《${track.name}》`
+          : preparedTrack.isStreaming
+            ? `边播边缓存《${track.name}》`
+            : `正在播放《${track.name}》`
       setStatusMessage(playbackStatusLabel)
     } catch (error) {
       if (requestId === playbackRequestId.current) {
-        const effectivePlaybackMode = options?.playbackModeOverride ?? playbackMode
+        const effectivePlaybackMode = nativePlaybackSupported
+          ? 'download_first'
+          : options?.playbackModeOverride ?? playbackMode
         if (
+          !nativePlaybackSupported &&
           effectivePlaybackMode === 'download_first' &&
           options?.playbackModeOverride !== 'stream_cache' &&
           options?.recoveryReason !== 'NotSupportedError' &&
@@ -567,16 +659,18 @@ function App() {
           return
         }
 
-        if (preparedTrack?.isStreaming) {
+        if (!nativePlaybackSupported && preparedTrack?.isStreaming) {
           setStatusMessage(`流式连接波动，等待后台续传《${track.name}》`)
           return
         }
         setStatusMessage(String(error))
         setIsPlaying(false)
-        const reason = isNotSupportedPlaybackError(error)
-          ? 'NotSupportedError'
-          : 'playback-interrupted'
-        void recoverPlayback(reason)
+        if (!nativePlaybackSupported) {
+          const reason = isNotSupportedPlaybackError(error)
+            ? 'NotSupportedError'
+            : 'playback-interrupted'
+          void recoverPlayback(reason)
+        }
       }
     } finally {
       if (requestId === playbackRequestId.current) {
@@ -586,16 +680,28 @@ function App() {
   }
 
   async function togglePlayback() {
-    const audio = audioRef.current
-    if (!audio) {
-      return
-    }
-
     if (!currentTrack) {
       const nextTrack = randomItem(tracks.length > 0 ? tracks : visibleTracks)
       if (nextTrack) {
         await playTrack(nextTrack)
       }
+      return
+    }
+
+    if (nativePlaybackSupported) {
+      try {
+        const snapshot = isPlaying
+          ? await api.pauseNativePlayback()
+          : await api.resumeNativePlayback()
+        syncNativePlaybackSnapshot(snapshot)
+      } catch (error) {
+        setStatusMessage(String(error))
+      }
+      return
+    }
+
+    const audio = audioRef.current
+    if (!audio) {
       return
     }
 
@@ -729,12 +835,12 @@ function App() {
       setCurrentLocalPath(null)
       setNowPlayingMetadata(null)
       setIsPlaying(false)
-      const audio = audioRef.current
-      if (audio) {
-        audio.pause()
-        audio.removeAttribute('src')
-        audio.load()
+      nativePlaybackEndedTrackIdRef.current = null
+      nativePlaybackErrorRef.current = null
+      if (nativePlaybackSupported) {
+        void api.stopNativePlayback()
       }
+      clearHtmlAudio()
     } catch (error) {
       setStatusMessage(String(error))
     } finally {
@@ -780,7 +886,11 @@ function App() {
       setCacheThreadsInput(String(payload.cacheThreads))
       setCacheUsageBytes(payload.cacheUsageBytes)
       setStatusMessage(
-        mode === 'download_first' ? '已切到优先缓存播放' : '已切到边播边缓存',
+        nativePlaybackSupported
+          ? 'Windows 端已切换为后端原生解码播放，实际播放会优先完整缓存后再播'
+          : mode === 'download_first'
+            ? '已切到优先缓存播放'
+            : '已切到边播边缓存',
       )
     } catch (error) {
       setStatusMessage(String(error))
@@ -829,6 +939,10 @@ function App() {
   }, [qrText])
 
   useEffect(() => {
+    if (nativePlaybackSupported) {
+      return
+    }
+
     const audio = audioRef.current
     if (!audio) {
       return
@@ -842,22 +956,7 @@ function App() {
     const onTimeUpdate = () => setCurrentTime(audio.currentTime)
     const onLoadedMetadata = () => setDuration(audio.duration)
     const onEnded = async () => {
-      clearRecoveryTimer()
-      recoveryAttemptRef.current = 0
-      if (loopMode === 'one' && currentTrack) {
-        audio.currentTime = 0
-        await audio.play()
-        return
-      }
-
-      const nextTrack = resolveUpcomingTrack()
-      prefetchedTrackId.current = null
-      prefetchingTrackId.current = null
-      if (nextTrack) {
-        await playTrack(nextTrack)
-      } else {
-        setIsPlaying(false)
-      }
+      await handlePlaybackEnded()
     }
     const onPlaybackError = () => {
       if (loadingTrackIdRef.current) {
@@ -897,7 +996,56 @@ function App() {
       audio.removeEventListener('ended', onEnded)
       audio.removeEventListener('error', onPlaybackError)
     }
-  }, [currentTrack, currentTrackId, loopMode, shuffle, tracks])
+  }, [currentTrack, currentTrackId, loopMode, nativePlaybackSupported, shuffle, tracks])
+
+  useEffect(() => {
+    if (!authenticated || !nativePlaybackSupported) {
+      return
+    }
+
+    let disposed = false
+    const pollNativePlayback = async () => {
+      try {
+        const snapshot = await api.getNativePlaybackSnapshot()
+        if (disposed) {
+          return
+        }
+
+        syncNativePlaybackSnapshot(snapshot)
+        if (snapshot.state === 'error' && snapshot.error) {
+          if (nativePlaybackErrorRef.current !== snapshot.error) {
+            nativePlaybackErrorRef.current = snapshot.error
+            setStatusMessage(snapshot.error)
+          }
+          return
+        }
+
+        nativePlaybackErrorRef.current = null
+        if (snapshot.state === 'ended' && snapshot.trackId) {
+          if (nativePlaybackEndedTrackIdRef.current !== snapshot.trackId) {
+            nativePlaybackEndedTrackIdRef.current = snapshot.trackId
+            void handlePlaybackEnded()
+          }
+        } else {
+          nativePlaybackEndedTrackIdRef.current = null
+        }
+      } catch (error) {
+        if (!disposed) {
+          setStatusMessage(String(error))
+        }
+      }
+    }
+
+    void pollNativePlayback()
+    const timer = window.setInterval(() => {
+      void pollNativePlayback()
+    }, NATIVE_PLAYBACK_POLL_MS)
+
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [authenticated, nativePlaybackSupported])
 
   useEffect(() => {
     if (!currentTrack || !currentLocalPath) {
@@ -974,6 +1122,18 @@ function App() {
         void togglePlayback()
       })
       navigator.mediaSession.setActionHandler('pause', () => {
+        if (nativePlaybackSupported) {
+          void api
+            .pauseNativePlayback()
+            .then((snapshot) => {
+              syncNativePlaybackSnapshot(snapshot)
+            })
+            .catch((error) => {
+              setStatusMessage(String(error))
+            })
+          return
+        }
+
         const audio = audioRef.current
         if (!audio) {
           return
@@ -988,18 +1148,10 @@ function App() {
         void playAdjacent(1)
       })
       navigator.mediaSession.setActionHandler('seekbackward', () => {
-        const audio = audioRef.current
-        if (!audio) {
-          return
-        }
-        audio.currentTime = Math.max(0, audio.currentTime - 15)
+        void seekPlayback(Math.max(0, currentTime - 15))
       })
       navigator.mediaSession.setActionHandler('seekforward', () => {
-        const audio = audioRef.current
-        if (!audio) {
-          return
-        }
-        audio.currentTime = Math.min(audio.duration || audio.currentTime + 15, audio.currentTime + 15)
+        void seekPlayback(Math.min(duration || currentTime + 15, currentTime + 15))
       })
     } catch {
       // Some browsers expose Media Session partially and reject unsupported handlers.
@@ -1009,7 +1161,7 @@ function App() {
       try {
         navigator.mediaSession.setPositionState({
           duration,
-          playbackRate: audio.playbackRate || 1,
+          playbackRate: nativePlaybackSupported ? 1 : audio.playbackRate || 1,
           position: Math.min(currentTime, duration),
         })
       } catch {
@@ -1023,6 +1175,7 @@ function App() {
     currentTrack,
     duration,
     isPlaying,
+    nativePlaybackSupported,
     nowPlayingMetadata,
     tracks.length,
   ])
@@ -1568,13 +1721,8 @@ function App() {
                         max={duration || 0}
                         value={Math.min(currentTime, duration || 0)}
                         onChange={(event) => {
-                          const audio = audioRef.current
-                          if (!audio) {
-                            return
-                          }
                           const nextTime = Number(event.target.value)
-                          audio.currentTime = nextTime
-                          setCurrentTime(nextTime)
+                          void seekPlayback(nextTime)
                         }}
                       />
                       <div className="time-line">

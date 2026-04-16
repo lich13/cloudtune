@@ -4,6 +4,7 @@ use crate::{
         BootstrapPayload, MAX_CACHE_THREADS, MAX_DOWNLOAD_THREADS, NowPlayingMetadata,
         PreparedTrack, SettingsPayload, TrackSummary, TransferSnapshotPayload,
     },
+    native_playback::NativePlaybackSnapshot,
     runtime_paths::RuntimePaths,
     state::{AppState, DownloadSpec, RuntimeState, TransferControl},
 };
@@ -107,6 +108,7 @@ fn build_bootstrap_payload(
         download_threads: runtime.config.download_threads,
         cache_threads: runtime.config.cache_threads,
         playback_mode: runtime.config.playback_mode.clone(),
+        native_playback_supported: cfg!(target_os = "windows"),
         cache_usage_bytes,
         last_error,
     })
@@ -340,6 +342,14 @@ fn effective_prefetch_thread_count(requested: usize) -> usize {
 
 fn next_download_retry_delay_ms(attempt: u8) -> u64 {
     (DOWNLOAD_PART_RETRY_DELAY_MS * u64::from(attempt)).min(DOWNLOAD_PART_RETRY_MAX_DELAY_MS)
+}
+
+fn duration_from_seconds(seconds: f64) -> Duration {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(seconds)
+    }
 }
 
 fn should_refresh_download_url(status: StatusCode) -> bool {
@@ -1629,7 +1639,64 @@ pub async fn update_playback_context(
 }
 
 #[tauri::command]
+pub async fn play_native_track(
+    state: State<'_, AppState>,
+    track_id: String,
+    local_path: String,
+    position_seconds: Option<f64>,
+) -> Result<NativePlaybackSnapshot, String> {
+    state
+        .native_playback
+        .play_track(
+            track_id,
+            PathBuf::from(local_path),
+            duration_from_seconds(position_seconds.unwrap_or_default()),
+        )
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn pause_native_playback(
+    state: State<'_, AppState>,
+) -> Result<NativePlaybackSnapshot, String> {
+    state.native_playback.pause().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn resume_native_playback(
+    state: State<'_, AppState>,
+) -> Result<NativePlaybackSnapshot, String> {
+    state.native_playback.resume().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn seek_native_playback(
+    state: State<'_, AppState>,
+    position_seconds: f64,
+) -> Result<NativePlaybackSnapshot, String> {
+    state
+        .native_playback
+        .seek(duration_from_seconds(position_seconds))
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn stop_native_playback(
+    state: State<'_, AppState>,
+) -> Result<NativePlaybackSnapshot, String> {
+    state.native_playback.stop().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn get_native_playback_snapshot(
+    state: State<'_, AppState>,
+) -> Result<NativePlaybackSnapshot, String> {
+    Ok(state.native_playback.snapshot())
+}
+
+#[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
+    let _ = state.native_playback.stop();
     let mut runtime = state.inner.lock().await;
     runtime.cloud.clear_session();
     runtime.config.refresh_token = None;

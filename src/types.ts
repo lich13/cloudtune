@@ -14,6 +14,7 @@ export interface BootstrapPayload {
   downloadThreads: number
   cacheThreads: number
   playbackMode: string
+  nativePlaybackSupported: boolean
   cacheUsageBytes: number
   lastError: string | null
 }
@@ -95,4 +96,14 @@ export interface NowPlayingMetadata {
   artist: string | null
   album: string | null
   artworkPath: string | null
+}
+
+export interface NativePlaybackSnapshot {
+  supported: boolean
+  state: string
+  trackId: string | null
+  localPath: string | null
+  positionSeconds: number
+  durationSeconds: number | null
+  error: string | null
 }

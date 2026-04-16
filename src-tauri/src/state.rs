@@ -4,14 +4,14 @@ use crate::{
     models::{StoredConfig, TrackSummary, TransferStatus},
     runtime_paths::RuntimePaths,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::streaming::{StreamSource, StreamSourceStore, TransferStore, start_stream_server};

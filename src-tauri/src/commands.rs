@@ -43,6 +43,12 @@ const TOTAL_SIZE_PROBE_RETRY_ATTEMPTS: u8 = 4;
 const FULL_DOWNLOAD_PLAYBACK_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREFETCH_CACHE_THREAD_LIMIT: usize = 1;
 
+struct DownloadProbeResult {
+    final_url: String,
+    total_size: u64,
+    range_supported: bool,
+}
+
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
 }
@@ -309,10 +315,11 @@ fn transfer_kind_from_id(id: &str) -> String {
 
 fn playback_download_thread_target(size_bytes: u64) -> usize {
     match size_bytes {
-        0..=8_388_607 => 2,
-        8_388_608..=25_165_823 => 4,
-        25_165_824..=67_108_863 => 6,
-        _ => 8,
+        // Playback downloads must stay conservative on Cloud189 media hosts.
+        // Medium-sized audio files stall more often when we split them before playback.
+        0..=134_217_727 => 1,
+        134_217_728..=536_870_911 => 2,
+        _ => 3,
     }
 }
 
@@ -364,23 +371,60 @@ async fn refresh_download_playback_url(
     runtime.cloud.playback_url(track_id).await
 }
 
-async fn probe_total_size_with_retries(
+async fn probe_download_target(
+    client: &Client,
+    url: &str,
+    fallback: u64,
+) -> Result<DownloadProbeResult> {
+    let response = client.get(url).header(RANGE, "bytes=0-0").send().await?;
+
+    let status = response.status();
+    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+        anyhow::bail!("download probe returned {}", status.as_u16());
+    }
+
+    let final_url = response.url().to_string();
+    let headers = response.headers();
+    let total_size = if status == StatusCode::PARTIAL_CONTENT {
+        total_size_from_content_range(headers.get(CONTENT_RANGE))
+    } else {
+        headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+    .unwrap_or(fallback)
+    .max(fallback);
+
+    let range_supported = status == StatusCode::PARTIAL_CONTENT;
+
+    Ok(DownloadProbeResult {
+        final_url,
+        total_size,
+        range_supported,
+    })
+}
+
+async fn resolve_download_target_with_retries(
     client: &Client,
     playback_url: Arc<Mutex<String>>,
     app_handle: &tauri::AppHandle,
     track_id: &str,
     fallback: u64,
-) -> Result<u64> {
+) -> Result<DownloadProbeResult> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=TOTAL_SIZE_PROBE_RETRY_ATTEMPTS {
         let current_url = playback_url.lock().await.clone();
-        match probe_total_size(client, &current_url, fallback).await {
-            Ok(total_size) => return Ok(total_size),
+        match probe_download_target(client, &current_url, fallback).await {
+            Ok(probe) => {
+                *playback_url.lock().await = probe.final_url.clone();
+                return Ok(probe);
+            }
             Err(error) => {
                 warn!(
                     target: "cloudtune::download",
-                    "track {} size probe attempt {}/{} failed: {}",
+                    "track {} download probe attempt {}/{} failed: {}",
                     track_id,
                     attempt,
                     TOTAL_SIZE_PROBE_RETRY_ATTEMPTS,
@@ -398,17 +442,7 @@ async fn probe_total_size_with_retries(
         }
     }
 
-    if fallback > 0 {
-        warn!(
-            target: "cloudtune::download",
-            "track {} size probe exhausted retries, falling back to known size {}",
-            track_id,
-            fallback
-        );
-        Ok(fallback)
-    } else {
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to probe remote media size")))
-    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to resolve remote media target")))
 }
 
 async fn download_range_part_with_retries(
@@ -602,6 +636,142 @@ async fn download_range_part_with_retries(
     Ok(())
 }
 
+async fn download_whole_file_with_retries(
+    client: Client,
+    app_handle: tauri::AppHandle,
+    remote_request_slots: Arc<Semaphore>,
+    playback_url: Arc<Mutex<String>>,
+    track_id: String,
+    destination: PathBuf,
+    transferred: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let temp_path = destination.with_extension("part");
+    let mut last_error = String::from("whole download interrupted");
+
+    for attempt in 1..=MAX_DOWNLOAD_PART_RETRY_ATTEMPTS {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let current_url = playback_url.lock().await.clone();
+        let _request_slot = remote_request_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("request slot closed"))?;
+
+        let response = client.get(&current_url).send().await;
+        let mut response = match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    response
+                } else {
+                    last_error = format!("whole download returned {}", status.as_u16());
+                    warn!(
+                        target: "cloudtune::download",
+                        "track {} whole-download attempt {}/{} returned {}",
+                        track_id,
+                        attempt,
+                        MAX_DOWNLOAD_PART_RETRY_ATTEMPTS,
+                        status
+                    );
+
+                    if attempt == MAX_DOWNLOAD_PART_RETRY_ATTEMPTS
+                        || !should_retry_download_status(status)
+                    {
+                        anyhow::bail!(last_error);
+                    }
+
+                    if should_refresh_download_url(status) {
+                        if let Ok(refreshed_url) =
+                            refresh_download_playback_url(&app_handle, &track_id).await
+                        {
+                            *playback_url.lock().await = refreshed_url;
+                        }
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(next_download_retry_delay_ms(
+                        attempt,
+                    )))
+                    .await;
+                    continue;
+                }
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                warn!(
+                    target: "cloudtune::download",
+                    "track {} whole-download attempt {}/{} failed: {}",
+                    track_id,
+                    attempt,
+                    MAX_DOWNLOAD_PART_RETRY_ATTEMPTS,
+                    error
+                );
+                if attempt == MAX_DOWNLOAD_PART_RETRY_ATTEMPTS {
+                    return Err(error.into());
+                }
+                if let Ok(refreshed_url) =
+                    refresh_download_playback_url(&app_handle, &track_id).await
+                {
+                    *playback_url.lock().await = refreshed_url;
+                }
+                tokio::time::sleep(Duration::from_millis(next_download_retry_delay_ms(attempt)))
+                    .await;
+                continue;
+            }
+        };
+
+        let _ = fs::remove_file(&temp_path).await;
+        let file = fs::File::create(&temp_path).await?;
+        let mut writer = BufWriter::new(file);
+        transferred.store(0, Ordering::Relaxed);
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        let _ = writer.flush().await;
+                        return Ok(());
+                    }
+                    writer.write_all(&chunk).await?;
+                    transferred.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                Ok(None) => {
+                    writer.flush().await?;
+                    drop(writer);
+                    let _ = fs::remove_file(&destination).await;
+                    fs::rename(&temp_path, &destination).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    warn!(
+                        target: "cloudtune::download",
+                        "track {} whole-download interrupted on attempt {}/{}: {}",
+                        track_id,
+                        attempt,
+                        MAX_DOWNLOAD_PART_RETRY_ATTEMPTS,
+                        error
+                    );
+                    let _ = writer.flush().await;
+                    break;
+                }
+            }
+        }
+
+        if attempt < MAX_DOWNLOAD_PART_RETRY_ATTEMPTS {
+            if let Ok(refreshed_url) = refresh_download_playback_url(&app_handle, &track_id).await {
+                *playback_url.lock().await = refreshed_url;
+            }
+            tokio::time::sleep(Duration::from_millis(next_download_retry_delay_ms(attempt))).await;
+        }
+    }
+
+    anyhow::bail!(last_error)
+}
+
 async fn run_download_task(
     app_handle: tauri::AppHandle,
     task_id: String,
@@ -632,13 +802,13 @@ async fn run_download_task(
     }
     let _ = fs::create_dir_all(&parts_dir).await;
 
-    let total_size = {
+    let probe = {
         let _request_slot = remote_request_slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("request slot closed"))?;
-        probe_total_size_with_retries(
+        resolve_download_target_with_retries(
             &client,
             playback_url.clone(),
             &app_handle,
@@ -647,12 +817,15 @@ async fn run_download_task(
         )
         .await?
     };
+    let total_size = probe.total_size;
     info!(
         target: "cloudtune::download",
-        "task {} preparing download for track {} with known size {}",
+        "task {} preparing download for track {} with known size {} via {} (range_supported={})",
         task_id,
         spec.track_id,
-        total_size
+        total_size,
+        probe.final_url,
+        probe.range_supported
     );
     upsert_transfer_status(
         &state,
@@ -669,8 +842,12 @@ async fn run_download_task(
     )
     .await;
 
-    let effective_threads =
-        effective_download_thread_count(&task_id, spec.thread_count, spec.size_bytes);
+    let cancel_flag = cancel.clone();
+    let effective_threads = if probe.range_supported {
+        effective_download_thread_count(&task_id, spec.thread_count, spec.size_bytes)
+    } else {
+        1
+    };
     if effective_threads != spec.thread_count.max(1) {
         info!(
             target: "cloudtune::download",
@@ -680,11 +857,139 @@ async fn run_download_task(
             effective_threads
         );
     }
+    let use_whole_file_download = !probe.range_supported || effective_threads <= 1;
+    if use_whole_file_download {
+        if !probe.range_supported {
+            warn!(
+                target: "cloudtune::download",
+                "track {} does not support range requests, falling back to whole-file download",
+                spec.track_id
+            );
+        } else {
+            info!(
+                target: "cloudtune::download",
+                "task {} uses a single connection for playback download stability",
+                task_id
+            );
+        }
+
+        let transferred = Arc::new(AtomicU64::new(0));
+        let mut whole_download = tokio::spawn(download_whole_file_with_retries(
+            client,
+            app_handle.clone(),
+            remote_request_slots.clone(),
+            playback_url.clone(),
+            spec.track_id.clone(),
+            spec.destination.clone(),
+            transferred.clone(),
+            cancel_flag.clone(),
+        ));
+        let mut failed: Option<String> = None;
+        let mut last_transferred = transferred.load(Ordering::Relaxed);
+        let mut last_tick = Instant::now();
+        let mut ticker = tokio::time::interval(Duration::from_millis(350));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let transferred_now = transferred.load(Ordering::Relaxed);
+                    let delta = transferred_now.saturating_sub(last_transferred);
+                    let delta_secs = last_tick.elapsed().as_secs_f64().max(0.001);
+                    let speed = (delta as f64 / delta_secs) as u64;
+                    upsert_transfer_status(
+                        &state,
+                        &task_id,
+                        spec.file_name.clone(),
+                        transfer_kind_from_id(&task_id),
+                        "running".to_string(),
+                        Some(spec.destination.to_string_lossy().into_owned()),
+                        true,
+                        true,
+                        speed,
+                        transferred_now,
+                        Some(total_size),
+                    )
+                    .await;
+                    last_transferred = transferred_now;
+                    last_tick = Instant::now();
+                }
+                result = &mut whole_download => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => failed = Some(error.to_string()),
+                        Err(error) => failed = Some(error.to_string()),
+                    }
+                    break;
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&parts_dir).await;
+        let final_bytes = transferred.load(Ordering::Relaxed);
+        if cancel_flag.load(Ordering::SeqCst) && failed.is_none() {
+            upsert_transfer_status(
+                &state,
+                &task_id,
+                spec.file_name,
+                transfer_kind_from_id(&task_id),
+                "paused".to_string(),
+                Some(spec.destination.to_string_lossy().into_owned()),
+                false,
+                true,
+                0,
+                final_bytes,
+                Some(total_size),
+            )
+            .await;
+            return Ok(());
+        }
+
+        if let Some(error) = failed {
+            upsert_transfer_status(
+                &state,
+                &task_id,
+                spec.file_name.clone(),
+                transfer_kind_from_id(&task_id),
+                format!("failed: {error}"),
+                Some(spec.destination.to_string_lossy().into_owned()),
+                false,
+                true,
+                0,
+                final_bytes,
+                Some(total_size),
+            )
+            .await;
+            warn!(
+                target: "cloudtune::download",
+                "task {} failed after {} bytes: {}",
+                task_id,
+                final_bytes,
+                error
+            );
+            anyhow::bail!(error);
+        }
+
+        upsert_transfer_status(
+            &state,
+            &task_id,
+            spec.file_name,
+            transfer_kind_from_id(&task_id),
+            "completed".to_string(),
+            Some(spec.destination.to_string_lossy().into_owned()),
+            false,
+            true,
+            0,
+            final_bytes,
+            Some(total_size),
+        )
+        .await;
+        return Ok(());
+    }
     let ranges = split_ranges(total_size, effective_threads);
     let transferred = Arc::new(AtomicU64::new(
         completed_bytes_for_parts(&parts_dir, &ranges).await,
     ));
-    let cancel_flag = cancel.clone();
     let mut jobs = JoinSet::new();
 
     for (index, (start, end)) in ranges.iter().copied().enumerate() {
@@ -840,26 +1145,6 @@ fn spawn_download_task(
     tauri::async_runtime::spawn(async move {
         let _ = run_download_task(app_handle, task_id, spec, playback_url).await;
     });
-}
-
-async fn probe_total_size(client: &Client, url: &str, fallback: u64) -> Result<u64> {
-    let response = client
-        .get(url)
-        .header(RANGE, "bytes=0-0")
-        .send()
-        .await?
-        .error_for_status()?;
-    let size = if response.status() == StatusCode::PARTIAL_CONTENT {
-        total_size_from_content_range(response.headers().get(CONTENT_RANGE))
-    } else {
-        response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-    }
-    .unwrap_or(fallback);
-    Ok(size.max(fallback))
 }
 
 fn total_size_from_content_range(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {

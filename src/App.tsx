@@ -493,11 +493,12 @@ function App() {
     lastTrackSwitchAtRef.current = Date.now()
     clearRecoveryTimer()
     setLoadingTrackId(track.id)
+    let preparedTrack: PreparedTrack | null = null
 
     try {
       prefetchedTrackId.current = null
       prefetchingTrackId.current = null
-      const payload: PreparedTrack = await api.prepareTrack(
+      preparedTrack = await api.prepareTrack(
         track.id,
         track.name,
         track.sizeBytes,
@@ -508,9 +509,9 @@ function App() {
         return
       }
 
-      audio.src = payload.isStreaming
-        ? payload.playbackUrl
-        : convertFileSrc(payload.localPath)
+      audio.src = preparedTrack.isStreaming
+        ? preparedTrack.playbackUrl
+        : convertFileSrc(preparedTrack.localPath)
       audio.load()
       await waitForAudioReady(audio, PLAYBACK_BUFFERING_TIMEOUT_MS)
       await audio.play()
@@ -524,23 +525,22 @@ function App() {
         audio.currentTime = Math.min(resumeTime, audio.duration || resumeTime)
       }
 
-      setCurrentTrackId(payload.trackId)
-      setCurrentLocalPath(payload.localPath)
+      setCurrentTrackId(preparedTrack.trackId)
+      setCurrentLocalPath(preparedTrack.localPath)
       setNowPlayingMetadata(null)
-      setCacheUsageBytes(payload.cacheUsageBytes)
+      setCacheUsageBytes(preparedTrack.cacheUsageBytes)
       setIsPlaying(true)
       pendingTrackRef.current = null
       recoveryAttemptRef.current = 0
       lastPlaybackStartRef.current = Date.now()
       const playbackStatusLabel = options?.recoveryReason
         ? `已恢复播放《${track.name}》`
-        : payload.isStreaming
+        : preparedTrack.isStreaming
           ? `边播边缓存《${track.name}》`
           : `正在播放《${track.name}》`
       setStatusMessage(playbackStatusLabel)
     } catch (error) {
       if (requestId === playbackRequestId.current) {
-        const audio = audioRef.current
         const effectivePlaybackMode = options?.playbackModeOverride ?? playbackMode
         if (
           effectivePlaybackMode === 'download_first' &&
@@ -559,7 +559,7 @@ function App() {
 
         setStatusMessage(String(error))
         setIsPlaying(false)
-        if (isLoopbackStreamUrl(audio?.currentSrc)) {
+        if (preparedTrack?.isStreaming) {
           return
         }
         const reason = isNotSupportedPlaybackError(error)

@@ -79,6 +79,7 @@ function isLoopbackStreamUrl(value: string | null | undefined) {
 async function waitForAudioReady(
   audio: HTMLAudioElement,
   timeoutMs = PLAYBACK_BUFFERING_TIMEOUT_MS,
+  failOnError = true,
 ) {
   if (audio.readyState > 0) {
     return
@@ -98,7 +99,11 @@ async function waitForAudioReady(
 
     const onError = () => {
       cleanup()
-      reject(audio.error ?? new Error('audio element reported an error'))
+      if (failOnError) {
+        reject(audio.error ?? new Error('audio element reported an error'))
+      } else {
+        resolve()
+      }
     }
 
     const cleanup = () => {
@@ -509,11 +514,20 @@ function App() {
         return
       }
 
+      setCurrentTrackId(preparedTrack.trackId)
+      setCurrentLocalPath(preparedTrack.localPath)
+      setNowPlayingMetadata(null)
+      setCacheUsageBytes(preparedTrack.cacheUsageBytes)
+
       audio.src = preparedTrack.isStreaming
         ? preparedTrack.playbackUrl
         : convertFileSrc(preparedTrack.localPath)
       audio.load()
-      await waitForAudioReady(audio, PLAYBACK_BUFFERING_TIMEOUT_MS)
+      await waitForAudioReady(
+        audio,
+        PLAYBACK_BUFFERING_TIMEOUT_MS,
+        !preparedTrack.isStreaming,
+      )
       await audio.play()
 
       if (requestId !== playbackRequestId.current) {
@@ -525,10 +539,6 @@ function App() {
         audio.currentTime = Math.min(resumeTime, audio.duration || resumeTime)
       }
 
-      setCurrentTrackId(preparedTrack.trackId)
-      setCurrentLocalPath(preparedTrack.localPath)
-      setNowPlayingMetadata(null)
-      setCacheUsageBytes(preparedTrack.cacheUsageBytes)
       setIsPlaying(true)
       pendingTrackRef.current = null
       recoveryAttemptRef.current = 0
@@ -557,11 +567,12 @@ function App() {
           return
         }
 
-        setStatusMessage(String(error))
-        setIsPlaying(false)
         if (preparedTrack?.isStreaming) {
+          setStatusMessage(`流式连接波动，等待后台续传《${track.name}》`)
           return
         }
+        setStatusMessage(String(error))
+        setIsPlaying(false)
         const reason = isNotSupportedPlaybackError(error)
           ? 'NotSupportedError'
           : 'playback-interrupted'

@@ -13,7 +13,6 @@ use tauri::{
     menu::{Menu, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tauri_plugin_log::log::LevelFilter;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -147,13 +146,6 @@ pub fn run() {
                 .expect("missing main window config");
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(LevelFilter::Info)
-                    .level_for("cloudtune", LevelFilter::Info)
-                    .level_for("reqwest", LevelFilter::Warn)
-                    .level_for("hyper_util", LevelFilter::Warn)
-                    .level_for("axum", LevelFilter::Warn)
-                    .level_for("tao", LevelFilter::Warn)
-                    .level_for("lofty", LevelFilter::Error)
                     .max_file_size(1_000_000)
                     .rotation_strategy(RotationStrategy::KeepSome(5))
                     .clear_targets()

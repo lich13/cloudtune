@@ -42,7 +42,6 @@ const DOWNLOAD_PART_RETRY_DELAY_MS: u64 = 1500;
 const DOWNLOAD_PART_RETRY_MAX_DELAY_MS: u64 = 12000;
 const TOTAL_SIZE_PROBE_RETRY_ATTEMPTS: u8 = 4;
 const FULL_DOWNLOAD_PLAYBACK_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
-const PREFETCH_CACHE_THREAD_LIMIT: usize = 1;
 
 struct DownloadProbeResult {
     final_url: String,
@@ -336,8 +335,29 @@ fn effective_download_thread_count(task_id: &str, requested: usize, size_bytes: 
     }
 }
 
-fn effective_prefetch_thread_count(requested: usize) -> usize {
-    requested.min(PREFETCH_CACHE_THREAD_LIMIT).max(1)
+fn prefetch_download_thread_target(size_bytes: u64) -> usize {
+    match size_bytes {
+        0..=16_777_215 => 1,
+        16_777_216..=67_108_863 => 2,
+        67_108_864..=201_326_591 => 3,
+        _ => 4,
+    }
+}
+
+fn effective_prefetch_thread_count(requested: usize, size_bytes: u64) -> usize {
+    requested
+        .max(1)
+        .min(prefetch_download_thread_target(size_bytes))
+        .max(1)
+}
+
+fn prefetch_wait_timeout(size_bytes: u64) -> Duration {
+    match size_bytes {
+        0..=16_777_215 => Duration::from_secs(8),
+        16_777_216..=67_108_863 => Duration::from_secs(20),
+        67_108_864..=201_326_591 => Duration::from_secs(40),
+        _ => Duration::from_secs(60),
+    }
 }
 
 fn next_download_retry_delay_ms(attempt: u8) -> u64 {
@@ -1419,10 +1439,17 @@ pub async fn prepare_track(
         && playback_mode == "download_first"
         && runtime.active_cache_downloads.contains(&track_id)
     {
+        let wait_timeout = prefetch_wait_timeout(size_bytes);
+        info!(
+            target: "cloudtune::download",
+            "track {} reusing in-progress prefetch before playback, waiting up to {} seconds",
+            track_id,
+            wait_timeout.as_secs()
+        );
         drop(runtime);
 
         if let Some((cached_path, cache_usage_bytes)) =
-            wait_for_prefetched_track(&state, &track_id, Duration::from_secs(6)).await
+            wait_for_prefetched_track(&state, &track_id, wait_timeout).await
         {
             return Ok(PreparedTrack {
                 track_id,
@@ -1437,6 +1464,13 @@ pub async fn prepare_track(
         ensure_authenticated(&mut runtime)
             .await
             .map_err(to_command_error)?;
+        if runtime.active_cache_downloads.contains(&track_id) {
+            warn!(
+                target: "cloudtune::download",
+                "track {} prefetch did not finish in time, falling back to direct playback download",
+                track_id
+            );
+        }
     }
 
     let cache_file_name = format!("{}-{}", track_id, sanitize_file_name(&file_name));
@@ -1448,7 +1482,7 @@ pub async fn prepare_track(
         .map_err(to_command_error)?;
     let app_handle = runtime.app_handle.clone();
     if !for_playback && !runtime.active_cache_downloads.contains(&track_id) {
-        let prefetch_threads = effective_prefetch_thread_count(cache_threads);
+        let prefetch_threads = effective_prefetch_thread_count(cache_threads, size_bytes);
         if prefetch_threads != cache_threads.max(1) {
             info!(
                 target: "cloudtune::download",

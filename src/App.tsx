@@ -1186,7 +1186,13 @@ function App() {
     }
 
     const remaining = duration - currentTime
-    if (!Number.isFinite(remaining) || remaining > 30 || remaining <= 0) {
+    const shouldPrefetchImmediately =
+      nativePlaybackSupported || playbackMode === 'download_first'
+    const shouldPrefetchNow = shouldPrefetchImmediately
+      ? true
+      : Number.isFinite(remaining) && remaining <= 30 && remaining > 0
+
+    if (!shouldPrefetchNow) {
       return
     }
 

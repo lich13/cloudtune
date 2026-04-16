@@ -49,11 +49,6 @@ export const api = {
     }),
   updatePlaybackMode: (playbackMode: string) =>
     invoke<SettingsPayload>('update_playback_mode', { playbackMode }),
-  updatePlaybackContext: (currentTrackId?: string | null, nextTrackId?: string | null) =>
-    invoke<void>('update_playback_context', {
-      currentTrackId,
-      nextTrackId,
-    }),
   getTransferSnapshot: () =>
     invoke<TransferSnapshotPayload>('get_transfer_snapshot'),
   pickDownloadDirectory: () => invoke<string | null>('pick_download_directory'),

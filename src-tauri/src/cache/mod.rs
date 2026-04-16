@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -93,11 +93,8 @@ impl CacheIndex {
         &mut self,
         cache_dir: &Path,
         limit_bytes: u64,
-        preserve_track_ids: &HashSet<String>,
-        preserve_prefixes: &[String],
+        preserve_track_id: Option<&str>,
     ) -> Result<u64> {
-        self.cleanup_orphaned_files(cache_dir, preserve_prefixes)?;
-
         let mut usage = self.usage_bytes(cache_dir);
         if usage <= limit_bytes {
             return Ok(usage);
@@ -115,7 +112,7 @@ impl CacheIndex {
                 break;
             }
 
-            if preserve_track_ids.contains(&track_id) {
+            if preserve_track_id == Some(track_id.as_str()) {
                 continue;
             }
 
@@ -129,50 +126,6 @@ impl CacheIndex {
         }
 
         Ok(usage)
-    }
-
-    fn cleanup_orphaned_files(&self, cache_dir: &Path, preserve_prefixes: &[String]) -> Result<()> {
-        if !cache_dir.exists() {
-            return Ok(());
-        }
-
-        let referenced_paths = self
-            .entries
-            .values()
-            .map(|entry| entry.relative_path.as_str())
-            .collect::<HashSet<_>>();
-
-        for entry in fs::read_dir(cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_name = match path.file_name().and_then(|value| value.to_str()) {
-                Some(file_name) => file_name,
-                None => continue,
-            };
-
-            if file_name == "index.json" {
-                continue;
-            }
-
-            if referenced_paths.contains(file_name) {
-                continue;
-            }
-
-            if preserve_prefixes
-                .iter()
-                .any(|prefix| file_name.starts_with(prefix))
-            {
-                continue;
-            }
-
-            if path.is_dir() {
-                let _ = fs::remove_dir_all(&path);
-            } else {
-                let _ = fs::remove_file(&path);
-            }
-        }
-
-        Ok(())
     }
 }
 

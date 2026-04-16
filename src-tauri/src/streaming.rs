@@ -487,7 +487,13 @@ async fn stream_and_cache_task(
                     .unwrap_or_else(|| source.track_id.clone()),
                 transferred,
             );
-            let _ = runtime.prune_cache_to_limit(&[source.track_id.as_str()]);
+            let cache_dir = runtime.cache_dir.clone();
+            let cache_limit_bytes = runtime.config.cache_limit_bytes();
+            let _ = runtime.cache_index.prune_to_limit(
+                &cache_dir,
+                cache_limit_bytes,
+                Some(source.track_id.as_str()),
+            );
             let _ = runtime.save_cache_index();
         } else {
             let _ = fs::remove_file(&temp_path).await;

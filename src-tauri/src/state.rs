@@ -54,7 +54,6 @@ pub struct RuntimeState {
     pub cache_index: CacheIndex,
     pub cloud: Cloud189Client,
     pub active_cache_downloads: HashSet<String>,
-    pub protected_cache_tracks: HashSet<String>,
 }
 
 impl AppState {
@@ -104,7 +103,6 @@ impl AppState {
                 cache_index,
                 cloud,
                 active_cache_downloads: HashSet::new(),
-                protected_cache_tracks: HashSet::new(),
             }),
         })
     }
@@ -140,34 +138,5 @@ impl RuntimeState {
         }
         fs::write(&self.library_index_path, serde_json::to_vec_pretty(tracks)?)?;
         Ok(())
-    }
-
-    pub fn protected_cache_track_ids(&self, extra_track_ids: &[&str]) -> HashSet<String> {
-        let mut protected = self.protected_cache_tracks.clone();
-        protected.extend(self.active_cache_downloads.iter().cloned());
-        protected.extend(
-            extra_track_ids
-                .iter()
-                .map(|track_id| (*track_id).to_string()),
-        );
-        protected
-    }
-
-    pub fn protected_cache_prefixes(&self) -> Vec<String> {
-        self.protected_cache_track_ids(&[])
-            .into_iter()
-            .map(|track_id| format!("{track_id}-"))
-            .collect()
-    }
-
-    pub fn prune_cache_to_limit(&mut self, extra_track_ids: &[&str]) -> Result<u64> {
-        let protected_track_ids = self.protected_cache_track_ids(extra_track_ids);
-        let protected_prefixes = self.protected_cache_prefixes();
-        self.cache_index.prune_to_limit(
-            &self.cache_dir,
-            self.config.cache_limit_bytes(),
-            &protected_track_ids,
-            &protected_prefixes,
-        )
     }
 }

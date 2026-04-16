@@ -25,8 +25,6 @@ const PLAYBACK_RECOVERY_MAX_DELAY_MS = 15000
 const PLAYBACK_BUFFERING_TIMEOUT_MS = 15000
 const PLAYBACK_RECENT_ACTIVITY_WINDOW_MS = 120000
 const PLAYBACK_SWITCH_RECOVERY_WINDOW_MS = 30000
-const PLAYBACK_STALL_RECOVERY_GRACE_MS = 12000
-const PLAYBACK_STALL_CHECK_INTERVAL_MS = 2000
 
 type PlaybackModeOverride = 'download_first' | 'stream_cache'
 
@@ -185,7 +183,6 @@ function App() {
   const playbackRequestId = useRef(0)
   const recoveryAttemptRef = useRef(0)
   const lastPlaybackStartRef = useRef(0)
-  const lastPlaybackProgressAtRef = useRef(0)
   const recoveryTimerRef = useRef<number | null>(null)
   const lastTrackRef = useRef<TrackSummary | null>(null)
   const pendingTrackRef = useRef<TrackSummary | null>(null)
@@ -481,7 +478,6 @@ function App() {
     lastTrackSwitchAtRef.current = Date.now()
     clearRecoveryTimer()
     setLoadingTrackId(track.id)
-    lastPlaybackProgressAtRef.current = Date.now()
 
     try {
       prefetchedTrackId.current = null
@@ -538,7 +534,6 @@ function App() {
       pendingTrackRef.current = null
       recoveryAttemptRef.current = 0
       lastPlaybackStartRef.current = Date.now()
-      lastPlaybackProgressAtRef.current = Date.now()
       const playbackStatusLabel = options?.recoveryReason
         ? `已恢复播放《${track.name}》`
         : payload.isStreaming
@@ -828,21 +823,11 @@ function App() {
 
     const onPlay = () => {
       clearRecoveryTimer()
-      lastPlaybackProgressAtRef.current = Date.now()
       setIsPlaying(true)
     }
     const onPause = () => setIsPlaying(false)
-    const onTimeUpdate = () => {
-      lastPlaybackProgressAtRef.current = Date.now()
-      setCurrentTime(audio.currentTime)
-    }
-    const onLoadedMetadata = () => {
-      lastPlaybackProgressAtRef.current = Date.now()
-      setDuration(audio.duration)
-    }
-    const onCanPlay = () => {
-      lastPlaybackProgressAtRef.current = Date.now()
-    }
+    const onTimeUpdate = () => setCurrentTime(audio.currentTime)
+    const onLoadedMetadata = () => setDuration(audio.duration)
     const onEnded = async () => {
       clearRecoveryTimer()
       recoveryAttemptRef.current = 0
@@ -870,37 +855,15 @@ function App() {
     audio.addEventListener('pause', onPause)
     audio.addEventListener('timeupdate', onTimeUpdate)
     audio.addEventListener('loadedmetadata', onLoadedMetadata)
-    audio.addEventListener('canplay', onCanPlay)
     audio.addEventListener('ended', onEnded)
     audio.addEventListener('error', onPlaybackError)
 
-    const stallWatchdog = window.setInterval(() => {
-      if (
-        !audio.currentSrc ||
-        audio.paused ||
-        audio.ended ||
-        audio.seeking ||
-        loadingTrackIdRef.current
-      ) {
-        return
-      }
-
-      const stalledFor = Date.now() - lastPlaybackProgressAtRef.current
-      if (stalledFor < PLAYBACK_STALL_RECOVERY_GRACE_MS) {
-        return
-      }
-
-      void recoverPlayback('playback-stalled')
-    }, PLAYBACK_STALL_CHECK_INTERVAL_MS)
-
     return () => {
       clearRecoveryTimer()
-      window.clearInterval(stallWatchdog)
       audio.removeEventListener('play', onPlay)
       audio.removeEventListener('pause', onPause)
       audio.removeEventListener('timeupdate', onTimeUpdate)
       audio.removeEventListener('loadedmetadata', onLoadedMetadata)
-      audio.removeEventListener('canplay', onCanPlay)
       audio.removeEventListener('ended', onEnded)
       audio.removeEventListener('error', onPlaybackError)
     }

@@ -858,10 +858,7 @@ function App() {
         return
       }
 
-      if (
-        isLoopbackStreamUrl(audio.currentSrc) &&
-        mediaError.code !== MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
-      ) {
+      if (isLoopbackStreamUrl(audio.currentSrc)) {
         setStatusMessage(`流式连接波动，等待后台续传《${currentTrackRef.current?.name ?? ''}》`)
         return
       }

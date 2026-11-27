@@ -41,14 +41,21 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
     private val cookieLock = Any()
     private var cookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
 
+    internal fun cookieHeaderFor(uri: URI): String = synchronized(cookieLock) {
+        cookieManager.cookieStore.get(uri)
+            .joinToString("; ") { "${it.name}=${it.value}" }
+    }
+
     override suspend fun send(
         url: String,
         method: String,
         headers: Map<String, String>,
         formBody: List<Pair<String, String>>?
     ): CloudHttpResponse = withContext(Dispatchers.IO) {
+        val initialUri = URI(url)
         var currentUrl = url
         var currentMethod = method
+        var currentHeaders = headers.toMap()
         var currentBody = formBody
         var redirects = 0
 
@@ -64,60 +71,80 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
                 setRequestProperty("Connection", "close")
             }
 
-            val cookieValue = synchronized(cookieLock) {
-                cookieManager.cookieStore.get(uri)
-                    .joinToString("; ") { "${it.name}=${it.value}" }
-            }
-            if (cookieValue.isNotEmpty()) {
-                conn.setRequestProperty("Cookie", cookieValue)
-            }
-            for ((k, v) in headers) {
-                conn.setRequestProperty(k, v)
-            }
-
-            if (currentBody != null && currentMethod == "POST") {
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-                val encoded = currentBody.joinToString("&") { (k, v) ->
-                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
-                }.toByteArray(Charsets.UTF_8)
-                conn.outputStream.use { it.write(encoded) }
-            }
-
-            val status = conn.responseCode
-            val rawHeaders = conn.headerFields
-            synchronized(cookieLock) {
-                val cookieHeaders = rawHeaders.filterKeys { it != null }.mapKeys { it.key!! }
-                runCatching { cookieManager.put(uri, cookieHeaders) }
-            }
-
-            if (status in listOf(301, 302, 303, 307, 308)) {
-                val location = conn.getHeaderField("Location")
-                conn.disconnect()
-                if (!location.isNullOrBlank()) {
-                    currentUrl = URI(currentUrl).resolve(location).toString()
-                    if (status == 301 || status == 302 || status == 303) {
-                        currentMethod = "GET"
-                        currentBody = null
+            try {
+                val allowCookies = Cloud189Protocol.isSameOrigin(initialUri, uri) ||
+                    Cloud189Protocol.isTrustedTianyiOrigin(uri)
+                if (allowCookies) {
+                    val cookieValue = cookieHeaderFor(uri)
+                    if (cookieValue.isNotEmpty()) {
+                        conn.setRequestProperty("Cookie", cookieValue)
                     }
-                    redirects += 1
-                    continue
                 }
-            }
-
-            val bytes = runCatching {
-                val stream = if (status in 200..399) conn.inputStream else (conn.errorStream ?: conn.inputStream)
-                stream?.use { it.readBytes() } ?: ByteArray(0)
-            }.getOrDefault(ByteArray(0))
-
-            val flatHeaders = mutableMapOf<String, String>()
-            for ((k, v) in rawHeaders) {
-                if (k != null && !v.isNullOrEmpty()) {
-                    flatHeaders[k.lowercase()] = v.last()
+                for ((k, v) in currentHeaders) {
+                    conn.setRequestProperty(k, v)
                 }
+
+                if (currentBody != null && currentMethod == "POST") {
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                    val encoded = currentBody.joinToString("&") { (k, v) ->
+                        "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+                    }.toByteArray(Charsets.UTF_8)
+                    conn.outputStream.use { it.write(encoded) }
+                }
+
+                val status = conn.responseCode
+                val rawHeaders = conn.headerFields
+                if (allowCookies) {
+                    synchronized(cookieLock) {
+                        val cookieHeaders = rawHeaders.filterKeys { it != null }.mapKeys { it.key!! }
+                        runCatching { cookieManager.put(uri, cookieHeaders) }
+                    }
+                }
+
+                if (status in listOf(301, 302, 303, 307, 308)) {
+                    val location = conn.getHeaderField("Location")
+                    if (!location.isNullOrBlank()) {
+                        val nextUri = runCatching { uri.resolve(location) }.getOrNull()
+                            ?: throw CloudTuneException("重定向地址无效")
+                        val sameOrigin = Cloud189Protocol.isSameOrigin(initialUri, nextUri) &&
+                            Cloud189Protocol.isSameOrigin(uri, nextUri)
+                        if (!sameOrigin) {
+                            if (!Cloud189Protocol.isTrustedTianyiOrigin(nextUri)) {
+                                throw CloudTuneException("拒绝向非受信域名重定向鉴权请求")
+                            }
+                            if ((status == 307 || status == 308) && currentBody != null) {
+                                throw CloudTuneException("拒绝跨源重定向转发鉴权表单请求")
+                            }
+                            currentHeaders = currentHeaders.filterKeys {
+                                it.lowercase(java.util.Locale.US) !in SENSITIVE_REDIRECT_HEADERS
+                            }
+                        }
+                        currentUrl = nextUri.toString()
+                        if (status == 301 || status == 302 || status == 303) {
+                            currentMethod = "GET"
+                            currentBody = null
+                        }
+                        redirects += 1
+                        continue
+                    }
+                }
+
+                val bytes = runCatching {
+                    val stream = if (status in 200..399) conn.inputStream else (conn.errorStream ?: conn.inputStream)
+                    stream?.use { it.readBytes() } ?: ByteArray(0)
+                }.getOrDefault(ByteArray(0))
+
+                val flatHeaders = mutableMapOf<String, String>()
+                for ((k, v) in rawHeaders) {
+                    if (k != null && !v.isNullOrEmpty()) {
+                        flatHeaders[k.lowercase()] = v.last()
+                    }
+                }
+                return@withContext CloudHttpResponse(status, flatHeaders, bytes, currentUrl)
+            } finally {
+                conn.disconnect()
             }
-            conn.disconnect()
-            return@withContext CloudHttpResponse(status, flatHeaders, bytes, currentUrl)
         }
         throw CloudTuneException("请求重定向次数过多")
     }
@@ -125,7 +152,14 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
     override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {
         if (cookieHeader.isNullOrBlank()) return
         val uri = runCatching { URI(domainUrl) }.getOrNull() ?: return
-        val host = uri.host ?: return
+        val host = uri.host?.lowercase(java.util.Locale.US)?.trimEnd('.') ?: return
+        val isTianyi = host == "cloud.189.cn" ||
+            host.endsWith(".cloud.189.cn") ||
+            host == "e.189.cn" ||
+            host.endsWith(".e.189.cn")
+        val isLoopback = host == "127.0.0.1" || host == "localhost"
+        if (!isTianyi && !isLoopback) return
+
         val targetUris = buildList {
             add(uri)
             if (host == "cloud.189.cn" || host.endsWith(".cloud.189.cn")) {
@@ -156,6 +190,17 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
         synchronized(cookieLock) {
             cookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
         }
+    }
+
+    companion object {
+        private val SENSITIVE_REDIRECT_HEADERS = setOf(
+            "sessionkey",
+            "signature",
+            "authorization",
+            "cookie",
+            "reqid",
+            "lt"
+        )
     }
 }
 
@@ -210,6 +255,9 @@ class Cloud189Client(
             )
         )
         Cloud189Protocol.extractApiErrorMessage(resp.text)?.let { throw CloudTuneException(it) }
+        if (resp.statusCode !in 200..299) {
+            throw CloudTuneException("刷新登录态失败 (HTTP ${resp.statusCode})")
+        }
         val json = runCatching { JSONObject(resp.text) }.getOrElse {
             throw CloudTuneException("刷新登录态失败 (HTTP ${resp.statusCode})")
         }
@@ -220,7 +268,8 @@ class Cloud189Client(
         val parsed = exchangeAccessTokenUnlocked(
             accessToken = accessToken,
             fallbackRefreshToken = nextRefresh,
-            fallbackAccountName = credential.accountName
+            fallbackAccountName = credential.accountName,
+            fallbackAccountKey = credential.accountKey
         )
         activeSession = parsed.activeSession
         persistedCredential = parsed.persistedCredential
@@ -248,6 +297,9 @@ class Cloud189Client(
             formBody = listOf("appId" to Cloud189Constants.APP_ID)
         )
         Cloud189Protocol.extractApiErrorMessage(uuidResp.text)?.let { throw CloudTuneException(it) }
+        if (uuidResp.statusCode !in 200..299) {
+            throw CloudTuneException("二维码初始化失败 (HTTP ${uuidResp.statusCode})")
+        }
         val json = JSONObject(uuidResp.text)
         val uuid = Cloud189Protocol.optNonBlank(json, "uuid") ?: throw CloudTuneException("缺少二维码 uuid")
         val encryUuid = Cloud189Protocol.optNonBlank(json, "encryuuid") ?: throw CloudTuneException("缺少 encryuuid")
@@ -297,10 +349,25 @@ class Cloud189Client(
     suspend fun exchangeRedirectForSession(redirectUrl: String): Cloud189Protocol.ParsedSessionPayload =
         mutex.withLock { exchangeRedirectUnlocked(redirectUrl) }
 
-    suspend fun listRemoteFolder(folderId: String?): FolderBrowsePayload {
+    suspend fun listRemoteFolder(
+        folderId: String?,
+        folderName: String? = null,
+        folderPath: String? = null
+    ): FolderBrowsePayload {
         val isRoot = folderId == null || folderId == Cloud189Constants.ROOT_FOLDER_ID
         val targetId = folderId ?: Cloud189Constants.ROOT_FOLDER_ID
-        val folderTitle = if (targetId == Cloud189Constants.ROOT_FOLDER_ID) Cloud189Constants.ROOT_FOLDER_NAME else "当前目录"
+        val resolvedFolderName: String
+        val resolvedFolderPath: String
+        if (isRoot) {
+            resolvedFolderName = Cloud189Constants.ROOT_FOLDER_NAME
+            resolvedFolderPath = Cloud189Constants.ROOT_FOLDER_NAME
+        } else {
+            val trimmedName = folderName?.trim()?.takeIf { it.isNotEmpty() }
+            val trimmedPath = folderPath?.trim()?.takeIf { it.isNotEmpty() }
+            val leafFromPath = trimmedPath?.substringAfterLast('/')?.trim()?.takeIf { it.isNotEmpty() }
+            resolvedFolderName = trimmedName ?: leafFromPath ?: targetId
+            resolvedFolderPath = trimmedPath ?: resolvedFolderName
+        }
 
         val folders = mutableListOf<RemoteFolder>()
         val audioFiles = mutableListOf<TrackSummary>()
@@ -323,7 +390,8 @@ class Cloud189Client(
                     "descending" to "false"
                 )
             )
-            val ao = json.optJSONObject("fileListAO") ?: break
+            val ao = json.optJSONObject("fileListAO")
+                ?: throw CloudTuneException("云盘目录响应缺少 fileListAO 字段")
             if (ao.optInt("count", 0) == 0) break
             val folderArr = ao.optJSONArray("folderList") ?: JSONArray()
             val fileArr = ao.optJSONArray("fileList") ?: JSONArray()
@@ -342,7 +410,7 @@ class Cloud189Client(
                 val track = TrackSummary(
                     id = id,
                     name = name,
-                    folderPath = folderTitle,
+                    folderPath = resolvedFolderPath,
                     sizeBytes = o.optLong("size", 0L),
                     modifiedAt = Cloud189Protocol.optNonBlank(o, "lastOpTime")
                 )
@@ -363,7 +431,7 @@ class Cloud189Client(
 
         return FolderBrowsePayload(
             currentFolderId = targetId,
-            currentFolderName = folderTitle,
+            currentFolderName = resolvedFolderName,
             parentFolderId = null,
             isRoot = isRoot,
             folders = folders,
@@ -398,7 +466,8 @@ class Cloud189Client(
 
         while (queue.isNotEmpty()) {
             val (currId, currPath) = queue.removeFirst()
-            val listing = listRemoteFolder(currId)
+            val leafName = currPath.substringAfterLast('/')
+            val listing = listRemoteFolder(folderId = currId, folderName = leafName, folderPath = currPath)
             for (f in listing.folders) {
                 queue.addLast(f.id to "$currPath/${f.name}")
             }
@@ -420,12 +489,17 @@ class Cloud189Client(
                 "Referer" to Cloud189Constants.REFERER
             )
         )
+        if (resp.statusCode !in 200..299) {
+            Cloud189Protocol.extractApiErrorMessage(resp.text)?.let { throw CloudTuneException(it) }
+            throw CloudTuneException("会话兑换失败 (HTTP ${resp.statusCode})")
+        }
         val parsed = Cloud189Protocol.parseSessionResponse(
             body = resp.text,
             statusCode = resp.statusCode,
             fallbackAccessToken = activeSession?.accessToken.orEmpty(),
             fallbackRefreshToken = persistedCredential?.refreshToken.orEmpty(),
-            fallbackAccountName = activeSession?.loginName
+            fallbackAccountName = activeSession?.loginName,
+            fallbackAccountKey = persistedCredential?.accountKey
         )
         activeSession = parsed.activeSession
         persistedCredential = parsed.persistedCredential
@@ -435,7 +509,8 @@ class Cloud189Client(
     private suspend fun exchangeAccessTokenUnlocked(
         accessToken: String,
         fallbackRefreshToken: String,
-        fallbackAccountName: String?
+        fallbackAccountName: String?,
+        fallbackAccountKey: String? = null
     ): Cloud189Protocol.ParsedSessionPayload {
         val query = buildQuery(
             clientSuffix() + listOf(
@@ -452,12 +527,17 @@ class Cloud189Client(
                 "X-Request-ID" to UUID.randomUUID().toString()
             )
         )
+        if (resp.statusCode !in 200..299) {
+            Cloud189Protocol.extractApiErrorMessage(resp.text)?.let { throw CloudTuneException(it) }
+            throw CloudTuneException("会话刷新失败 (HTTP ${resp.statusCode})")
+        }
         return Cloud189Protocol.parseSessionResponse(
             body = resp.text,
             statusCode = resp.statusCode,
             fallbackAccessToken = accessToken,
             fallbackRefreshToken = fallbackRefreshToken,
-            fallbackAccountName = fallbackAccountName
+            fallbackAccountName = fallbackAccountName,
+            fallbackAccountKey = fallbackAccountKey
         )
     }
 
@@ -493,7 +573,8 @@ class Cloud189Client(
                         val refreshed = exchangeAccessTokenUnlocked(
                             accessToken = session.accessToken,
                             fallbackRefreshToken = persistedCredential?.refreshToken.orEmpty(),
-                            fallbackAccountName = session.loginName
+                            fallbackAccountName = session.loginName,
+                            fallbackAccountKey = persistedCredential?.accountKey
                         )
                         activeSession = refreshed.activeSession
                         persistedCredential = refreshed.persistedCredential
@@ -503,6 +584,9 @@ class Cloud189Client(
                 throw CloudTuneException("天翼云盘会话已失效，请重新登录", isSessionExpired = true)
             }
             Cloud189Protocol.extractApiErrorMessage(body)?.let { throw CloudTuneException(it) }
+            if (resp.statusCode !in 200..299) {
+                throw CloudTuneException("读取天翼云盘接口失败 (HTTP ${resp.statusCode})")
+            }
             return runCatching { JSONObject(body) }.getOrElse {
                 throw CloudTuneException("读取天翼云盘接口失败 (HTTP ${resp.statusCode})")
             }

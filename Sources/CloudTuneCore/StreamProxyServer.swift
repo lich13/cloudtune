@@ -40,6 +40,53 @@ public protocol UpstreamStreamFetcher: Sendable {
     )
 }
 
+private final class PullByteStreamReader: @unchecked Sendable {
+    private let session: URLSession
+    private var iterator: URLSession.AsyncBytes.AsyncIterator
+    private var finished = false
+    private let chunkSize: Int
+
+    init(session: URLSession, bytes: URLSession.AsyncBytes, chunkSize: Int = 32_768) {
+        self.session = session
+        self.iterator = bytes.makeAsyncIterator()
+        self.chunkSize = max(1024, chunkSize)
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+    }
+
+    func invalidate() {
+        session.invalidateAndCancel()
+    }
+
+    func nextChunk() async throws -> Data? {
+        guard !finished else { return nil }
+        return try await withTaskCancellationHandler {
+            do {
+                var buffer = Data()
+                buffer.reserveCapacity(chunkSize)
+                while buffer.count < chunkSize {
+                    try Task.checkCancellation()
+                    guard let byte = try await iterator.next() else {
+                        finished = true
+                        session.finishTasksAndInvalidate()
+                        return buffer.isEmpty ? nil : buffer
+                    }
+                    buffer.append(byte)
+                }
+                return buffer
+            } catch {
+                finished = true
+                session.invalidateAndCancel()
+                throw error
+            }
+        } onCancel: { [session] in
+            session.invalidateAndCancel()
+        }
+    }
+}
+
 public struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
     public init() {}
 
@@ -60,7 +107,13 @@ public struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         let session = URLSession(configuration: config)
-        let (bytes, response) = try await session.bytes(for: req)
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await session.bytes(for: req)
+        } catch {
+            session.invalidateAndCancel()
+            throw error
+        }
         guard let http = response as? HTTPURLResponse else {
             session.invalidateAndCancel()
             throw CloudTuneError.protocolError("非 HTTP 媒体流响应")
@@ -69,33 +122,64 @@ public struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
         for (k, v) in http.allHeaderFields {
             headers[String(describing: k).lowercased()] = String(describing: v)
         }
-        let stream = AsyncThrowingStream<Data, Error> { continuation in
-            let readerTask = Task {
-                defer { session.finishTasksAndInvalidate() }
-                do {
-                    var buffer = Data()
-                    buffer.reserveCapacity(32_768)
-                    for try await byte in bytes {
-                        buffer.append(byte)
-                        if buffer.count >= 32_768 {
-                            continuation.yield(buffer)
-                            buffer.removeAll(keepingCapacity: true)
-                        }
-                    }
-                    if !buffer.isEmpty {
-                        continuation.yield(buffer)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                readerTask.cancel()
-                session.invalidateAndCancel()
-            }
-        }
+        let reader = PullByteStreamReader(session: session, bytes: bytes, chunkSize: 32_768)
+        let stream = AsyncThrowingStream<Data, Error>(unfolding: {
+            try await reader.nextChunk()
+        })
         return (http.statusCode, headers, stream)
+    }
+}
+
+private final class ActiveStreamConnection: @unchecked Sendable {
+    let id = UUID()
+    let accountHash: String
+    let token: String
+    private let lock = NSLock()
+    private var fd: Int32
+    private var revoked = false
+    private var streamTask: Task<Void, Never>?
+
+    init(fd: Int32, accountHash: String, token: String) {
+        self.fd = fd
+        self.accountHash = accountHash
+        self.token = token
+    }
+
+    var isRevoked: Bool {
+        lock.withLock { revoked }
+    }
+
+    func attachTask(_ task: Task<Void, Never>) {
+        let cancelImmediately = lock.withLock { () -> Bool in
+            self.streamTask = task
+            return revoked
+        }
+        if cancelImmediately {
+            task.cancel()
+        }
+    }
+
+    func revokeAndShutdownSocket() {
+        let (activeFD, task) = lock.withLock { () -> (Int32, Task<Void, Never>?) in
+            revoked = true
+            return (fd, streamTask)
+        }
+        if activeFD >= 0 {
+            _ = Darwin.shutdown(activeFD, SHUT_RDWR)
+        }
+        task?.cancel()
+    }
+
+    func closeOnce() {
+        let fdToClose = lock.withLock { () -> Int32 in
+            let current = fd
+            fd = -1
+            return current
+        }
+        if fdToClose >= 0 {
+            _ = Darwin.shutdown(fdToClose, SHUT_RDWR)
+            _ = Darwin.close(fdToClose)
+        }
     }
 }
 
@@ -109,13 +193,16 @@ public actor StreamProxyServer {
     private nonisolated let fetcher: UpstreamStreamFetcher
     private nonisolated let urlRefresher: (@Sendable (String) async throws -> URL)?
     private nonisolated let onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)?
+    private nonisolated let onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)?
     private var sourcesByToken: [String: StreamSourceRegistration] = [:]
     private var cacheStoresByAccount: [String: CacheStore] = [:]
+    private var activeConnectionsByID: [UUID: ActiveStreamConnection] = [:]
 
     public init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)? = nil,
+        onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)? = nil,
         urlRefresher: (@Sendable (String) async throws -> URL)? = nil
     ) throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
@@ -157,6 +244,7 @@ public actor StreamProxyServer {
         self.semaphore = semaphore
         self.fetcher = fetcher
         self.onStreamStatusUpdate = onStreamStatusUpdate
+        self.onAccountStreamStatusUpdate = onAccountStreamStatusUpdate
         self.urlRefresher = urlRefresher
 
         let acceptQ = DispatchQueue(label: "com.gosu.cloudtune.proxy.accept.\(self.port)", qos: .userInitiated)
@@ -225,19 +313,48 @@ public actor StreamProxyServer {
 
     public func revokeAllSources(forAccountHash accountHash: String) {
         sourcesByToken = sourcesByToken.filter { $0.value.accountHash != accountHash }
+        cacheStoresByAccount.removeValue(forKey: accountHash)
+        var toRevoke: [ActiveStreamConnection] = []
+        for (id, conn) in activeConnectionsByID where conn.accountHash == accountHash {
+            activeConnectionsByID.removeValue(forKey: id)
+            toRevoke.append(conn)
+        }
+        for conn in toRevoke {
+            conn.revokeAndShutdownSocket()
+        }
     }
 
     public func shutdown() {
         sourcesByToken.removeAll()
+        cacheStoresByAccount.removeAll()
+        let active = Array(activeConnectionsByID.values)
+        activeConnectionsByID.removeAll()
+        for conn in active {
+            conn.revokeAndShutdownSocket()
+        }
         acceptSource.cancel()
     }
 
-    private func lookupSource(token: String) -> (StreamSourceRegistration, CacheStore)? {
+    private func acquireConnection(
+        token: String,
+        clientFD: Int32
+    ) -> (StreamSourceRegistration, CacheStore, ActiveStreamConnection)? {
         guard let reg = sourcesByToken[token],
               let store = cacheStoresByAccount[reg.accountHash] else {
             return nil
         }
-        return (reg, store)
+        let conn = ActiveStreamConnection(fd: clientFD, accountHash: reg.accountHash, token: token)
+        activeConnectionsByID[conn.id] = conn
+        return (reg, store, conn)
+    }
+
+    private func unregisterConnection(id: UUID) {
+        activeConnectionsByID.removeValue(forKey: id)
+    }
+
+    private func isSourceStillRegistered(token: String, accountHash: String) -> Bool {
+        guard let reg = sourcesByToken[token] else { return false }
+        return reg.accountHash == accountHash && cacheStoresByAccount[accountHash] != nil
     }
 
     private func updateSourceURL(token: String, newURL: URL) {
@@ -255,22 +372,65 @@ public actor StreamProxyServer {
         }
     }
 
+    private nonisolated func publishStreamStatus(
+        id: String,
+        accountHash: String,
+        status: TransferStatus?
+    ) async {
+        if let onAccountStreamStatusUpdate {
+            await onAccountStreamStatusUpdate(id, accountHash, status)
+        } else if let onStreamStatusUpdate {
+            await onStreamStatusUpdate(id, status)
+        }
+    }
+
     private nonisolated func handleParsedClientConnection(
         _ clientFD: Int32,
         req: (method: String, path: String, headers: [String: String])
     ) async {
-        defer { Darwin.close(clientFD) }
         let parts = req.path.split(separator: "/")
         guard parts.count >= 2, parts[0] == "stream" else {
             _ = await writeSocketAsync(clientFD, Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            Darwin.close(clientFD)
             return
         }
         let token = String(parts[1])
-        guard let (foundSource, cacheStore) = await lookupSource(token: token) else {
+        guard let (foundSource, cacheStore, conn) = await acquireConnection(token: token, clientFD: clientFD) else {
             _ = await writeSocketAsync(clientFD, Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            Darwin.close(clientFD)
             return
         }
-        var source = foundSource
+
+        let worker = Task { [weak self] in
+            guard let self else {
+                conn.closeOnce()
+                return
+            }
+            await self.serveAcquiredConnection(
+                clientFD: clientFD,
+                conn: conn,
+                initialSource: foundSource,
+                cacheStore: cacheStore,
+                req: req
+            )
+        }
+        conn.attachTask(worker)
+        await worker.value
+    }
+
+    private nonisolated func serveAcquiredConnection(
+        clientFD: Int32,
+        conn: ActiveStreamConnection,
+        initialSource: StreamSourceRegistration,
+        cacheStore: CacheStore,
+        req: (method: String, path: String, headers: [String: String])
+    ) async {
+        defer {
+            conn.closeOnce()
+            Task { await self.unregisterConnection(id: conn.id) }
+        }
+        guard !conn.isRevoked, !Task.isCancelled else { return }
+        var source = initialSource
 
         let isHead = req.method.uppercased() == "HEAD"
         let clientRangeRaw = req.headers["range"]
@@ -284,8 +444,11 @@ public actor StreamProxyServer {
         }
         defer { Task { await semaphore.release() } }
 
+        guard !conn.isRevoked, !Task.isCancelled else { return }
+
         do {
             var opened = try await openWithRefreshIfNeeded(source: &source, rangeHeader: upstreamInitialRange)
+            guard !conn.isRevoked, !Task.isCancelled else { return }
             guard opened.statusCode == 200 || opened.statusCode == 206 else {
                 _ = await writeSocketAsync(clientFD, Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
                 return
@@ -320,10 +483,10 @@ public actor StreamProxyServer {
                 respHeader += "Content-Range: \(cr)\r\n"
             }
             respHeader += "\r\n"
-            guard await writeSocketAsync(clientFD, Data(respHeader.utf8)) else { return }
+            guard !conn.isRevoked, !Task.isCancelled, await writeSocketAsync(clientFD, Data(respHeader.utf8)) else { return }
 
             let eligibleForCache: Bool
-            if RangeHeaderValidator.canWriteThroughToCache(rangeHeader: clientRangeRaw) {
+            if !conn.isRevoked, RangeHeaderValidator.canWriteThroughToCache(rangeHeader: clientRangeRaw) {
                 eligibleForCache = await cacheStore.beginWriteThroughIfIdle(trackId: source.trackId)
             } else {
                 eligibleForCache = false
@@ -341,10 +504,12 @@ public actor StreamProxyServer {
             let reqEnd = requestedRange?.end
             let isTinyProbe = (reqStart == 0 && (reqEnd ?? UInt64.max) <= 1)
             let streamTaskId = "stream:\(source.trackId)"
+            let hasStatusCallback = (onAccountStreamStatusUpdate != nil) || (onStreamStatusUpdate != nil)
             var didPublishStreamStatus = false
             defer {
-                if didPublishStreamStatus, let onStreamStatusUpdate {
-                    Task { await onStreamStatusUpdate(streamTaskId, nil) }
+                if didPublishStreamStatus && hasStatusCallback {
+                    let accountHash = source.accountHash
+                    Task { await self.publishStreamStatus(id: streamTaskId, accountHash: accountHash, status: nil) }
                 }
             }
             var delivered: UInt64 = 0
@@ -356,8 +521,12 @@ public actor StreamProxyServer {
             streamLoop: while true {
                 do {
                     for try await chunk in opened.chunks {
+                        if conn.isRevoked || Task.isCancelled {
+                            streamCompletedCleanly = false
+                            break streamLoop
+                        }
                         guard !chunk.isEmpty else { continue }
-                        if !(await writeSocketAsync(clientFD, chunk)) {
+                        if !(await writeSocketAsync(clientFD, chunk)) || conn.isRevoked || Task.isCancelled {
                             streamCompletedCleanly = false
                             break streamLoop
                         }
@@ -371,7 +540,7 @@ public actor StreamProxyServer {
                         }
                         delivered += UInt64(chunk.count)
                         windowBytes += UInt64(chunk.count)
-                        if !isTinyProbe, let onStreamStatusUpdate {
+                        if !isTinyProbe && hasStatusCallback && !conn.isRevoked {
                             let elapsed = windowStart.duration(to: .now)
                             if !didPublishStreamStatus || elapsed >= .milliseconds(300) {
                                 let secs = max(0.05, Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18)
@@ -379,9 +548,10 @@ public actor StreamProxyServer {
                                 didPublishStreamStatus = true
                                 windowBytes = 0
                                 windowStart = .now
-                                await onStreamStatusUpdate(
-                                    streamTaskId,
-                                    TransferStatus(
+                                await publishStreamStatus(
+                                    id: streamTaskId,
+                                    accountHash: source.accountHash,
+                                    status: TransferStatus(
                                         id: streamTaskId,
                                         label: source.fileName,
                                         kind: "stream",
@@ -395,9 +565,13 @@ public actor StreamProxyServer {
                         }
                         resumeAttempt = 0
                     }
-                    streamCompletedCleanly = true
+                    streamCompletedCleanly = !conn.isRevoked && !Task.isCancelled
                     break streamLoop
                 } catch {
+                    if conn.isRevoked || Task.isCancelled {
+                        streamCompletedCleanly = false
+                        break streamLoop
+                    }
                     resumeAttempt += 1
                     if resumeAttempt > 4 {
                         streamCompletedCleanly = false
@@ -405,7 +579,7 @@ public actor StreamProxyServer {
                     }
                     let resumeStart = reqStart + delivered
                     if let reqEnd, resumeStart > reqEnd {
-                        streamCompletedCleanly = true
+                        streamCompletedCleanly = !conn.isRevoked && !Task.isCancelled
                         break streamLoop
                     }
                     let resumeRange = ParsedByteRange(start: resumeStart, end: reqEnd).headerValue
@@ -431,7 +605,9 @@ public actor StreamProxyServer {
             if eligibleForCache {
                 let targetTotal = fullLength ?? 0
                 let matchesExpected = (source.expectedSize == 0) || (delivered == source.expectedSize)
-                if streamCompletedCleanly && fileHandle != nil && targetTotal > 0 && delivered == targetTotal && matchesExpected {
+                let sourceRegistered = await isSourceStillRegistered(token: source.token, accountHash: source.accountHash)
+                let stillRegistered = !conn.isRevoked && !Task.isCancelled && sourceRegistered
+                if stillRegistered && streamCompletedCleanly && fileHandle != nil && targetTotal > 0 && delivered == targetTotal && matchesExpected {
                     try? FileManager.default.removeItem(at: source.cacheDestinationURL)
                     if (try? FileManager.default.moveItem(at: partURL, to: source.cacheDestinationURL)) != nil {
                         _ = try? await cacheStore.recordCompletedFile(
@@ -449,7 +625,9 @@ public actor StreamProxyServer {
                 await cacheStore.finishWriteThrough(trackId: source.trackId)
             }
         } catch {
-            _ = await writeSocketAsync(clientFD, Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            if !conn.isRevoked {
+                _ = await writeSocketAsync(clientFD, Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            }
         }
     }
 

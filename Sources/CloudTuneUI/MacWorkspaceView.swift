@@ -30,7 +30,7 @@ public struct MacWorkspaceView: View {
                 VStack(alignment: .leading, spacing: 13) {
                     heroHeader(palette: palette)
 
-                    if let status = viewModel.statusMessage, !status.isEmpty {
+                    if let status = viewModel.settingsValidationError ?? viewModel.statusMessage, !status.isEmpty {
                         Text(status)
                             .font(.system(size: 13.5, weight: .medium))
                             .foregroundStyle(palette.inkPrimary)
@@ -359,11 +359,14 @@ public struct MacWorkspaceView: View {
                             Task { await viewModel.browseTo(folderId: nil, nextBreadcrumbs: [.root]) }
                         }
                         SecondaryActionButton("下载文件夹", palette: palette, isDisabled: viewModel.browser == nil) {
-                            let dir = pickDirectoryViaOpenPanel()
-                            if let dir {
-                                Task {
-                                    await viewModel.saveExportDirectoryBookmark(dir)
-                                    await viewModel.enqueueCurrentFolderDownload(explicitDirectoryURL: dir)
+                            Task {
+                                if viewModel.committedSettings.exportFolderDisplayName == nil {
+                                    if let dir = pickDirectoryViaOpenPanel() {
+                                        await viewModel.saveExportDirectoryBookmark(dir)
+                                        await viewModel.enqueueCurrentFolderDownload(explicitDirectoryURL: dir)
+                                    }
+                                } else {
+                                    await viewModel.enqueueCurrentFolderDownload()
                                 }
                             }
                         }

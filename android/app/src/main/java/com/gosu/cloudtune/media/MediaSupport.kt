@@ -19,6 +19,7 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import java.io.File
 
 object PlaybackSessionBridge {
@@ -121,6 +122,7 @@ class PlaybackService : MediaSessionService() {
             }
         }
         mediaSession = MediaSession.Builder(this, forwardingPlayer).build()
+        CloudTuneAppRuntime.getOrCreate(applicationContext).bindSkipBridge()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession

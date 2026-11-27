@@ -17,7 +17,9 @@ import com.gosu.cloudtune.core.PlaybackMode
 import com.gosu.cloudtune.core.TrackSummary
 import java.io.File
 import java.io.FileInputStream
+import java.io.OutputStream
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -49,7 +51,8 @@ class EncryptedCredentialStore(context: Context) : CredentialStore {
             val plain = JSONObject(cipher.doFinal(ct).toString(Charsets.UTF_8))
             PersistedRefreshCredential.createOrNull(
                 refreshToken = plain.optString("refreshToken"),
-                accountName = plain.optString("accountName")
+                accountName = plain.optString("accountName"),
+                accountKey = plain.optString("accountKey")
             )
         }.getOrNull()
     }
@@ -60,6 +63,7 @@ class EncryptedCredentialStore(context: Context) : CredentialStore {
             val plain = JSONObject()
                 .put("refreshToken", credential.refreshToken)
                 .put("accountName", credential.accountName.orEmpty())
+                .put("accountKey", credential.accountKey.orEmpty())
                 .toString()
                 .toByteArray(Charsets.UTF_8)
 
@@ -231,6 +235,9 @@ object SafExporter {
         if (treeUriString.isNullOrBlank()) {
             throw CloudTuneException("尚未选择导出目录，请先授权下载文件夹。")
         }
+        if (!stagedFile.isFile) {
+            throw CloudTuneException("待导出的本地暂存文件不存在")
+        }
         val treeUri = Uri.parse(treeUriString)
         var currentDir = DocumentFile.fromTreeUri(context, treeUri)
             ?.takeIf { it.canWrite() }
@@ -240,22 +247,90 @@ object SafExporter {
         if (parts.isEmpty()) throw CloudTuneException("导出文件名为空")
 
         for (dirSegment in parts.dropLast(1)) {
-            currentDir = currentDir.findFile(dirSegment)?.takeIf { it.isDirectory }
+            val existingSegment = currentDir.findFile(dirSegment)
+            if (existingSegment != null && !existingSegment.isDirectory) {
+                throw CloudTuneException("导出路径已存在同名文件：$dirSegment")
+            }
+            currentDir = existingSegment
                 ?: currentDir.createDirectory(dirSegment)
                 ?: throw CloudTuneException("无法在导出目录创建子文件夹 $dirSegment")
         }
 
         val targetName = parts.last()
-        currentDir.findFile(targetName)?.delete()
-        val destDoc = currentDir.createFile(mimeType, targetName)
-            ?: throw CloudTuneException("无法创建导出文件 $targetName")
+        return exportToDocumentDirectory(
+            dir = currentDir,
+            targetName = targetName,
+            stagedFile = stagedFile,
+            mimeType = mimeType,
+            openOutputStream = { doc -> context.contentResolver.openOutputStream(doc.uri) }
+        )
+    }
 
-        context.contentResolver.openOutputStream(destDoc.uri)?.use { out ->
-            FileInputStream(stagedFile).use { input ->
-                input.copyTo(out, bufferSize = 262_144)
+    internal fun exportToDocumentDirectory(
+        dir: DocumentFile,
+        targetName: String,
+        stagedFile: File,
+        mimeType: String,
+        openOutputStream: (DocumentFile) -> OutputStream?
+    ): String {
+        if (!stagedFile.isFile) {
+            throw CloudTuneException("待导出的本地暂存文件不存在")
+        }
+        val initialExisting = dir.findFile(targetName)
+        if (initialExisting != null && initialExisting.isDirectory) {
+            throw CloudTuneException("导出目标路径已存在同名文件夹：$targetName")
+        }
+
+        val tempName = ".${targetName}.cloudtune-${UUID.randomUUID()}.tmp"
+        val tempDoc = dir.createFile(mimeType, tempName)
+            ?: throw CloudTuneException("无法创建导出临时文件 $targetName")
+
+        var tempPromoted = false
+        try {
+            val expectedBytes = stagedFile.length()
+            var writtenBytes = 0L
+            openOutputStream(tempDoc)?.use { out ->
+                FileInputStream(stagedFile).use { input ->
+                    writtenBytes = input.copyTo(out, bufferSize = 262_144)
+                }
+            } ?: throw CloudTuneException("无法写入导出文件流")
+
+            if (expectedBytes > 0L && writtenBytes != expectedBytes) {
+                throw CloudTuneException("导出文件写入长度不完整：$writtenBytes != $expectedBytes")
             }
-        } ?: throw CloudTuneException("无法写入导出文件流")
 
-        return destDoc.uri.toString()
+            val currentExisting = dir.findFile(targetName)
+            if (currentExisting != null && currentExisting.uri != tempDoc.uri) {
+                if (currentExisting.isDirectory) {
+                    throw CloudTuneException("导出目标路径已存在同名文件夹：$targetName")
+                }
+                if (!currentExisting.delete()) {
+                    throw CloudTuneException("无法替换已有导出文件 $targetName")
+                }
+            }
+
+            if (tempDoc.renameTo(targetName)) {
+                tempPromoted = true
+                return (dir.findFile(targetName) ?: tempDoc).uri.toString()
+            }
+
+            val fallbackDest = dir.createFile(mimeType, targetName)
+                ?: throw CloudTuneException("无法创建导出文件 $targetName")
+            try {
+                openOutputStream(fallbackDest)?.use { out ->
+                    FileInputStream(stagedFile).use { input ->
+                        input.copyTo(out, bufferSize = 262_144)
+                    }
+                } ?: throw CloudTuneException("无法写入导出文件流")
+                return fallbackDest.uri.toString()
+            } catch (e: Exception) {
+                runCatching { fallbackDest.delete() }
+                throw e
+            }
+        } finally {
+            if (!tempPromoted) {
+                runCatching { tempDoc.delete() }
+            }
+        }
     }
 }

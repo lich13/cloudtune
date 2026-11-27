@@ -182,14 +182,31 @@ public actor AccountScopedStore {
 
         var coordinatorError: NSError?
         var writeError: Error?
+        let targetLeafName = components.last!
         let coordinator = NSFileCoordinator()
         coordinator.coordinate(writingItemAt: targetURL, options: .forReplacing, error: &coordinatorError) { coordinatedURL in
             do {
                 try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-                if FileManager.default.fileExists(atPath: coordinatedURL.path) {
-                    try FileManager.default.removeItem(at: coordinatedURL)
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: coordinatedURL.path, isDirectory: &isDir), isDir.boolValue {
+                    throw CloudTuneError.storageError("导出目标路径已存在同名文件夹：\(targetLeafName)")
                 }
-                try FileManager.default.copyItem(at: stagedFileURL, to: coordinatedURL)
+                let tempName = ".\(coordinatedURL.lastPathComponent).cloudtune-\(UUID().uuidString.lowercased()).tmp"
+                let tempURL = coordinatedURL.deletingLastPathComponent().appendingPathComponent(tempName, isDirectory: false)
+                defer {
+                    try? FileManager.default.removeItem(at: tempURL)
+                }
+                try FileManager.default.copyItem(at: stagedFileURL, to: tempURL)
+
+                var replaceIsDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: coordinatedURL.path, isDirectory: &replaceIsDir) {
+                    if replaceIsDir.boolValue {
+                        throw CloudTuneError.storageError("导出目标路径已存在同名文件夹：\(targetLeafName)")
+                    }
+                    _ = try FileManager.default.replaceItemAt(coordinatedURL, withItemAt: tempURL)
+                } else {
+                    try FileManager.default.moveItem(at: tempURL, to: coordinatedURL)
+                }
             } catch {
                 writeError = error
             }
@@ -198,33 +215,72 @@ public actor AccountScopedStore {
             throw CloudTuneError.exportPermissionRevoked("写入导出目录被拒绝: \(coordinatorError.localizedDescription)")
         }
         if let writeError {
+            if let ctError = writeError as? CloudTuneError {
+                throw ctError
+            }
             throw CloudTuneError.exportPermissionRevoked("导出文件失败: \(writeError.localizedDescription)")
         }
         return targetURL
     }
 
-    /// Non-destructive migration from legacy Tauri `com.cloudtune.desktop` directory if present.
-    public func migrateLegacyTauriDataIfPresent(legacyRoot: URL? = nil) -> PersistedRefreshCredential? {
-        let candidate: URL
-        if let legacyRoot {
-            candidate = legacyRoot
-        } else if let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
-            candidate = appSupport.appendingPathComponent("com.cloudtune.desktop", isDirectory: true)
+    /// Non-destructive migration from legacy Tauri directories (`com.gosu.cloudtune` flat root,
+    /// `/Applications/CloudTune.app/Contents/MacOS/data`, and `com.cloudtune.desktop`) if present.
+    public func migrateLegacyTauriDataIfPresent(
+        legacyRoot: URL? = nil,
+        candidateRoots: [URL]? = nil
+    ) -> PersistedRefreshCredential? {
+        let marker = rootDirectory.appendingPathComponent(".migrated-v2")
+        guard !fm.fileExists(atPath: marker.path) else { return nil }
+
+        let rawCandidates: [URL]
+        if let candidateRoots {
+            rawCandidates = candidateRoots
+        } else if let legacyRoot {
+            rawCandidates = [legacyRoot]
         } else {
-            return nil
+            var defaults: [URL] = [
+                rootDirectory,
+                URL(fileURLWithPath: "/Applications/CloudTune.app/Contents/MacOS/data", isDirectory: true)
+            ]
+            if let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
+                defaults.append(appSupport.appendingPathComponent("com.cloudtune.desktop", isDirectory: true))
+            }
+            rawCandidates = defaults
         }
 
-        let marker = rootDirectory.appendingPathComponent(".migrated-v1")
-        guard !fm.fileExists(atPath: marker.path) else { return nil }
-        let legacySettingsURL = candidate.appendingPathComponent("settings.json")
-        guard let settingsData = try? Data(contentsOf: legacySettingsURL),
-              let json = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any] else {
+        var seenPaths = Set<String>()
+        var matchedCandidate: URL?
+        var parsedSettings: [String: Any]?
+        for dir in rawCandidates {
+            let stdPath = dir.standardizedFileURL.path
+            guard seenPaths.insert(stdPath).inserted else { continue }
+            let settingsURL = dir.appendingPathComponent("settings.json")
+            if let settingsData = try? Data(contentsOf: settingsURL),
+               let json = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any] {
+                matchedCandidate = dir
+                parsedSettings = json
+                break
+            }
+        }
+
+        guard let candidate = matchedCandidate, let json = parsedSettings else {
             return nil
         }
 
         let accountName = Cloud189Protocol.stringValue(json["accountName"])
         let refreshToken = Cloud189Protocol.stringValue(json["refreshToken"]) ?? ""
-        let targetAccount = accountName ?? "legacy_account"
+        let targetAccount: String
+        if let accountName, accountName != Cloud189Constants.defaultAccountDisplayName {
+            targetAccount = accountName
+        } else if !refreshToken.isEmpty {
+            targetAccount = Cloud189Protocol.deriveFallbackAccountKey(
+                refreshToken: refreshToken,
+                accessToken: nil,
+                sessionKey: "legacy_account"
+            )
+        } else {
+            targetAccount = "legacy_account"
+        }
 
         if let p = try? paths(for: targetAccount) {
             if !fm.fileExists(atPath: p.settingsURL.path) {
@@ -233,8 +289,14 @@ public actor AccountScopedStore {
                    let fname = Cloud189Protocol.stringValue(json["musicFolderName"]) {
                     migrated.musicFolder = FolderSelection(id: fid, name: fname)
                 }
-                if let limit = Cloud189Protocol.intValue(json["cacheLimitMb"]), limit >= 256 {
+                if let limit = Cloud189Protocol.intValue(json["cacheLimitMb"]), limit >= Int(AccountSettings.minCacheLimitMB) {
                     migrated.cacheLimitMb = UInt64(limit)
+                }
+                if let dlThreads = Cloud189Protocol.intValue(json["downloadThreads"]) {
+                    migrated.downloadThreads = min(max(1, dlThreads), AccountSettings.maxDownloadThreads)
+                }
+                if let cThreads = Cloud189Protocol.intValue(json["cacheThreads"]) {
+                    migrated.cacheThreads = min(max(1, cThreads), AccountSettings.maxCacheThreads)
                 }
                 if let modeRaw = Cloud189Protocol.stringValue(json["playbackMode"]),
                    let mode = PlaybackMode(rawValue: modeRaw) {
@@ -249,6 +311,10 @@ public actor AccountScopedStore {
         }
 
         try? Data("ok".utf8).write(to: marker, options: .atomic)
-        return PersistedRefreshCredential(refreshToken: refreshToken, accountName: accountName)
+        return PersistedRefreshCredential(
+            refreshToken: refreshToken,
+            accountName: accountName,
+            accountKey: targetAccount
+        )
     }
 }

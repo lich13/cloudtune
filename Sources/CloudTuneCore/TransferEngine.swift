@@ -2,13 +2,25 @@ import Foundation
 
 public struct StagedDownloadManifest: Codable, Equatable, Sendable {
     public var taskId: String
-    public var accountId: String
+    public var accountHash: String
     public var trackId: String
     public var fileName: String
     public var relativeExportSubpath: String
     public var totalSize: UInt64
     public var partCount: Int
     public var state: String
+
+    private enum CodingKeys: String, CodingKey {
+        case taskId
+        case accountId
+        case accountHash
+        case trackId
+        case fileName
+        case relativeExportSubpath
+        case totalSize
+        case partCount
+        case state
+    }
 
     public init(
         taskId: String,
@@ -21,7 +33,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         state: String
     ) {
         self.taskId = taskId
-        self.accountId = accountId
+        self.accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
         self.trackId = trackId
         self.fileName = fileName
         self.relativeExportSubpath = relativeExportSubpath
@@ -29,15 +41,75 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.partCount = partCount
         self.state = state
     }
+
+    public init(
+        taskId: String,
+        accountHash: String,
+        trackId: String,
+        fileName: String,
+        relativeExportSubpath: String,
+        totalSize: UInt64,
+        partCount: Int,
+        state: String
+    ) {
+        self.taskId = taskId
+        self.accountHash = accountHash
+        self.trackId = trackId
+        self.fileName = fileName
+        self.relativeExportSubpath = relativeExportSubpath
+        self.totalSize = totalSize
+        self.partCount = partCount
+        self.state = state
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.taskId = try c.decode(String.self, forKey: .taskId)
+        if let hash = try c.decodeIfPresent(String.self, forKey: .accountHash), !hash.isEmpty {
+            self.accountHash = hash
+        } else if let legacyAccountId = try c.decodeIfPresent(String.self, forKey: .accountId), !legacyAccountId.isEmpty {
+            self.accountHash = Cloud189Protocol.accountBucketHash(for: legacyAccountId)
+        } else {
+            self.accountHash = ""
+        }
+        self.trackId = try c.decode(String.self, forKey: .trackId)
+        self.fileName = try c.decode(String.self, forKey: .fileName)
+        self.relativeExportSubpath = try c.decodeIfPresent(String.self, forKey: .relativeExportSubpath) ?? self.fileName
+        self.totalSize = try c.decodeIfPresent(UInt64.self, forKey: .totalSize) ?? 0
+        self.partCount = max(1, try c.decodeIfPresent(Int.self, forKey: .partCount) ?? 1)
+        self.state = try c.decodeIfPresent(String.self, forKey: .state) ?? "paused"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(taskId, forKey: .taskId)
+        try c.encode(trackId, forKey: .trackId)
+        try c.encode(fileName, forKey: .fileName)
+        try c.encode(relativeExportSubpath, forKey: .relativeExportSubpath)
+        try c.encode(totalSize, forKey: .totalSize)
+        try c.encode(partCount, forKey: .partCount)
+        try c.encode(state, forKey: .state)
+    }
 }
 
 public actor TransferEngine {
+    private struct InFlightCacheDownload {
+        let cacheKey: String
+        let statusId: String
+        let accountHash: String?
+        var waiterIDs: Set<UUID>
+        let task: Task<URL, Error>
+    }
+
     private let semaphore: GlobalTransferSemaphore
     private let fetcher: UpstreamStreamFetcher
     private let urlResolver: @Sendable (String) async throws -> URL
     private var statuses: [String: TransferStatus] = [:]
+    private var statusAccountHashes: [String: String] = [:]
     private var manifests: [String: StagedDownloadManifest] = [:]
+    private var manifestAccountKeys: [String: String] = [:]
     private var runningTasks: [String: Task<Void, Error>] = [:]
+    private var inFlightCacheDownloads: [String: InFlightCacheDownload] = [:]
     private let fm = FileManager.default
 
     public init(
@@ -56,11 +128,18 @@ public actor TransferEngine {
               let saved = try? JSONDecoder().decode([StagedDownloadManifest].self, from: data) else {
             return
         }
+        let targetHash = paths.bucketHash
         for var item in saved {
+            if !item.accountHash.isEmpty && item.accountHash != targetHash {
+                continue
+            }
+            item.accountHash = targetHash
             if item.state == "running" {
                 item.state = "paused"
             }
             manifests[item.taskId] = item
+            manifestAccountKeys[item.taskId] = accountId
+            statusAccountHashes[item.taskId] = targetHash
             let completed = completedBytesForManifest(item, stagingDir: paths.stagingDir)
             statuses[item.taskId] = TransferStatus(
                 id: item.taskId,
@@ -69,7 +148,7 @@ public actor TransferEngine {
                 state: item.state,
                 path: item.relativeExportSubpath,
                 canPause: false,
-                canResume: item.state == "paused",
+                canResume: item.state == "paused" || item.state.hasPrefix("failed"),
                 canDelete: true,
                 bytesPerSecond: 0,
                 transferredBytes: completed,
@@ -86,45 +165,90 @@ public actor TransferEngine {
         return TransferSnapshotPayload(totalSpeedBytesPerSecond: speed, items: items)
     }
 
-    public func updateExternalTransferStatus(id: String, status: TransferStatus?) {
+    public func updateExternalTransferStatus(id: String, accountHash: String? = nil, status: TransferStatus?) {
         if let status {
             statuses[id] = status
+            if let accountHash {
+                statusAccountHashes[id] = accountHash
+            }
         } else {
             statuses.removeValue(forKey: id)
+            statusAccountHashes.removeValue(forKey: id)
         }
     }
 
     public func cancelAll(forAccountId accountId: String) {
-        for (id, manifest) in manifests where manifest.accountId == accountId {
+        let targetHash = Cloud189Protocol.accountBucketHash(for: accountId)
+        for (id, manifest) in manifests where manifest.accountHash == targetHash {
             runningTasks[id]?.cancel()
             runningTasks.removeValue(forKey: id)
             statuses.removeValue(forKey: id)
+            statusAccountHashes.removeValue(forKey: id)
             manifests.removeValue(forKey: id)
+            manifestAccountKeys.removeValue(forKey: id)
         }
-        for key in statuses.keys where key.hasPrefix("stream:") || key.hasPrefix("prefetch:") || key.hasPrefix("playback:") {
-            statuses.removeValue(forKey: key)
+        for (cacheKey, inFlight) in inFlightCacheDownloads where inFlight.accountHash == nil || inFlight.accountHash == targetHash {
+            inFlight.task.cancel()
+            inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            statuses.removeValue(forKey: inFlight.statusId)
+            statusAccountHashes.removeValue(forKey: inFlight.statusId)
+        }
+        for (id, ownerHash) in statusAccountHashes where ownerHash == targetHash {
+            runningTasks[id]?.cancel()
+            runningTasks.removeValue(forKey: id)
+            statuses.removeValue(forKey: id)
+            statusAccountHashes.removeValue(forKey: id)
+        }
+        for key in Array(statuses.keys) where key.hasPrefix("stream:") || key.hasPrefix("prefetch:") || key.hasPrefix("playback:") {
+            if statusAccountHashes[key] == nil || statusAccountHashes[key] == targetHash {
+                statuses.removeValue(forKey: key)
+                statusAccountHashes.removeValue(forKey: key)
+            }
         }
     }
 
     /// Downloads a track directly into private cache (`download_first` or background `prefetch`) using the shared 8-permit limiter.
+    /// Concurrent `prefetch` and `playback` calls for the same cache destination coalesce onto a single in-flight download.
     @discardableResult
     public func downloadTrackToCache(
         track: TrackSummary,
         cacheStore: CacheStore,
         parallelThreads: Int,
         cacheLimitBytes: UInt64,
-        kind: String = "playback"
+        kind: String = "playback",
+        accountHash: String? = nil
     ) async throws -> URL {
         if let existing = await cacheStore.existingCachedFile(trackId: track.id) {
             return existing
         }
         let destination = await cacheStore.cacheFileURL(trackId: track.id, originalFileName: track.name)
-        let partsDir = destination.appendingPathExtension("parts")
-        let tempMerged = destination.appendingPathExtension("part")
-        let taskId = "\(kind):\(track.id)"
+        let cacheKey = destination.standardizedFileURL.path
+        let waiterID = UUID()
 
-        statuses[taskId] = TransferStatus(
-            id: taskId,
+        if var existingInFlight = inFlightCacheDownloads[cacheKey] {
+            existingInFlight.waiterIDs.insert(waiterID)
+            inFlightCacheDownloads[cacheKey] = existingInFlight
+            if kind == "playback", var currentStatus = statuses[existingInFlight.statusId] {
+                currentStatus.kind = "playback"
+                statuses[existingInFlight.statusId] = currentStatus
+            }
+            let sharedTask = existingInFlight.task
+            return try await withTaskCancellationHandler {
+                try await sharedTask.value
+            } onCancel: {
+                Task {
+                    await self.detachCacheDownloadWaiter(cacheKey: cacheKey, waiterID: waiterID)
+                }
+            }
+        }
+
+        if let existingAfterAwait = await cacheStore.existingCachedFile(trackId: track.id) {
+            return existingAfterAwait
+        }
+
+        let statusId = "\(kind):\(track.id)"
+        statuses[statusId] = TransferStatus(
+            id: statusId,
             label: track.name,
             kind: kind,
             state: "running",
@@ -135,32 +259,93 @@ public actor TransferEngine {
             transferredBytes: 0,
             totalBytes: track.sizeBytes > 0 ? track.sizeBytes : nil
         )
-        defer { statuses.removeValue(forKey: taskId) }
+        if let accountHash {
+            statusAccountHashes[statusId] = accountHash
+        }
+
+        let worker = Task<URL, Error> {
+            try await self.performCacheDownload(
+                cacheKey: cacheKey,
+                statusId: statusId,
+                track: track,
+                destination: destination,
+                cacheStore: cacheStore,
+                parallelThreads: parallelThreads,
+                cacheLimitBytes: cacheLimitBytes
+            )
+        }
+        inFlightCacheDownloads[cacheKey] = InFlightCacheDownload(
+            cacheKey: cacheKey,
+            statusId: statusId,
+            accountHash: accountHash,
+            waiterIDs: [waiterID],
+            task: worker
+        )
+
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            Task {
+                await self.detachCacheDownloadWaiter(cacheKey: cacheKey, waiterID: waiterID)
+            }
+        }
+    }
+
+    private func detachCacheDownloadWaiter(cacheKey: String, waiterID: UUID) {
+        guard var inFlight = inFlightCacheDownloads[cacheKey] else { return }
+        inFlight.waiterIDs.remove(waiterID)
+        if inFlight.waiterIDs.isEmpty {
+            inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            statuses.removeValue(forKey: inFlight.statusId)
+            statusAccountHashes.removeValue(forKey: inFlight.statusId)
+            inFlight.task.cancel()
+        } else {
+            inFlightCacheDownloads[cacheKey] = inFlight
+        }
+    }
+
+    private func performCacheDownload(
+        cacheKey: String,
+        statusId: String,
+        track: TrackSummary,
+        destination: URL,
+        cacheStore: CacheStore,
+        parallelThreads: Int,
+        cacheLimitBytes: UInt64
+    ) async throws -> URL {
+        let partsDir = destination.appendingPathExtension("parts")
+        let tempMerged = destination.appendingPathExtension("merged.part")
+        defer {
+            inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            statuses.removeValue(forKey: statusId)
+            statusAccountHashes.removeValue(forKey: statusId)
+            try? fm.removeItem(at: partsDir)
+            try? fm.removeItem(at: tempMerged)
+        }
 
         let remoteURL = try await urlResolver(track.id)
         let probe = try await probeTarget(url: remoteURL, fallbackSize: track.sizeBytes)
         let totalSize = probe.totalSize
         let partCount = (probe.supportsRange && totalSize >= 1_048_576) ? min(max(1, parallelThreads), 8) : 1
 
+        try? fm.removeItem(at: partsDir)
         try fm.createDirectory(at: partsDir, withIntermediateDirectories: true)
-        defer {
-            try? fm.removeItem(at: partsDir)
-            try? fm.removeItem(at: tempMerged)
-        }
 
         try await downloadParts(
-            taskId: taskId,
+            taskId: statusId,
             trackId: track.id,
             initialURL: probe.finalURL,
             totalSize: totalSize,
             partCount: partCount,
             partsDir: partsDir
         )
+        try Task.checkCancellation()
         try mergeParts(partsDir: partsDir, partCount: partCount, into: tempMerged, expectedTotal: totalSize)
         if fm.fileExists(atPath: destination.path) {
-            try? fm.removeItem(at: destination)
+            _ = try fm.replaceItemAt(destination, withItemAt: tempMerged)
+        } else {
+            try fm.moveItem(at: tempMerged, to: destination)
         }
-        try fm.moveItem(at: tempMerged, to: destination)
         _ = try await cacheStore.recordCompletedFile(
             trackId: track.id,
             fileURL: destination,
@@ -182,9 +367,10 @@ public actor TransferEngine {
     ) async throws -> String {
         let taskId = "download:\(UUID().uuidString.lowercased())"
         let partCount = min(max(1, parallelThreads), 16)
+        let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
         let manifest = StagedDownloadManifest(
             taskId: taskId,
-            accountId: accountId,
+            accountHash: accountHash,
             trackId: track.id,
             fileName: track.name,
             relativeExportSubpath: relativeExportSubpath,
@@ -193,6 +379,8 @@ public actor TransferEngine {
             state: "running"
         )
         manifests[taskId] = manifest
+        manifestAccountKeys[taskId] = accountId
+        statusAccountHashes[taskId] = accountHash
         statuses[taskId] = TransferStatus(
             id: taskId,
             label: track.name,
@@ -206,8 +394,8 @@ public actor TransferEngine {
             transferredBytes: 0,
             totalBytes: track.sizeBytes > 0 ? track.sizeBytes : nil
         )
-        await persistManifests(for: accountId, accountStore: accountStore)
-        spawnExportTask(manifest: manifest, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
+        await persistManifests(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
+        spawnExportTask(manifest: manifest, accountKey: accountId, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
         return taskId
     }
 
@@ -224,58 +412,69 @@ public actor TransferEngine {
                 s.bytesPerSecond = 0
                 statuses[id] = s
             }
-            await persistManifests(for: m.accountId, accountStore: accountStore)
+            if let accountKey = manifestAccountKeys[id] {
+                await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
+            }
         }
     }
 
     public func resumeTransfer(id: String, explicitDirectoryURL: URL? = nil, accountStore: AccountScopedStore) async {
-        guard var m = manifests[id] else { return }
+        guard var m = manifests[id], let accountKey = manifestAccountKeys[id] else { return }
         m.state = "running"
         manifests[id] = m
+        statusAccountHashes[id] = m.accountHash
         if var s = statuses[id] {
             s.state = "running"
             s.canPause = true
             s.canResume = false
             statuses[id] = s
         }
-        await persistManifests(for: m.accountId, accountStore: accountStore)
-        spawnExportTask(manifest: m, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
+        await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
+        spawnExportTask(manifest: m, accountKey: accountKey, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
     }
 
     public func deleteTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
-        let accountId = manifests[id]?.accountId
-        manifests.removeValue(forKey: id)
+        let manifest = manifests.removeValue(forKey: id)
+        let accountKey = manifestAccountKeys.removeValue(forKey: id)
         statuses.removeValue(forKey: id)
-        if let accountId, let paths = try? await accountStore.paths(for: accountId) {
+        statusAccountHashes.removeValue(forKey: id)
+        if let accountKey, let manifest, let paths = try? await accountStore.paths(for: accountKey) {
             let safeKey = Cloud189Protocol.sanitizeFileName(id)
             try? fm.removeItem(at: paths.stagingDir.appendingPathComponent("\(safeKey).parts"))
             try? fm.removeItem(at: paths.stagingDir.appendingPathComponent("\(safeKey).merged"))
-            await persistManifests(for: accountId, accountStore: accountStore)
+            await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
         }
     }
 
     private func spawnExportTask(
         manifest: StagedDownloadManifest,
+        accountKey: String,
         explicitDirectoryURL: URL?,
         accountStore: AccountScopedStore
     ) {
         let id = manifest.taskId
         runningTasks[id]?.cancel()
         runningTasks[id] = Task {
-            await self.runExportWorkflow(manifest: manifest, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
+            await self.runExportWorkflow(
+                manifest: manifest,
+                accountKey: accountKey,
+                explicitDirectoryURL: explicitDirectoryURL,
+                accountStore: accountStore
+            )
         }
     }
 
     private func runExportWorkflow(
         manifest: StagedDownloadManifest,
+        accountKey: String,
         explicitDirectoryURL: URL?,
         accountStore: AccountScopedStore
     ) async {
         let id = manifest.taskId
         do {
-            let paths = try await accountStore.paths(for: manifest.accountId)
+            let paths = try await accountStore.paths(for: accountKey)
             let safeKey = Cloud189Protocol.sanitizeFileName(id)
             let partsDir = paths.stagingDir.appendingPathComponent("\(safeKey).parts", isDirectory: true)
             let mergedURL = paths.stagingDir.appendingPathComponent("\(safeKey).merged")
@@ -286,11 +485,12 @@ public actor TransferEngine {
             let totalSize = max(probe.totalSize, manifest.totalSize)
             let effectiveParts = (probe.supportsRange && totalSize >= 524_288) ? manifest.partCount : 1
 
+            guard manifests[id] != nil else { return }
             var updatedManifest = manifest
             updatedManifest.totalSize = totalSize
             updatedManifest.partCount = effectiveParts
             manifests[id] = updatedManifest
-            await persistManifests(for: manifest.accountId, accountStore: accountStore)
+            await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
 
             let resumedCompleted = completedBytesForManifest(updatedManifest, stagingDir: paths.stagingDir)
             if var s = statuses[id] {
@@ -313,12 +513,15 @@ public actor TransferEngine {
                 stagedFileURL: mergedURL,
                 relativeSubpath: manifest.relativeExportSubpath,
                 explicitDirectoryURL: explicitDirectoryURL,
-                for: manifest.accountId
+                for: accountKey
             )
             try? fm.removeItem(at: mergedURL)
             try? fm.removeItem(at: partsDir)
 
+            guard manifests[id] != nil else { return }
             manifests.removeValue(forKey: id)
+            manifestAccountKeys.removeValue(forKey: id)
+            statusAccountHashes[id] = manifest.accountHash
             statuses[id] = TransferStatus(
                 id: id,
                 label: manifest.fileName,
@@ -332,14 +535,14 @@ public actor TransferEngine {
                 transferredBytes: totalSize,
                 totalBytes: totalSize > 0 ? totalSize : nil
             )
-            await persistManifests(for: manifest.accountId, accountStore: accountStore)
+            await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
         } catch is CancellationError {
             return
         } catch {
             if var m = manifests[id] {
                 m.state = "paused"
                 manifests[id] = m
-                await persistManifests(for: m.accountId, accountStore: accountStore)
+                await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
             }
             if var s = statuses[id] {
                 s.state = "failed: \(error.localizedDescription)"
@@ -347,6 +550,7 @@ public actor TransferEngine {
                 s.canResume = true
                 s.bytesPerSecond = 0
                 statuses[id] = s
+                statusAccountHashes[id] = manifest.accountHash
             }
         }
     }
@@ -563,9 +767,9 @@ public actor TransferEngine {
         return manifest.totalSize > 0 ? min(sum, manifest.totalSize) : sum
     }
 
-    private func persistManifests(for accountId: String, accountStore: AccountScopedStore) async {
-        guard let paths = try? await accountStore.paths(for: accountId) else { return }
-        let items = manifests.values.filter { $0.accountId == accountId }.sorted { $0.taskId < $1.taskId }
+    private func persistManifests(forAccountKey accountKey: String, accountHash: String, accountStore: AccountScopedStore) async {
+        guard let paths = try? await accountStore.paths(for: accountKey) else { return }
+        let items = manifests.values.filter { $0.accountHash == accountHash }.sorted { $0.taskId < $1.taskId }
         if let data = try? JSONEncoder().encode(items) {
             try? data.write(to: paths.transfersURL, options: .atomic)
         }

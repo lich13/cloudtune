@@ -24,6 +24,78 @@ public protocol CloudHTTPTransport: Sendable {
     func clearCookies() async
 }
 
+private final class PerRequestRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private let initialRequest: URLRequest
+    private var _blockedError: CloudTuneError?
+
+    init(initialRequest: URLRequest) {
+        self.initialRequest = initialRequest
+    }
+
+    var blockedError: CloudTuneError? {
+        lock.withLock { _blockedError }
+    }
+
+    private func recordBlocked(_ error: CloudTuneError) {
+        lock.withLock {
+            if _blockedError == nil {
+                _blockedError = error
+            }
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let origURL = task.originalRequest?.url ?? initialRequest.url,
+              let targetURL = request.url else {
+            recordBlocked(.protocolError("重定向地址无效"))
+            completionHandler(nil)
+            return
+        }
+        let prevURL = response.url ?? origURL
+        let sameOrigin = Cloud189Protocol.isSameOrigin(origURL, targetURL)
+            && Cloud189Protocol.isSameOrigin(prevURL, targetURL)
+        if sameOrigin {
+            completionHandler(request)
+            return
+        }
+
+        guard Cloud189Protocol.isTrustedTianyiOrigin(targetURL) else {
+            recordBlocked(.protocolError("拒绝向非受信域名重定向鉴权请求"))
+            completionHandler(nil)
+            return
+        }
+
+        let isBodyPreservingRedirect = (response.statusCode == 307 || response.statusCode == 308)
+        let hadBody = (initialRequest.httpBody != nil)
+            || (task.originalRequest?.httpBody != nil)
+            || (request.httpBody != nil)
+        if isBodyPreservingRedirect && hadBody {
+            recordBlocked(.protocolError("拒绝跨源重定向转发鉴权表单请求"))
+            completionHandler(nil)
+            return
+        }
+
+        var sanitized = request
+        for sensitiveHeader in ["SessionKey", "Signature", "Authorization", "Cookie", "Reqid", "lt"] {
+            sanitized.setValue(nil, forHTTPHeaderField: sensitiveHeader)
+        }
+        if [301, 302, 303].contains(response.statusCode) {
+            sanitized.httpMethod = "GET"
+            sanitized.httpBody = nil
+            sanitized.setValue(nil, forHTTPHeaderField: "Content-Type")
+            sanitized.setValue(nil, forHTTPHeaderField: "Content-Length")
+        }
+        completionHandler(sanitized)
+    }
+}
+
 public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var session: URLSession
@@ -46,7 +118,11 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
 
     public func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
         let activeSession = lock.withLock { session }
-        let (data, response) = try await activeSession.data(for: request)
+        let redirectGuard = PerRequestRedirectGuard(initialRequest: request)
+        let (data, response) = try await activeSession.data(for: request, delegate: redirectGuard)
+        if let blocked = redirectGuard.blockedError {
+            throw blocked
+        }
         guard let http = response as? HTTPURLResponse else {
             throw CloudTuneError.protocolError("非 HTTP 响应")
         }
@@ -65,7 +141,22 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
     public func importCookies(_ cookies: [HTTPCookie]) async {
         lock.withLock {
             for cookie in cookies {
+                let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                let isTianyi = domain == "cloud.189.cn"
+                    || domain.hasSuffix(".cloud.189.cn")
+                    || domain == "e.189.cn"
+                    || domain.hasSuffix(".e.189.cn")
+                let isLoopback = domain == "127.0.0.1" || domain == "localhost"
+                guard isTianyi || isLoopback else { continue }
                 cookieStorage.setCookie(cookie)
+                if domain == "cloud.189.cn" || domain.hasSuffix(".cloud.189.cn") {
+                    var props = cookie.properties ?? [:]
+                    props[.domain] = ".cloud.189.cn"
+                    props[.path] = "/"
+                    if let shared = HTTPCookie(properties: props) {
+                        cookieStorage.setCookie(shared)
+                    }
+                }
             }
         }
     }
@@ -144,6 +235,9 @@ public actor Cloud189Client {
         if let err = Cloud189Protocol.extractAPIErrorMessage(resp.text) {
             throw CloudTuneError.protocolError(err)
         }
+        guard (200..<300).contains(resp.statusCode) else {
+            throw CloudTuneError.httpStatus(resp.statusCode, "刷新登录态请求失败")
+        }
         guard let data = resp.text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let accessToken = Cloud189Protocol.stringValue(json["accessToken"]),
@@ -154,7 +248,8 @@ public actor Cloud189Client {
         let parsed = try await exchangeAccessTokenForSession(
             accessToken: accessToken,
             fallbackRefreshToken: nextRefresh,
-            fallbackAccountName: credential.accountName
+            fallbackAccountName: credential.accountName,
+            fallbackAccountKey: credential.accountKey
         )
         self.activeSession = parsed.activeSession
         self.persistedCredential = parsed.persistedCredential
@@ -182,6 +277,9 @@ public actor Cloud189Client {
         let uuidResp = try await transport.send(uuidReq)
         if let err = Cloud189Protocol.extractAPIErrorMessage(uuidResp.text) {
             throw CloudTuneError.protocolError(err)
+        }
+        guard (200..<300).contains(uuidResp.statusCode) else {
+            throw CloudTuneError.httpStatus(uuidResp.statusCode, "二维码初始化请求失败")
         }
         guard let data = uuidResp.text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -252,22 +350,46 @@ public actor Cloud189Client {
         req.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
 
         let resp = try await transport.send(req)
+        guard (200..<300).contains(resp.statusCode) else {
+            if let err = Cloud189Protocol.extractAPIErrorMessage(resp.text) {
+                throw CloudTuneError.protocolError(err)
+            }
+            throw CloudTuneError.httpStatus(resp.statusCode, "会话兑换失败")
+        }
         let parsed = try Cloud189Protocol.parseSessionResponse(
             resp.text,
             statusCode: resp.statusCode,
             fallbackAccessToken: activeSession?.accessToken ?? "",
             fallbackRefreshToken: persistedCredential?.refreshToken ?? "",
-            fallbackAccountName: activeSession?.loginName
+            fallbackAccountName: activeSession?.loginName,
+            fallbackAccountKey: persistedCredential?.accountKey
         )
         self.activeSession = parsed.activeSession
         self.persistedCredential = parsed.persistedCredential
         return parsed
     }
 
-    public func listRemoteFolder(folderId: String?) async throws -> FolderBrowsePayload {
+    public func listRemoteFolder(
+        folderId: String?,
+        folderName: String? = nil,
+        folderPath: String? = nil
+    ) async throws -> FolderBrowsePayload {
         let isRoot = (folderId == nil || folderId == Cloud189Constants.rootFolderId)
         let targetId = folderId ?? Cloud189Constants.rootFolderId
-        let folderTitle = (targetId == Cloud189Constants.rootFolderId) ? Cloud189Constants.rootFolderName : "当前目录"
+        let resolvedFolderName: String
+        let resolvedFolderPath: String
+        if isRoot {
+            resolvedFolderName = Cloud189Constants.rootFolderName
+            resolvedFolderPath = Cloud189Constants.rootFolderName
+        } else {
+            let trimmedName = folderName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let trimmedPath = folderPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let leafFromPath = trimmedPath?.split(separator: "/").last.map(String.init)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+            resolvedFolderName = trimmedName ?? leafFromPath ?? targetId
+            resolvedFolderPath = trimmedPath ?? resolvedFolderName
+        }
 
         var folders: [RemoteFolder] = []
         var audioFiles: [TrackSummary] = []
@@ -290,7 +412,9 @@ public actor Cloud189Client {
                     ("descending", "false")
                 ]
             )
-            guard let block = json["fileListAO"] as? [String: Any] else { break }
+            guard let block = json["fileListAO"] as? [String: Any] else {
+                throw CloudTuneError.protocolError("云盘目录响应缺少 fileListAO 字段")
+            }
             let count = Cloud189Protocol.intValue(block["count"]) ?? 0
             if count == 0 { break }
 
@@ -315,7 +439,7 @@ public actor Cloud189Client {
                     let summary = TrackSummary(
                         id: id,
                         name: name,
-                        folderPath: folderTitle,
+                        folderPath: resolvedFolderPath,
                         sizeBytes: size,
                         modifiedAt: Cloud189Protocol.stringValue(item["lastOpTime"])
                     )
@@ -339,7 +463,7 @@ public actor Cloud189Client {
 
         return FolderBrowsePayload(
             currentFolderId: targetId,
-            currentFolderName: folderTitle,
+            currentFolderName: resolvedFolderName,
             parentFolderId: nil,
             isRoot: isRoot,
             folders: folders,
@@ -383,7 +507,8 @@ public actor Cloud189Client {
         while index < queue.count {
             let (currId, currPath) = queue[index]
             index += 1
-            let listing = try await listRemoteFolder(folderId: currId)
+            let leafName = currPath.split(separator: "/").last.map(String.init) ?? currPath
+            let listing = try await listRemoteFolder(folderId: currId, folderName: leafName, folderPath: currPath)
             for sub in listing.folders {
                 queue.append((sub.id, "\(currPath)/\(sub.name)"))
             }
@@ -402,7 +527,8 @@ public actor Cloud189Client {
     private func exchangeAccessTokenForSession(
         accessToken: String,
         fallbackRefreshToken: String,
-        fallbackAccountName: String?
+        fallbackAccountName: String?,
+        fallbackAccountKey: String? = nil
     ) async throws -> Cloud189Protocol.ParsedSessionPayload {
         var comps = URLComponents(string: "\(Cloud189Constants.apiURL)/getSessionForPC.action")!
         comps.queryItems = clientSuffixItems() + [
@@ -416,12 +542,19 @@ public actor Cloud189Client {
         req.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
 
         let resp = try await transport.send(req)
+        guard (200..<300).contains(resp.statusCode) else {
+            if let err = Cloud189Protocol.extractAPIErrorMessage(resp.text) {
+                throw CloudTuneError.protocolError(err)
+            }
+            throw CloudTuneError.httpStatus(resp.statusCode, "会话刷新失败")
+        }
         return try Cloud189Protocol.parseSessionResponse(
             resp.text,
             statusCode: resp.statusCode,
             fallbackAccessToken: accessToken,
             fallbackRefreshToken: fallbackRefreshToken,
-            fallbackAccountName: fallbackAccountName
+            fallbackAccountName: fallbackAccountName,
+            fallbackAccountKey: fallbackAccountKey
         )
     }
 
@@ -458,7 +591,8 @@ public actor Cloud189Client {
                     let refreshed = try await exchangeAccessTokenForSession(
                         accessToken: session.accessToken,
                         fallbackRefreshToken: persistedCredential?.refreshToken ?? "",
-                        fallbackAccountName: session.loginName
+                        fallbackAccountName: session.loginName,
+                        fallbackAccountKey: persistedCredential?.accountKey
                     )
                     self.activeSession = refreshed.activeSession
                     self.persistedCredential = refreshed.persistedCredential
@@ -468,6 +602,9 @@ public actor Cloud189Client {
             }
             if let err = Cloud189Protocol.extractAPIErrorMessage(body) {
                 throw CloudTuneError.protocolError(err)
+            }
+            guard (200..<300).contains(resp.statusCode) else {
+                throw CloudTuneError.httpStatus(resp.statusCode, "读取天翼云盘接口失败")
             }
             guard let data = body.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

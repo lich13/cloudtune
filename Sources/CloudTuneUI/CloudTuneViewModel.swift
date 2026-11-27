@@ -16,6 +16,7 @@ public final class CloudTuneViewModel {
 
     public var isAuthenticated: Bool = false
     public var accountName: String?
+    public private(set) var accountStorageKey: String?
 
     // Strictly separated committed vs draft settings
     public private(set) var committedSettings: AccountSettings = AccountSettings()
@@ -88,6 +89,7 @@ public final class CloudTuneViewModel {
     private var playbackGeneration: Int = 0
     private var recoveryAttempts: Int = 0
     private var currentPlaybackIsLoopback: Bool = false
+    public var retryBaseDelayMs: Int = 1500
 
     public init(
         cloudClient: Cloud189Client = Cloud189Client(),
@@ -108,8 +110,8 @@ public final class CloudTuneViewModel {
         if enableLiveObservers {
             self.streamServer = try? StreamProxyServer(
                 semaphore: semaphore,
-                onStreamStatusUpdate: { id, status in
-                    await engine.updateExternalTransferStatus(id: id, status: status)
+                onAccountStreamStatusUpdate: { id, accountHash, status in
+                    await engine.updateExternalTransferStatus(id: id, accountHash: accountHash, status: status)
                 },
                 urlRefresher: { [cloudClient] trackId in
                     try await cloudClient.resolveDownloadURL(fileId: trackId)
@@ -144,10 +146,12 @@ public final class CloudTuneViewModel {
         case .authIdle:
             vm.isAuthenticated = false
             vm.accountName = nil
+            vm.accountStorageKey = nil
             vm.cacheUsageBytes = 0
         case .authQr:
             vm.isAuthenticated = false
             vm.accountName = nil
+            vm.accountStorageKey = nil
             vm.cacheUsageBytes = 0
             vm.qrContent = fixture.qrLogin.qrContent
             vm.qrHint = fixture.qrLogin.message
@@ -156,6 +160,7 @@ public final class CloudTuneViewModel {
         case .music, .video, .download, .errorBanner:
             vm.isAuthenticated = true
             vm.accountName = fixture.accountName
+            vm.accountStorageKey = fixture.accountName
             vm.cacheUsageBytes = fixture.settings.cacheUsageBytes
             vm.breadcrumbs = fixture.breadcrumbs
             vm.browser = fixture.browser
@@ -216,10 +221,16 @@ public final class CloudTuneViewModel {
         cacheLimitDraft = String(committedSettings.cacheLimitMb)
         downloadThreadsDraft = String(committedSettings.downloadThreads)
         cacheThreadsDraft = String(committedSettings.cacheThreads)
+        if let previousError = settingsValidationError, statusMessage == previousError {
+            statusMessage = nil
+        }
         settingsValidationError = nil
     }
 
     public func noteDraftEdited() {
+        if let previousError = settingsValidationError, statusMessage == previousError {
+            statusMessage = nil
+        }
         settingsValidationError = nil
     }
 
@@ -284,8 +295,12 @@ public final class CloudTuneViewModel {
     }
 
     private var activeAccountKey: String? {
+        if let key = accountStorageKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            return key
+        }
         guard let trimmed = accountName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else {
+              !trimmed.isEmpty,
+              trimmed != Cloud189Constants.defaultAccountDisplayName else {
             return nil
         }
         return trimmed
@@ -322,13 +337,21 @@ public final class CloudTuneViewModel {
 
         do {
             let sessionPayload = try await cloudClient.restoreFromRefreshCredential(storedCred)
+            let identity = Cloud189Protocol.resolveAccountIdentity(
+                activeSession: sessionPayload.activeSession,
+                persistedCredential: sessionPayload.persistedCredential ?? storedCred,
+                priorAccountKey: storedCred.accountKey
+            )
             if let refreshedCred = sessionPayload.persistedCredential {
-                try? credentialMachine.save(refreshedCred, backend: keychainBackend)
+                try? credentialMachine.save(refreshedCred.withAccountKey(identity.storageKey), backend: keychainBackend)
             }
             await activateAuthenticatedAccount(
-                accountName: sessionPayload.activeSession.loginName ?? storedCred.accountName ?? "天翼云盘用户"
+                storageKey: identity.storageKey,
+                displayName: identity.displayName
             )
             await browseTo(folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
+        } catch is CancellationError {
+            return
         } catch {
             isAuthenticated = false
             statusMessage = error.localizedDescription
@@ -346,6 +369,8 @@ public final class CloudTuneViewModel {
             statusMessage = start.message
             qrPNGData = QRCodeGenerator.generatePNGData(content: start.qrContent, dimension: 512)
             startQrPolling()
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -355,7 +380,11 @@ public final class CloudTuneViewModel {
         qrPollTask?.cancel()
         qrPollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(2500))
+                do {
+                    try await Task.sleep(for: .milliseconds(2500))
+                } catch {
+                    break
+                }
                 guard !Task.isCancelled, let self else { break }
                 do {
                     let poll = try await self.cloudClient.pollQrLogin()
@@ -363,14 +392,34 @@ public final class CloudTuneViewModel {
                     self.statusMessage = poll.message
                     switch poll.state {
                     case .authenticated:
-                        if let persisted = await self.cloudClient.persistedCredential {
-                            try? self.credentialMachine.save(persisted, backend: self.keychainBackend)
+                        let activeSession = await self.cloudClient.activeSession
+                        let persisted = await self.cloudClient.persistedCredential
+                        let identity: (storageKey: String, displayName: String)
+                        if let activeSession {
+                            identity = Cloud189Protocol.resolveAccountIdentity(
+                                activeSession: activeSession,
+                                persistedCredential: persisted
+                            )
+                        } else {
+                            let fallbackName = poll.accountName ?? Cloud189Constants.defaultAccountDisplayName
+                            let fallbackKey = (fallbackName != Cloud189Constants.defaultAccountDisplayName)
+                                ? fallbackName
+                                : Cloud189Protocol.deriveFallbackAccountKey(
+                                    refreshToken: persisted?.refreshToken,
+                                    accessToken: nil,
+                                    sessionKey: UUID().uuidString
+                                )
+                            identity = (fallbackKey, fallbackName)
                         }
-                        let clientName = await self.cloudClient.accountName
-                        let resolvedName = poll.accountName ?? clientName ?? "天翼云盘用户"
+                        if let persisted {
+                            try? self.credentialMachine.save(persisted.withAccountKey(identity.storageKey), backend: self.keychainBackend)
+                        }
                         self.qrContent = nil
                         self.qrPNGData = nil
-                        await self.activateAuthenticatedAccount(accountName: resolvedName)
+                        await self.activateAuthenticatedAccount(
+                            storageKey: identity.storageKey,
+                            displayName: identity.displayName
+                        )
                         await self.browseTo(folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
                         return
                     case .expired:
@@ -380,6 +429,8 @@ public final class CloudTuneViewModel {
                     case .waitingScan, .waitingConfirm:
                         continue
                     }
+                } catch is CancellationError {
+                    return
                 } catch {
                     self.statusMessage = error.localizedDescription
                     return
@@ -394,17 +445,25 @@ public final class CloudTuneViewModel {
         do {
             await cloudClient.importWebCookies(cookies)
             let parsed = try await cloudClient.exchangeRedirectForSession(redirectURL: callbackURL.absoluteString)
+            let identity = Cloud189Protocol.resolveAccountIdentity(
+                activeSession: parsed.activeSession,
+                persistedCredential: parsed.persistedCredential
+            )
             if let persisted = parsed.persistedCredential {
-                try? credentialMachine.save(persisted, backend: keychainBackend)
+                try? credentialMachine.save(persisted.withAccountKey(identity.storageKey), backend: keychainBackend)
             }
             isShowingWebLoginSheet = false
             qrPollTask?.cancel()
             qrContent = nil
             qrPNGData = nil
-            let name = parsed.activeSession.loginName ?? "天翼云盘用户"
-            await activateAuthenticatedAccount(accountName: name)
+            await activateAuthenticatedAccount(
+                storageKey: identity.storageKey,
+                displayName: identity.displayName
+            )
             await browseTo(folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
             statusMessage = "天翼官方网页登录成功"
+        } catch is CancellationError {
+            return
         } catch {
             isShowingWebLoginSheet = false
             statusMessage = "网页登录回调兑换失败（\(error.localizedDescription)），已为您切换至二维码扫码登录，可保存二维码到相册后用天翼云盘 App 识别。"
@@ -412,24 +471,25 @@ public final class CloudTuneViewModel {
         }
     }
 
-    private func activateAuthenticatedAccount(accountName: String) async {
+    public func activateAuthenticatedAccount(storageKey: String, displayName: String) async {
         self.isAuthenticated = true
-        self.accountName = accountName
+        self.accountStorageKey = storageKey
+        self.accountName = displayName
         self.credentialIssue = nil
 
-        if let paths = try? await accountStore.paths(for: accountName) {
+        if let paths = try? await accountStore.paths(for: storageKey) {
             let store = try? CacheStore(cacheDirectory: paths.cacheDir, indexURL: paths.cacheIndexURL)
             self.cacheStore = store
             self.cacheUsageBytes = await store?.usageBytes() ?? 0
         }
-        if let savedSettings = try? await accountStore.loadSettings(for: accountName) {
+        if let savedSettings = try? await accountStore.loadSettings(for: storageKey) {
             self.committedSettings = savedSettings
             syncDraftsFromCommitted()
         }
-        if let savedTracks = try? await accountStore.loadLibrary(for: accountName) {
+        if let savedTracks = try? await accountStore.loadLibrary(for: storageKey) {
             self.tracks = savedTracks
         }
-        await transferEngine.restorePersistedDownloads(for: accountName, accountStore: accountStore)
+        await transferEngine.restorePersistedDownloads(for: storageKey, accountStore: accountStore)
         transferSnapshot = await transferEngine.snapshot()
         startTransferPolling()
     }
@@ -438,6 +498,10 @@ public final class CloudTuneViewModel {
         qrPollTask?.cancel()
         transferPollTask?.cancel()
         playbackGeneration += 1
+        recoveryAttempts = 0
+        prefetchedTrackId = nil
+        prefetchingTrackId = nil
+        plannedShuffleNextTrackId = nil
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         _player?.pause()
@@ -454,6 +518,7 @@ public final class CloudTuneViewModel {
 
         isAuthenticated = false
         accountName = nil
+        accountStorageKey = nil
         cacheStore = nil
         cacheUsageBytes = 0
         browser = nil
@@ -476,10 +541,24 @@ public final class CloudTuneViewModel {
         guard isAuthenticated else { return }
         if showBusy { busyLabel = "读取云盘目录..." }
         defer { if showBusy { busyLabel = nil } }
+        let isRoot = (folderId == nil || folderId == Cloud189Constants.rootFolderId)
+        let nonRootCrumbs = nextBreadcrumbs.filter { $0.id != nil && $0.id != Cloud189Constants.rootFolderId }
+        let resolvedName = isRoot
+            ? Cloud189Constants.rootFolderName
+            : (nonRootCrumbs.last?.name ?? nextBreadcrumbs.last?.name)
+        let resolvedPath = isRoot
+            ? Cloud189Constants.rootFolderName
+            : nonRootCrumbs.map(\.name).filter { !$0.isEmpty }.joined(separator: "/")
         do {
-            let listing = try await cloudClient.listRemoteFolder(folderId: folderId)
+            let listing = try await cloudClient.listRemoteFolder(
+                folderId: folderId,
+                folderName: resolvedName,
+                folderPath: resolvedPath.isEmpty ? nil : resolvedPath
+            )
             browser = listing
             breadcrumbs = nextBreadcrumbs
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -487,13 +566,16 @@ public final class CloudTuneViewModel {
 
     public func setCurrentFolderAsMusicLibrary() async {
         guard let browser, let lastCrumb = breadcrumbs.last, let accountId = activeAccountKey else { return }
-        busyLabel = "保存 \(lastCrumb.name) 为音乐目录..."
+        let displayName = (lastCrumb.id == browser.currentFolderId || (browser.isRoot && lastCrumb.id == nil))
+            ? lastCrumb.name
+            : browser.currentFolderName
+        busyLabel = "保存 \(displayName) 为音乐目录..."
         defer { busyLabel = nil }
         var next = committedSettings
-        next.musicFolder = FolderSelection(id: browser.currentFolderId, name: lastCrumb.name)
+        next.musicFolder = FolderSelection(id: browser.currentFolderId, name: displayName)
         committedSettings = next
         try? await accountStore.saveSettings(next, for: accountId)
-        statusMessage = "音乐目录已设置为 \(lastCrumb.name)"
+        statusMessage = "音乐目录已设置为 \(displayName)"
         await scanMusicLibrary(showBusy: false)
     }
 
@@ -509,6 +591,8 @@ public final class CloudTuneViewModel {
             tracks = scanned
             try? await accountStore.saveLibrary(scanned, for: accountId)
             statusMessage = "已载入 \(scanned.count) 首音乐"
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -520,7 +604,8 @@ public final class CloudTuneViewModel {
         _ track: TrackSummary,
         modeOverride: PlaybackMode? = nil,
         forceStreamProxy: Bool = false,
-        resumeTime: Double = 0
+        resumeTime: Double = 0,
+        isRecoveryRetry: Bool = false
     ) async {
         guard let accountId = activeAccountKey, let cacheStore else { return }
         playbackGeneration += 1
@@ -529,7 +614,7 @@ public final class CloudTuneViewModel {
         prefetchedTrackId = nil
         prefetchingTrackId = nil
         plannedShuffleNextTrackId = nil
-        if modeOverride == nil && !forceStreamProxy && resumeTime == 0 {
+        if !isRecoveryRetry {
             recoveryAttempts = 0
         }
         defer {
@@ -566,9 +651,10 @@ public final class CloudTuneViewModel {
                     cacheStore: cacheStore,
                     parallelThreads: committedSettings.downloadThreads,
                     cacheLimitBytes: committedSettings.cacheLimitBytes,
-                    kind: "playback"
+                    kind: "playback",
+                    accountHash: accountHash
                 )
-                guard gen == playbackGeneration else { return }
+                guard gen == playbackGeneration, isAuthenticated else { return }
                 cacheUsageBytes = await cacheStore.usageBytes()
                 try await startAVPlayer(
                     track: track,
@@ -580,7 +666,7 @@ public final class CloudTuneViewModel {
                 )
             } else {
                 let remoteURL = try await cloudClient.resolveDownloadURL(fileId: track.id)
-                guard gen == playbackGeneration else { return }
+                guard gen == playbackGeneration, isAuthenticated else { return }
                 let destURL = await cacheStore.cacheFileURL(trackId: track.id, originalFileName: track.name)
                 let playbackURL: URL
                 if let streamServer {
@@ -608,8 +694,10 @@ public final class CloudTuneViewModel {
                     generation: gen
                 )
             }
+        } catch is CancellationError {
+            return
         } catch {
-            guard gen == playbackGeneration else { return }
+            guard gen == playbackGeneration, isAuthenticated else { return }
             await handlePlaybackPreparationFailure(
                 track: track,
                 error: error,
@@ -686,6 +774,10 @@ public final class CloudTuneViewModel {
         wasLoopback: Bool,
         resumeTime: Double
     ) async {
+        if error is CancellationError {
+            return
+        }
+        let failedGeneration = playbackGeneration
         let nsError = error as NSError
         let lower = error.localizedDescription.lowercased()
         let lowerName = track.name.lowercased()
@@ -725,11 +817,25 @@ public final class CloudTuneViewModel {
         recoveryAttempts += 1
         switch action {
         case .fallbackToStreamProxyOnce:
+            guard isAuthenticated, playbackGeneration == failedGeneration else { return }
             statusMessage = "《\(track.name)》优先缓存超时，改用流式代理直接起播"
-            await playTrack(track, modeOverride: .streamCache, forceStreamProxy: true, resumeTime: resumeTime)
+            await playTrack(
+                track,
+                modeOverride: .streamCache,
+                forceStreamProxy: true,
+                resumeTime: resumeTime,
+                isRecoveryRetry: true
+            )
         case .fallbackToFullDownloadOnce:
+            guard isAuthenticated, playbackGeneration == failedGeneration else { return }
             statusMessage = "流式容器受限，回退整曲下载《\(track.name)》"
-            await playTrack(track, modeOverride: .downloadFirst, forceStreamProxy: false, resumeTime: resumeTime)
+            await playTrack(
+                track,
+                modeOverride: .downloadFirst,
+                forceStreamProxy: false,
+                resumeTime: resumeTime,
+                isRecoveryRetry: true
+            )
         case let .stopImmediatelyUnsupportedCodec(msg):
             isPlaying = false
             statusMessage = msg
@@ -738,9 +844,22 @@ public final class CloudTuneViewModel {
             statusMessage = "播放异常，已停止自动重试《\(track.name)》"
         case let .retryTransientAfterDelay(attempt):
             isPlaying = false
+            guard isAuthenticated, playbackGeneration == failedGeneration else { return }
             statusMessage = "播放波动，正在重试《\(track.name)》(\(attempt)/\(PlaybackDecisionPolicy.maxRecoveryAttempts))"
-            try? await Task.sleep(for: .milliseconds(1500 * attempt))
-            await playTrack(track, resumeTime: resumeTime)
+            let delayMs = max(0, retryBaseDelayMs) * attempt
+            if delayMs > 0 {
+                do {
+                    try await Task.sleep(for: .milliseconds(delayMs))
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled,
+                  isAuthenticated,
+                  playbackGeneration == failedGeneration else {
+                return
+            }
+            await playTrack(track, resumeTime: resumeTime, isRecoveryRetry: true)
         }
     }
 
@@ -836,6 +955,8 @@ public final class CloudTuneViewModel {
             activeVideoTrack = video
             activeVideoURL = url
             statusMessage = "正在应用内播放视频：\(video.name)"
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -864,6 +985,8 @@ public final class CloudTuneViewModel {
             )
             transferSnapshot = await transferEngine.snapshot()
             statusMessage = "已创建下载任务 \(taskId)"
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -871,17 +994,22 @@ public final class CloudTuneViewModel {
 
     public func enqueueCurrentFolderDownload(explicitDirectoryURL: URL? = nil) async {
         guard let browser, let accountId = activeAccountKey else { return }
+        let nonRootCrumbs = breadcrumbs.filter { $0.id != nil && $0.id != Cloud189Constants.rootFolderId }
+        let crumbPath: String? = (!browser.isRoot && nonRootCrumbs.last?.id == browser.currentFolderId)
+            ? nonRootCrumbs.map(\.name).filter { !$0.isEmpty }.joined(separator: "/")
+            : nil
+        let rootExportFolder = (crumbPath?.isEmpty == false ? crumbPath! : browser.currentFolderName)
         busyLabel = "扫描文件夹 \(browser.currentFolderName)..."
         defer { busyLabel = nil }
         do {
             let allFiles = try await cloudClient.scanAllFiles(
                 folderId: browser.currentFolderId,
-                folderName: browser.currentFolderName
+                folderName: rootExportFolder
             )
             for item in allFiles {
-                let rel = item.folderPath.hasPrefix(browser.currentFolderName)
+                let rel = item.folderPath.hasPrefix(rootExportFolder)
                     ? "\(item.folderPath)/\(item.name)"
-                    : "\(browser.currentFolderName)/\(item.name)"
+                    : "\(rootExportFolder)/\(item.name)"
                 _ = try await transferEngine.enqueueExportDownload(
                     accountId: accountId,
                     track: item,
@@ -893,6 +1021,8 @@ public final class CloudTuneViewModel {
             }
             transferSnapshot = await transferEngine.snapshot()
             statusMessage = "目录下载已入队（共 \(allFiles.count) 个文件）"
+        } catch is CancellationError {
+            return
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -1031,6 +1161,7 @@ public final class CloudTuneViewModel {
 
         prefetchingTrackId = next.id
         let activeId = currentTrackId ?? ""
+        let accountHash = activeAccountKey.map { Cloud189Protocol.accountBucketHash(for: $0) }
         await cacheStore.setProtectedTrackIDs([activeId, next.id])
         Task { [weak self] in
             guard let self else { return }
@@ -1039,7 +1170,8 @@ public final class CloudTuneViewModel {
                 cacheStore: cacheStore,
                 parallelThreads: self.committedSettings.cacheThreads,
                 cacheLimitBytes: self.committedSettings.cacheLimitBytes,
-                kind: "prefetch"
+                kind: "prefetch",
+                accountHash: accountHash
             )) != nil {
                 self.prefetchedTrackId = next.id
             }

@@ -1,6 +1,7 @@
 package com.gosu.cloudtune.core
 
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -11,13 +12,17 @@ import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class StreamSourceRegistration(
     val token: String = UUID.randomUUID().toString(),
@@ -42,39 +47,45 @@ fun interface UpstreamStreamOpener {
 }
 
 class HttpUrlConnectionStreamOpener : UpstreamStreamOpener {
-    override suspend fun open(url: String, rangeHeader: String?): OpenedUpstreamStream {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = true
-            requestMethod = "GET"
-            connectTimeout = 20_000
-            readTimeout = 25_000
-            setRequestProperty("Accept", "*/*")
-            setRequestProperty("Referer", Cloud189Constants.REFERER)
-            setRequestProperty("User-Agent", Cloud189Constants.USER_AGENT)
-            setRequestProperty("Connection", "close")
-            if (rangeHeader != null) {
-                setRequestProperty("Range", rangeHeader)
+    override suspend fun open(url: String, rangeHeader: String?): OpenedUpstreamStream =
+        withContext(Dispatchers.IO) {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = true
+                requestMethod = "GET"
+                connectTimeout = 20_000
+                readTimeout = 25_000
+                setRequestProperty("Accept", "*/*")
+                setRequestProperty("Referer", Cloud189Constants.REFERER)
+                setRequestProperty("User-Agent", Cloud189Constants.USER_AGENT)
+                setRequestProperty("Connection", "close")
+                if (rangeHeader != null) {
+                    setRequestProperty("Range", rangeHeader)
+                }
+            }
+            try {
+                val status = conn.responseCode
+                val headers = mutableMapOf<String, String>()
+                for ((k, v) in conn.headerFields) {
+                    if (k != null && !v.isNullOrEmpty()) {
+                        headers[k.lowercase()] = v.last()
+                    }
+                }
+                val stream = if (status in 200..299) {
+                    BufferedInputStream(conn.inputStream, 32_768)
+                } else {
+                    conn.errorStream ?: ByteArrayInputStream(ByteArray(0))
+                }
+                OpenedUpstreamStream(
+                    statusCode = status,
+                    headers = headers,
+                    bodyStream = stream,
+                    onClose = { runCatching { conn.disconnect() } }
+                )
+            } catch (t: Throwable) {
+                runCatching { conn.disconnect() }
+                throw t
             }
         }
-        val status = conn.responseCode
-        val headers = mutableMapOf<String, String>()
-        for ((k, v) in conn.headerFields) {
-            if (k != null && !v.isNullOrEmpty()) {
-                headers[k.lowercase()] = v.last()
-            }
-        }
-        val stream = if (status in 200..299) {
-            BufferedInputStream(conn.inputStream, 32_768)
-        } else {
-            conn.errorStream ?: java.io.ByteArrayInputStream(ByteArray(0))
-        }
-        return OpenedUpstreamStream(
-            statusCode = status,
-            headers = headers,
-            bodyStream = stream,
-            onClose = { runCatching { conn.disconnect() } }
-        )
-    }
 }
 
 /**
@@ -84,235 +95,391 @@ class LocalStreamServer(
     private val limiter: GlobalTransferLimiter,
     private val opener: UpstreamStreamOpener = HttpUrlConnectionStreamOpener(),
     private val onStreamStatusUpdate: ((String, TransferStatus?) -> Unit)? = null,
+    private val onAccountStreamStatusUpdate: ((String, String, TransferStatus?) -> Unit)? = null,
     private val urlRefresher: (suspend (String) -> String)? = null
 ) : AutoCloseable {
+    private class ActiveClientSession(
+        val id: UUID = UUID.randomUUID(),
+        val accountHash: String,
+        val token: String,
+        val socket: Socket,
+        val job: Job?
+    ) {
+        val revoked = AtomicBoolean(false)
+        @Volatile var activeUpstream: OpenedUpstreamStream? = null
+
+        fun revoke() {
+            revoked.set(true)
+            runCatching { socket.close() }
+            val upstream = activeUpstream
+            if (upstream != null) {
+                runCatching { upstream.bodyStream.close() }
+                runCatching { upstream.onClose() }
+            }
+            job?.cancel()
+        }
+    }
+
     private val serverSocket = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
     val port: Int = serverSocket.localPort
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val sources = ConcurrentHashMap<String, Pair<StreamSourceRegistration, CacheManager>>()
+    private val stateLock = Any()
+    private val sources = HashMap<String, Pair<StreamSourceRegistration, CacheManager>>()
+    private val activeSessions = HashMap<UUID, ActiveClientSession>()
 
     init {
         scope.launch {
             while (isActive && !serverSocket.isClosed) {
-                val client = runCatching { serverSocket.accept() }.getOrNull() ?: break
-                launch { handleClient(client) }
+                val client = try {
+                    serverSocket.accept()
+                } catch (_: Throwable) {
+                    if (serverSocket.isClosed || !isActive) break
+                    continue
+                }
+                // Launch directly on supervisor `scope` (never as child of accept job) so client errors isolate cleanly
+                scope.launch {
+                    val clientJob = currentCoroutineContext()[Job]
+                    try {
+                        handleClient(client, clientJob)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Throwable) {
+                        // Isolated per-connection failure
+                    } finally {
+                        runCatching { client.close() }
+                    }
+                }
             }
         }
     }
 
     fun registerSource(reg: StreamSourceRegistration, cacheManager: CacheManager): String {
-        sources[reg.token] = reg to cacheManager
+        synchronized(stateLock) {
+            sources[reg.token] = reg to cacheManager
+        }
         val encoded = URLEncoder.encode(Cloud189Protocol.sanitizeFileName(reg.fileName), "UTF-8")
             .replace("+", "%20")
         return "http://127.0.0.1:$port/stream/${reg.token}/$encoded"
     }
 
     fun revokeAllSources(accountHash: String) {
-        val iterator = sources.entries.iterator()
-        while (iterator.hasNext()) {
-            if (iterator.next().value.first.accountHash == accountHash) {
-                iterator.remove()
+        val sessionsToRevoke: List<ActiveClientSession>
+        synchronized(stateLock) {
+            val sourceIter = sources.entries.iterator()
+            while (sourceIter.hasNext()) {
+                if (sourceIter.next().value.first.accountHash == accountHash) {
+                    sourceIter.remove()
+                }
             }
+            val collected = ArrayList<ActiveClientSession>()
+            val sessIter = activeSessions.entries.iterator()
+            while (sessIter.hasNext()) {
+                val entry = sessIter.next()
+                if (entry.value.accountHash == accountHash) {
+                    collected.add(entry.value)
+                    sessIter.remove()
+                }
+            }
+            sessionsToRevoke = collected
+        }
+        for (session in sessionsToRevoke) {
+            session.revoke()
         }
     }
 
     override fun close() {
-        sources.clear()
+        val sessionsToRevoke: List<ActiveClientSession>
+        synchronized(stateLock) {
+            sources.clear()
+            sessionsToRevoke = activeSessions.values.toList()
+            activeSessions.clear()
+        }
+        for (session in sessionsToRevoke) {
+            session.revoke()
+        }
         runCatching { serverSocket.close() }
         scope.cancel()
     }
 
-    private suspend fun handleClient(socket: Socket) {
+    private fun acquireSession(
+        token: String,
+        socket: Socket,
+        job: Job?
+    ): Triple<StreamSourceRegistration, CacheManager, ActiveClientSession>? = synchronized(stateLock) {
+        val pair = sources[token] ?: return null
+        val session = ActiveClientSession(
+            accountHash = pair.first.accountHash,
+            token = token,
+            socket = socket,
+            job = job
+        )
+        activeSessions[session.id] = session
+        Triple(pair.first, pair.second, session)
+    }
+
+    private fun releaseSession(id: UUID) {
+        synchronized(stateLock) {
+            activeSessions.remove(id)
+        }
+    }
+
+    private fun isSourceStillRegistered(token: String, accountHash: String): Boolean = synchronized(stateLock) {
+        sources[token]?.first?.accountHash == accountHash
+    }
+
+    private fun publishStatus(id: String, accountHash: String, status: TransferStatus?) {
+        if (onAccountStreamStatusUpdate != null) {
+            onAccountStreamStatusUpdate.invoke(id, accountHash, status)
+        } else {
+            onStreamStatusUpdate?.invoke(id, status)
+        }
+    }
+
+    private suspend fun handleClient(socket: Socket, clientJob: Job?) {
         socket.use { client ->
-            val req = readHttpRequest(client.getInputStream()) ?: return
+            val req = runCatching { readHttpRequest(client.getInputStream()) }.getOrNull() ?: return
             val segments = req.path.trim('/').split('/')
             val out = client.getOutputStream()
             if (segments.size < 2 || segments[0] != "stream") {
-                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                runCatching {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                }
                 return
             }
-            val (source, cacheManager) = sources[segments[1]] ?: run {
-                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+            val acquired = acquireSession(segments[1], client, clientJob) ?: run {
+                runCatching {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                }
                 return
             }
+            val (source, cacheManager, session) = acquired
+            try {
+                if (session.revoked.get()) return
+                val isHead = req.method.equals("HEAD", ignoreCase = true)
+                val clientRangeRaw = req.headers["range"]
+                val requestedRange = RangeHeaderValidator.parseRequestRange(clientRangeRaw)
+                val upstreamRange = if (isHead) "bytes=0-0" else clientRangeRaw
 
-            val isHead = req.method.equals("HEAD", ignoreCase = true)
-            val clientRangeRaw = req.headers["range"]
-            val requestedRange = RangeHeaderValidator.parseRequestRange(clientRangeRaw)
-            val upstreamRange = if (isHead) "bytes=0-0" else clientRangeRaw
-
-            limiter.withPermit {
-                var opened = openWithRefreshIfNeeded(source, upstreamRange)
-                try {
-                    if (opened.statusCode != 200 && opened.statusCode != 206) {
-                        out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                limiter.withPermit {
+                    if (session.revoked.get()) return@withPermit
+                    var opened = try {
+                        openWithRefreshIfNeeded(source, upstreamRange)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Throwable) {
+                        if (!session.revoked.get()) {
+                            runCatching {
+                                out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            }
+                        }
                         return@withPermit
                     }
-
-                    val mime = PlaybackDecisionPolicy.guessMimeType(source.fileName)
-                    val fullLength = RangeHeaderValidator.extractFullAssetLength(
-                        statusCode = opened.statusCode,
-                        requestHadRange = upstreamRange != null,
-                        contentRangeHeader = opened.headers["content-range"],
-                        contentLengthHeader = opened.headers["content-length"]
-                    ) ?: source.expectedSize.takeIf { it > 0L }
-
-                    if (isHead) {
-                        val sb = StringBuilder("HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nAccept-Ranges: bytes\r\nConnection: close\r\n")
-                        if (fullLength != null) sb.append("Content-Length: $fullLength\r\n")
-                        sb.append("\r\n")
-                        out.write(sb.toString().toByteArray())
-                        return@withPermit
-                    }
-
-                    val statusLine = if (opened.statusCode == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
-                    val headerBuf = StringBuilder("$statusLine\r\nContent-Type: $mime\r\nAccept-Ranges: bytes\r\nConnection: close\r\n")
-                    val cl = opened.headers["content-length"]
-                    if (cl != null) {
-                        headerBuf.append("Content-Length: $cl\r\n")
-                    } else if (opened.statusCode == 200 && fullLength != null) {
-                        headerBuf.append("Content-Length: $fullLength\r\n")
-                    }
-                    opened.headers["content-range"]?.let { headerBuf.append("Content-Range: $it\r\n") }
-                    headerBuf.append("\r\n")
-                    out.write(headerBuf.toString().toByteArray())
-                    out.flush()
-
-                    val eligibleForCache = RangeHeaderValidator.canWriteThroughToCache(clientRangeRaw) &&
-                        cacheManager.beginWriteThroughIfIdle(source.trackId)
-                    val partFile = File(source.cacheDestination.parentFile, "${source.cacheDestination.name}.part")
-                    var partOut: FileOutputStream? = null
-
-                    if (eligibleForCache) {
-                        partFile.delete()
-                        partOut = runCatching { FileOutputStream(partFile) }.getOrNull()
-                    }
-
-                    val reqStart = requestedRange?.start ?: 0L
-                    val reqEnd = requestedRange?.end
-                    val isTinyProbe = (reqStart == 0L && (reqEnd ?: Long.MAX_VALUE) <= 1L)
-                    val streamTaskId = "stream:${source.trackId}"
-                    var didPublishStreamStatus = false
-                    var delivered = 0L
-                    var completedCleanly = false
-                    var resumeAttempts = 0
-                    val buf = ByteArray(32_768)
-                    var windowBytes = 0L
-                    var windowStartNs = System.nanoTime()
-
+                    session.activeUpstream = opened
                     try {
-                        streamLoop@ while (true) {
-                            try {
-                                while (true) {
-                                    val n = opened.bodyStream.read(buf)
-                                    if (n < 0) break
-                                    if (n == 0) continue
-                                    try {
-                                        out.write(buf, 0, n)
-                                    } catch (_: Exception) {
+                        if (session.revoked.get()) return@withPermit
+                        if (opened.statusCode != 200 && opened.statusCode != 206) {
+                            runCatching {
+                                out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            }
+                            return@withPermit
+                        }
+
+                        val mime = PlaybackDecisionPolicy.guessMimeType(source.fileName)
+                        val fullLength = RangeHeaderValidator.extractFullAssetLength(
+                            statusCode = opened.statusCode,
+                            requestHadRange = upstreamRange != null,
+                            contentRangeHeader = opened.headers["content-range"],
+                            contentLengthHeader = opened.headers["content-length"]
+                        ) ?: source.expectedSize.takeIf { it > 0L }
+
+                        if (isHead) {
+                            val sb = StringBuilder("HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nAccept-Ranges: bytes\r\nConnection: close\r\n")
+                            if (fullLength != null) sb.append("Content-Length: $fullLength\r\n")
+                            sb.append("\r\n")
+                            runCatching { out.write(sb.toString().toByteArray()) }
+                            return@withPermit
+                        }
+
+                        val statusLine = if (opened.statusCode == 206) "HTTP/1.1 206 Partial Content" else "HTTP/1.1 200 OK"
+                        val headerBuf = StringBuilder("$statusLine\r\nContent-Type: $mime\r\nAccept-Ranges: bytes\r\nConnection: close\r\n")
+                        val cl = opened.headers["content-length"]
+                        if (cl != null) {
+                            headerBuf.append("Content-Length: $cl\r\n")
+                        } else if (opened.statusCode == 200 && fullLength != null) {
+                            headerBuf.append("Content-Length: $fullLength\r\n")
+                        }
+                        opened.headers["content-range"]?.let { headerBuf.append("Content-Range: $it\r\n") }
+                        headerBuf.append("\r\n")
+                        if (session.revoked.get()) return@withPermit
+                        val wroteHeaders = runCatching {
+                            out.write(headerBuf.toString().toByteArray())
+                            out.flush()
+                        }.isSuccess
+                        if (!wroteHeaders || session.revoked.get()) return@withPermit
+
+                        val eligibleForCache = !session.revoked.get() &&
+                            RangeHeaderValidator.canWriteThroughToCache(clientRangeRaw) &&
+                            cacheManager.beginWriteThroughIfIdle(source.trackId)
+                        val partFile = File(source.cacheDestination.parentFile, "${source.cacheDestination.name}.part")
+                        var partOut: FileOutputStream? = null
+
+                        if (eligibleForCache) {
+                            partFile.delete()
+                            partOut = runCatching { FileOutputStream(partFile) }.getOrNull()
+                        }
+
+                        val reqStart = requestedRange?.start ?: 0L
+                        val reqEnd = requestedRange?.end
+                        val isTinyProbe = (reqStart == 0L && (reqEnd ?: Long.MAX_VALUE) <= 1L)
+                        val streamTaskId = "stream:${source.trackId}"
+                        val hasStatusCallback = onAccountStreamStatusUpdate != null || onStreamStatusUpdate != null
+                        var didPublishStreamStatus = false
+                        var delivered = 0L
+                        var completedCleanly = false
+                        var resumeAttempts = 0
+                        val buf = ByteArray(32_768)
+                        var windowBytes = 0L
+                        var windowStartNs = System.nanoTime()
+
+                        try {
+                            streamLoop@ while (true) {
+                                try {
+                                    while (true) {
+                                        if (session.revoked.get()) {
+                                            completedCleanly = false
+                                            break@streamLoop
+                                        }
+                                        val n = opened.bodyStream.read(buf)
+                                        if (session.revoked.get()) {
+                                            completedCleanly = false
+                                            break@streamLoop
+                                        }
+                                        if (n < 0) break
+                                        if (n == 0) continue
+                                        try {
+                                            out.write(buf, 0, n)
+                                        } catch (_: Exception) {
+                                            completedCleanly = false
+                                            break@streamLoop
+                                        }
+                                        if (session.revoked.get()) {
+                                            completedCleanly = false
+                                            break@streamLoop
+                                        }
+                                        if (partOut != null) {
+                                            runCatching { partOut!!.write(buf, 0, n) }.onFailure {
+                                                runCatching { partOut?.close() }
+                                                partOut = null
+                                            }
+                                        }
+                                        delivered += n.toLong()
+                                        windowBytes += n.toLong()
+                                        if (!isTinyProbe && hasStatusCallback && !session.revoked.get()) {
+                                            val elapsedMs = (System.nanoTime() - windowStartNs) / 1_000_000L
+                                            if (!didPublishStreamStatus || elapsedMs >= 300L) {
+                                                val speed = if (didPublishStreamStatus) {
+                                                    (windowBytes * 1000L) / elapsedMs.coerceAtLeast(1L)
+                                                } else {
+                                                    n.toLong()
+                                                }
+                                                didPublishStreamStatus = true
+                                                windowBytes = 0L
+                                                windowStartNs = System.nanoTime()
+                                                publishStatus(
+                                                    streamTaskId,
+                                                    source.accountHash,
+                                                    TransferStatus(
+                                                        id = streamTaskId,
+                                                        label = source.fileName,
+                                                        kind = "stream",
+                                                        state = "running",
+                                                        bytesPerSecond = speed,
+                                                        transferredBytes = fullLength?.let { minOf(reqStart + delivered, it) } ?: (reqStart + delivered),
+                                                        totalBytes = fullLength
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        resumeAttempts = 0
+                                    }
+                                    out.flush()
+                                    completedCleanly = !session.revoked.get()
+                                    break@streamLoop
+                                } catch (ce: CancellationException) {
+                                    completedCleanly = false
+                                    throw ce
+                                } catch (_: Exception) {
+                                    if (session.revoked.get()) {
                                         completedCleanly = false
                                         break@streamLoop
                                     }
-                                    if (partOut != null) {
-                                        runCatching { partOut!!.write(buf, 0, n) }.onFailure {
-                                            runCatching { partOut?.close() }
-                                            partOut = null
-                                        }
+                                    resumeAttempts += 1
+                                    if (resumeAttempts > 4) {
+                                        completedCleanly = false
+                                        break@streamLoop
                                     }
-                                    delivered += n.toLong()
-                                    windowBytes += n.toLong()
-                                    if (!isTinyProbe && onStreamStatusUpdate != null) {
-                                        val elapsedMs = (System.nanoTime() - windowStartNs) / 1_000_000L
-                                        if (!didPublishStreamStatus || elapsedMs >= 300L) {
-                                            val speed = if (didPublishStreamStatus) {
-                                                (windowBytes * 1000L) / elapsedMs.coerceAtLeast(1L)
-                                            } else {
-                                                n.toLong()
-                                            }
-                                            didPublishStreamStatus = true
-                                            windowBytes = 0L
-                                            windowStartNs = System.nanoTime()
-                                            onStreamStatusUpdate.invoke(
-                                                streamTaskId,
-                                                TransferStatus(
-                                                    id = streamTaskId,
-                                                    label = source.fileName,
-                                                    kind = "stream",
-                                                    state = "running",
-                                                    bytesPerSecond = speed,
-                                                    transferredBytes = fullLength?.let { minOf(reqStart + delivered, it) } ?: (reqStart + delivered),
-                                                    totalBytes = fullLength
-                                                )
-                                            )
-                                        }
+                                    val resumeOffset = reqStart + delivered
+                                    if (reqEnd != null && resumeOffset > reqEnd) {
+                                        completedCleanly = !session.revoked.get()
+                                        break@streamLoop
                                     }
-                                    resumeAttempts = 0
+                                    runCatching { opened.bodyStream.close(); opened.onClose() }
+                                    val resumeRange = ParsedByteRange(resumeOffset, reqEnd).headerValue
+                                    val nextOpened = runCatching { openWithRefreshIfNeeded(source, resumeRange) }.getOrNull() ?: run {
+                                        completedCleanly = false
+                                        break@streamLoop
+                                    }
+                                    val valid = runCatching {
+                                        RangeHeaderValidator.validateResumeResponse(
+                                            expectedStartOffset = resumeOffset,
+                                            statusCode = nextOpened.statusCode,
+                                            contentRangeHeader = nextOpened.headers["content-range"]
+                                        )
+                                    }.isSuccess
+                                    if (!valid || session.revoked.get()) {
+                                        runCatching { nextOpened.bodyStream.close(); nextOpened.onClose() }
+                                        completedCleanly = false
+                                        break@streamLoop
+                                    }
+                                    opened = nextOpened
+                                    session.activeUpstream = nextOpened
                                 }
-                                out.flush()
-                                completedCleanly = true
-                                break@streamLoop
-                            } catch (_: Exception) {
-                                resumeAttempts += 1
-                                if (resumeAttempts > 4) {
-                                    completedCleanly = false
-                                    break@streamLoop
+                            }
+                        } finally {
+                            if (didPublishStreamStatus) {
+                                publishStatus(streamTaskId, source.accountHash, null)
+                            }
+                            runCatching { partOut?.flush(); partOut?.close() }
+                            if (eligibleForCache) {
+                                val expectedTotal = fullLength ?: 0L
+                                val matchesExpected = (source.expectedSize == 0L) || (delivered == source.expectedSize)
+                                val stillAuthorized = !session.revoked.get() &&
+                                    isSourceStillRegistered(source.token, source.accountHash)
+                                if (stillAuthorized && completedCleanly && partOut != null && expectedTotal > 0L && delivered == expectedTotal && matchesExpected) {
+                                    source.cacheDestination.delete()
+                                    if (partFile.renameTo(source.cacheDestination)) {
+                                        cacheManager.recordCompletedFile(
+                                            trackId = source.trackId,
+                                            file = source.cacheDestination,
+                                            sizeBytes = delivered,
+                                            limitBytes = source.cacheLimitBytes
+                                        )
+                                    } else {
+                                        partFile.delete()
+                                    }
+                                } else {
+                                    partFile.delete()
                                 }
-                                val resumeOffset = reqStart + delivered
-                                if (reqEnd != null && resumeOffset > reqEnd) {
-                                    completedCleanly = true
-                                    break@streamLoop
-                                }
-                                runCatching { opened.bodyStream.close(); opened.onClose() }
-                                val resumeRange = ParsedByteRange(resumeOffset, reqEnd).headerValue
-                                val nextOpened = runCatching { openWithRefreshIfNeeded(source, resumeRange) }.getOrNull() ?: run {
-                                    completedCleanly = false
-                                    break@streamLoop
-                                }
-                                val valid = runCatching {
-                                    RangeHeaderValidator.validateResumeResponse(
-                                        expectedStartOffset = resumeOffset,
-                                        statusCode = nextOpened.statusCode,
-                                        contentRangeHeader = nextOpened.headers["content-range"]
-                                    )
-                                }.isSuccess
-                                if (!valid) {
-                                    runCatching { nextOpened.bodyStream.close(); nextOpened.onClose() }
-                                    completedCleanly = false
-                                    break@streamLoop
-                                }
-                                opened = nextOpened
+                                cacheManager.finishWriteThrough(source.trackId)
                             }
                         }
                     } finally {
-                        if (didPublishStreamStatus) {
-                            onStreamStatusUpdate?.invoke(streamTaskId, null)
-                        }
+                        session.activeUpstream = null
+                        runCatching { opened.bodyStream.close(); opened.onClose() }
                     }
-
-                    runCatching { partOut?.flush(); partOut?.close() }
-                    if (eligibleForCache) {
-                        val expectedTotal = fullLength ?: 0L
-                        val matchesExpected = (source.expectedSize == 0L) || (delivered == source.expectedSize)
-                        if (completedCleanly && partOut != null && expectedTotal > 0L && delivered == expectedTotal && matchesExpected) {
-                            source.cacheDestination.delete()
-                            if (partFile.renameTo(source.cacheDestination)) {
-                                cacheManager.recordCompletedFile(
-                                    trackId = source.trackId,
-                                    file = source.cacheDestination,
-                                    sizeBytes = delivered,
-                                    limitBytes = source.cacheLimitBytes
-                                )
-                            } else {
-                                partFile.delete()
-                            }
-                        } else {
-                            partFile.delete()
-                        }
-                        cacheManager.finishWriteThrough(source.trackId)
-                    }
-                } finally {
-                    runCatching { opened.bodyStream.close(); opened.onClose() }
                 }
+            } finally {
+                releaseSession(session.id)
             }
         }
     }

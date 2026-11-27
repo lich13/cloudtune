@@ -1,4 +1,5 @@
 import CloudTuneCore
+import Darwin
 import Foundation
 import Testing
 
@@ -498,5 +499,448 @@ struct CloudTuneCoreTests {
         let ranges = await tracker.observedRanges
         #expect(ranges.contains("bytes=450000-599999"))
         #expect(!ranges.contains("bytes=0-299999"))
+    }
+
+    @Test("Export target safety: rejects directory targets and preserves existing file when copy fails")
+    func verifyExportTargetSafety() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-exp-safe-\(UUID().uuidString)")
+        let exportDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-exp-out-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir)
+        }
+        try FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+        let store = try AccountScopedStore(rootDirectory: root)
+        let staged = root.appendingPathComponent("staged.flac")
+        let newContent = Data("new-audio-payload".utf8)
+        try newContent.write(to: staged)
+
+        // 1) Directory collision MUST throw and NEVER delete the directory or its child files
+        let dirCollision = exportDir.appendingPathComponent("Collision.flac", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirCollision, withIntermediateDirectories: true)
+        let childInsideDir = dirCollision.appendingPathComponent("keep.txt")
+        try Data("precious".utf8).write(to: childInsideDir)
+
+        await #expect(throws: CloudTuneError.self) {
+            _ = try await store.exportStagedFile(
+                stagedFileURL: staged,
+                relativeSubpath: "Collision.flac",
+                explicitDirectoryURL: exportDir,
+                for: "alice@example.invalid"
+            )
+        }
+        #expect(FileManager.default.fileExists(atPath: childInsideDir.path))
+
+        // 2) Copy failure (missing staged file) MUST preserve existing destination file intact
+        let existingTarget = exportDir.appendingPathComponent("Existing.flac")
+        let oldContent = Data("original-intact-file".utf8)
+        try oldContent.write(to: existingTarget)
+        let missingStaged = root.appendingPathComponent("nonexistent-source.flac")
+
+        await #expect(throws: CloudTuneError.self) {
+            _ = try await store.exportStagedFile(
+                stagedFileURL: missingStaged,
+                relativeSubpath: "Existing.flac",
+                explicitDirectoryURL: exportDir,
+                for: "alice@example.invalid"
+            )
+        }
+        #expect(try Data(contentsOf: existingTarget) == oldContent)
+
+        // 3) Valid staged replacement atomically updates target and leaves no temporary sibling files
+        let replacedURL = try await store.exportStagedFile(
+            stagedFileURL: staged,
+            relativeSubpath: "Existing.flac",
+            explicitDirectoryURL: exportDir,
+            for: "alice@example.invalid"
+        )
+        #expect(try Data(contentsOf: replacedURL) == newContent)
+        let children = try FileManager.default.contentsOfDirectory(atPath: exportDir.path)
+        #expect(!children.contains { $0.contains(".tmp") })
+    }
+
+    @Test("Cross-origin redirect blocks auth header, cookie, and POST token leaks; API status & fileListAO validated")
+    func verifyCrossOriginRedirectProtectionAndApiValidation() async throws {
+        // 1) Origin classification checks
+        #expect(Cloud189Protocol.isTrustedTianyiOrigin(URL(string: "https://api.cloud.189.cn/listFiles.action")!) == true)
+        #expect(Cloud189Protocol.isTrustedTianyiOrigin(URL(string: "https://open.e.189.cn/api/oauth2/refreshToken.do")!) == true)
+        #expect(Cloud189Protocol.isTrustedTianyiOrigin(URL(string: "http://api.cloud.189.cn/listFiles.action")!) == false)
+        #expect(Cloud189Protocol.isTrustedTianyiOrigin(URL(string: "https://cloud.189.cn.evil.invalid/steal")!) == false)
+        #expect(Cloud189Protocol.isTrustedTianyiOrigin(URL(string: "https://api.cloud.189.cn:8443/listFiles.action")!) == false)
+
+        // 2) Real loopback redirect server: 307 cross-origin redirect MUST NOT contact untrusted target
+        let targetHitCount = LockedBox(0)
+        let targetServer = try OneShotLoopbackServer { _ in
+            targetHitCount.withValue { $0 += 1 }
+            return Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".utf8)
+        }
+        defer { targetServer.close() }
+
+        let originServer = try OneShotLoopbackServer { [targetPort = targetServer.port] _ in
+            let resp = "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:\(targetPort)/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            return Data(resp.utf8)
+        }
+        defer { originServer.close() }
+
+        let transport = URLSessionCloudHTTPTransport()
+        if let cookie = HTTPCookie(properties: [
+            .domain: "127.0.0.1",
+            .path: "/",
+            .name: "SESSIONID",
+            .value: "secret_cookie"
+        ]) {
+            await transport.importCookies([cookie])
+        }
+        var postReq = URLRequest(url: URL(string: "http://127.0.0.1:\(originServer.port)/api/oauth2/refreshToken.do")!)
+        postReq.httpMethod = "POST"
+        postReq.setValue("sk_secret", forHTTPHeaderField: "SessionKey")
+        postReq.setValue("sig_secret", forHTTPHeaderField: "Signature")
+        postReq.httpBody = Data("refreshToken=rt_super_secret".utf8)
+
+        await #expect(throws: CloudTuneError.self) {
+            _ = try await transport.send(postReq)
+        }
+        #expect(targetHitCount.withValue { $0 } == 0)
+
+        // 3) Non-2xx JSON and missing fileListAO MUST throw in Cloud189Client
+        struct MockTransport: CloudHTTPTransport {
+            let statusCode: Int
+            let bodyText: String
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                if request.url?.path.contains("getSessionForPC.action") == true {
+                    let s = #"{"res_code":0,"loginName":"alice@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(s.utf8), finalURL: request.url!)
+                }
+                return CloudHTTPResponse(statusCode: statusCode, body: Data(bodyText.utf8), finalURL: request.url!)
+            }
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let gateway502Client = Cloud189Client(transport: MockTransport(statusCode: 502, bodyText: "{}"))
+        _ = try await gateway502Client.exchangeRedirectForSession(redirectURL: "https://m.cloud.189.cn/cb?paras=1")
+        await #expect(throws: CloudTuneError.self) {
+            _ = try await gateway502Client.listRemoteFolder(folderId: nil)
+        }
+
+        let missingAOClient = Cloud189Client(transport: MockTransport(statusCode: 200, bodyText: #"{"res_code":0}"#))
+        _ = try await missingAOClient.exchangeRedirectForSession(redirectURL: "https://m.cloud.189.cn/cb?paras=1")
+        await #expect(throws: CloudTuneError.self) {
+            _ = try await missingAOClient.scanMusicLibrary(folderId: "f1", folderName: "Music")
+        }
+    }
+
+    @Test("Completed download status isolation across accounts, zero PII in transfers.json, and coalesced prefetch+playback")
+    func verifyCompletedDownloadIsolationZeroPiiAndCoalescing() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-iso-\(UUID().uuidString)")
+        let exportDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-iso-exp-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir)
+        }
+        try FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+        let store = try AccountScopedStore(rootDirectory: root)
+        let payload = Data((0..<4096).map { UInt8($0 & 0xFF) })
+        let probeCalls = LockedBox(0)
+
+        let semaphore = GlobalTransferSemaphore(maxPermits: 8)
+        let engine = TransferEngine(
+            semaphore: semaphore,
+            fetcher: MockUpstreamFetcher { _, rangeHeader in
+                if rangeHeader == "bytes=0-0" {
+                    probeCalls.withValue { $0 += 1 }
+                    let s = AsyncThrowingStream<Data, Error> {
+                        $0.yield(payload.subdata(in: 0..<1))
+                        $0.finish()
+                    }
+                    return (206, ["content-range": "bytes 0-0/\(payload.count)", "content-length": "1"], s)
+                }
+                let s = AsyncThrowingStream<Data, Error> { cont in
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(60))
+                        cont.yield(payload)
+                        cont.finish()
+                    }
+                }
+                return (200, ["content-length": "\(payload.count)"], s)
+            },
+            urlResolver: { _ in URL(string: "https://media.example.invalid/song.flac")! }
+        )
+
+        // 1) Enqueue download for Alice, check transfers.json contains ZERO PII before completion
+        let aliceId = "alice_private_13800138000@example.invalid"
+        let track = TrackSummary(id: "t-coalesce", name: "SharedTrack.flac", folderPath: "Music", sizeBytes: UInt64(payload.count))
+        let taskId = try await engine.enqueueExportDownload(
+            accountId: aliceId,
+            track: track,
+            relativeExportSubpath: "SharedTrack.flac",
+            parallelThreads: 2,
+            explicitDirectoryURL: exportDir,
+            accountStore: store
+        )
+        let alicePaths = try await store.paths(for: aliceId)
+        if let rawTransfers = try? String(contentsOf: alicePaths.transfersURL, encoding: .utf8) {
+            #expect(!rawTransfers.contains("alice_private"))
+            #expect(!rawTransfers.contains("13800138000"))
+        }
+
+        for _ in 0..<40 {
+            if await engine.snapshot().items.first(where: { $0.id == taskId })?.state == "completed" {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        #expect(await engine.snapshot().items.first(where: { $0.id == taskId })?.state == "completed")
+
+        // Purging Alice on logout MUST remove completed downloads too so Bob never sees them
+        await engine.cancelAll(forAccountId: aliceId)
+        #expect(await engine.snapshot().items.isEmpty)
+
+        // 2) Concurrent prefetch + playback downloadTrackToCache coalesces onto a single upstream download
+        probeCalls.withValue { $0 = 0 }
+        let cacheStore = try CacheStore(cacheDirectory: alicePaths.cacheDir)
+        async let prefetchURL = engine.downloadTrackToCache(
+            track: track,
+            cacheStore: cacheStore,
+            parallelThreads: 4,
+            cacheLimitBytes: 256 * 1024 * 1024,
+            kind: "prefetch",
+            accountHash: alicePaths.bucketHash
+        )
+        try await Task.sleep(for: .milliseconds(15))
+        async let playbackURL = engine.downloadTrackToCache(
+            track: track,
+            cacheStore: cacheStore,
+            parallelThreads: 8,
+            cacheLimitBytes: 256 * 1024 * 1024,
+            kind: "playback",
+            accountHash: alicePaths.bucketHash
+        )
+        let (u1, u2) = try await (prefetchURL, playbackURL)
+        #expect(u1 == u2)
+        #expect(try Data(contentsOf: u1) == payload)
+        #expect(probeCalls.withValue { $0 } == 1)
+    }
+
+    @Test("Active stream connection tears down immediately on logout without committing cache, and pull fetcher streams cleanly")
+    func verifyActiveStreamLogoutTeardownAndPullFetcher() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-teardown-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cacheStore = try CacheStore(cacheDirectory: tempDir)
+        let fullPayload = Data((0..<65_536).map { UInt8($0 & 0xFF) })
+
+        // 1) Pull-based URLSessionUpstreamStreamFetcher reads multi-chunk HTTP response accurately
+        let upstreamHTTP = try OneShotLoopbackServer { _ in
+            var header = Data("HTTP/1.1 200 OK\r\nContent-Length: \(fullPayload.count)\r\nConnection: close\r\n\r\n".utf8)
+            header.append(fullPayload)
+            return header
+        }
+        defer { upstreamHTTP.close() }
+        let pullFetcher = URLSessionUpstreamStreamFetcher()
+        let opened = try await pullFetcher.openStream(
+            url: URL(string: "http://127.0.0.1:\(upstreamHTTP.port)/track.flac")!,
+            rangeHeader: nil
+        )
+        #expect(opened.statusCode == 200)
+        var assembled = Data()
+        for try await chunk in opened.chunks {
+            assembled.append(chunk)
+        }
+        #expect(assembled == fullPayload)
+
+        // 2) Active mid-flight stream tears down immediately on revokeAllSources without writing cache
+        let firstChunkSent = LockedBox(false)
+        let semaphore = GlobalTransferSemaphore(maxPermits: 8)
+        let proxy = try StreamProxyServer(
+            semaphore: semaphore,
+            fetcher: MockUpstreamFetcher { _, _ in
+                let stream = AsyncThrowingStream<Data, Error> { cont in
+                    let task = Task {
+                        cont.yield(fullPayload.subdata(in: 0..<16_384))
+                        firstChunkSent.withValue { $0 = true }
+                        try? await Task.sleep(for: .seconds(10))
+                        cont.yield(fullPayload.subdata(in: 16_384..<fullPayload.count))
+                        cont.finish()
+                    }
+                    cont.onTermination = { _ in task.cancel() }
+                }
+                return (200, ["content-length": "\(fullPayload.count)"], stream)
+            }
+        )
+        defer { Task { await proxy.shutdown() } }
+
+        let destURL = await cacheStore.cacheFileURL(trackId: "live-1", originalFileName: "live.flac")
+        let streamURL = await proxy.registerSource(
+            StreamSourceRegistration(
+                accountHash: "acctLive",
+                trackId: "live-1",
+                remoteURL: URL(string: "https://media.example.invalid/live.flac")!,
+                cacheDestinationURL: destURL,
+                expectedSize: UInt64(fullPayload.count),
+                fileName: "live.flac",
+                cacheLimitBytes: 256 * 1024 * 1024
+            ),
+            cacheStore: cacheStore
+        )
+
+        let clientTask = Task<Int, Never> {
+            guard let (bytes, _) = try? await URLSession.shared.bytes(from: streamURL) else {
+                return 0
+            }
+            var count = 0
+            do {
+                for try await _ in bytes {
+                    count += 1
+                }
+            } catch {
+                return count
+            }
+            return count
+        }
+
+        for _ in 0..<50 {
+            if firstChunkSent.withValue({ $0 }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let revokeStart = ContinuousClock.now
+        await proxy.revokeAllSources(forAccountHash: "acctLive")
+        let receivedBytes = await clientTask.value
+        let elapsed = revokeStart.duration(to: .now)
+        #expect(elapsed < .seconds(2))
+        #expect(receivedBytes < fullPayload.count)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await cacheStore.existingCachedFile(trackId: "live-1") == nil)
+        #expect(!FileManager.default.fileExists(atPath: destURL.path))
+    }
+
+    @Test("Legacy Tauri macOS migration supports flat com.gosu.cloudtune root, threads, and never overwrites existing account data")
+    func verifyLegacyTauriFlatRootMigration() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-mig-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let legacySettings = """
+        {
+          "refreshToken": "rt_legacy_gosu",
+          "accountName": "legacy_user@example.invalid",
+          "musicFolderId": "f-legacy-99",
+          "musicFolderName": "经典无损收藏",
+          "cacheLimitMb": 4096,
+          "downloadThreads": 12,
+          "cacheThreads": 6,
+          "playbackMode": "stream_cache"
+        }
+        """
+        let legacyLibrary = """
+        [{"id":"t-leg-1","name":"LegacySong.flac","folderPath":"经典无损收藏","sizeBytes":12345}]
+        """
+        try Data(legacySettings.utf8).write(to: root.appendingPathComponent("settings.json"))
+        try Data(legacyLibrary.utf8).write(to: root.appendingPathComponent("library.json"))
+
+        let store = try AccountScopedStore(rootDirectory: root)
+        let migratedCred = try #require(await store.migrateLegacyTauriDataIfPresent())
+        #expect(migratedCred.refreshToken == "rt_legacy_gosu")
+        #expect(migratedCred.accountName == "legacy_user@example.invalid")
+
+        let migratedSettings = try await store.loadSettings(for: "legacy_user@example.invalid")
+        #expect(migratedSettings.musicFolder == FolderSelection(id: "f-legacy-99", name: "经典无损收藏"))
+        #expect(migratedSettings.cacheLimitMb == 4096)
+        #expect(migratedSettings.downloadThreads == 12)
+        #expect(migratedSettings.cacheThreads == 6)
+        #expect(migratedSettings.playbackMode == .streamCache)
+
+        let migratedTracks = try await store.loadLibrary(for: "legacy_user@example.invalid")
+        #expect(migratedTracks.count == 1)
+        #expect(migratedTracks.first?.name == "LegacySong.flac")
+
+        // Existing account data MUST NOT be overwritten by migration
+        let root2 = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-mig2-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root2) }
+        let store2 = try AccountScopedStore(rootDirectory: root2)
+        let preExistingSettings = AccountSettings(cacheLimitMb: 8192, downloadThreads: 4, cacheThreads: 2, playbackMode: .downloadFirst)
+        try await store2.saveSettings(preExistingSettings, for: "legacy_user@example.invalid")
+        try await store2.saveLibrary([TrackSummary(id: "new-1", name: "NewTrack.flac", folderPath: "New", sizeBytes: 99)], for: "legacy_user@example.invalid")
+        try Data(legacySettings.utf8).write(to: root2.appendingPathComponent("settings.json"))
+        try Data(legacyLibrary.utf8).write(to: root2.appendingPathComponent("library.json"))
+
+        _ = await store2.migrateLegacyTauriDataIfPresent()
+        #expect(try await store2.loadSettings(for: "legacy_user@example.invalid").cacheLimitMb == 8192)
+        #expect(try await store2.loadLibrary(for: "legacy_user@example.invalid").first?.id == "new-1")
+    }
+}
+
+private final class LockedBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T
+    init(_ value: T) { self.value = value }
+    func withValue<R>(_ body: (inout T) -> R) -> R {
+        lock.withLock { body(&value) }
+    }
+}
+
+private final class OneShotLoopbackServer: @unchecked Sendable {
+    let port: UInt16
+    private let listenFD: Int32
+    private let queue: DispatchQueue
+
+    init(responder: @escaping @Sendable (String) -> Data) throws {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw CloudTuneError.storageError("socket failed") }
+        var one: Int32 = 1
+        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindRes == 0, Darwin.listen(fd, 8) == 0 else {
+            Darwin.close(fd)
+            throw CloudTuneError.storageError("bind failed")
+        }
+        var bound = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &bound) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &len)
+            }
+        }
+        self.listenFD = fd
+        self.port = UInt16(bigEndian: bound.sin_port)
+        self.queue = DispatchQueue(label: "test.loopback.\(self.port)")
+        queue.async {
+            while true {
+                var cAddr = sockaddr_in()
+                var cLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let cfd = withUnsafeMutablePointer(to: &cAddr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        Darwin.accept(fd, $0, &cLen)
+                    }
+                }
+                if cfd < 0 { break }
+                var noSigPipe: Int32 = 1
+                _ = Darwin.setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+                var reqBuf = [UInt8](repeating: 0, count: 4096)
+                let n = Darwin.recv(cfd, &reqBuf, reqBuf.count, 0)
+                let reqText = n > 0 ? String(decoding: reqBuf.prefix(n), as: UTF8.self) : ""
+                let reply = responder(reqText)
+                reply.withUnsafeBytes { raw in
+                    if let base = raw.baseAddress {
+                        _ = Darwin.send(cfd, base, raw.count, 0)
+                    }
+                }
+                _ = Darwin.shutdown(cfd, SHUT_RDWR)
+                Darwin.close(cfd)
+            }
+        }
+    }
+
+    func close() {
+        _ = Darwin.shutdown(listenFD, SHUT_RDWR)
+        Darwin.close(listenFD)
     }
 }

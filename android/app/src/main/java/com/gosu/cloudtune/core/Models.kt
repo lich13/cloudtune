@@ -76,15 +76,26 @@ data class ActiveCloudSession(
 /** Cold-start persisted credential. Only created when a non-empty refreshToken is present. */
 data class PersistedRefreshCredential(
     val refreshToken: String,
-    val accountName: String?
+    val accountName: String?,
+    val accountKey: String? = accountName
 ) {
+    fun withAccountKey(key: String): PersistedRefreshCredential =
+        copy(accountKey = key.trim().takeIf { it.isNotEmpty() } ?: accountKey)
+
     companion object {
-        fun createOrNull(refreshToken: String?, accountName: String?): PersistedRefreshCredential? {
+        fun createOrNull(
+            refreshToken: String?,
+            accountName: String?,
+            accountKey: String? = null
+        ): PersistedRefreshCredential? {
             val rt = refreshToken?.trim().orEmpty()
             if (rt.isEmpty()) return null
+            val normName = accountName?.trim()?.takeIf { it.isNotEmpty() }
+            val normKey = accountKey?.trim()?.takeIf { it.isNotEmpty() } ?: normName
             return PersistedRefreshCredential(
                 refreshToken = rt,
-                accountName = accountName?.trim()?.takeIf { it.isNotEmpty() }
+                accountName = normName,
+                accountKey = normKey
             )
         }
     }

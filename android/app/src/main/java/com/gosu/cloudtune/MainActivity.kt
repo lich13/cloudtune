@@ -6,6 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import com.gosu.cloudtune.ui.CloudTuneRootApp
 import com.gosu.cloudtune.ui.CloudTuneViewModel
 
@@ -13,10 +14,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val appRuntime = CloudTuneAppRuntime.getOrCreate(applicationContext)
         val factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                return CloudTuneViewModel(appContext = applicationContext).also {
+                return CloudTuneViewModel(runtime = appRuntime).also {
                     it.bootstrap()
                 } as T
             }

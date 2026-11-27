@@ -6,13 +6,19 @@ import android.os.Looper
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.documentfile.provider.DocumentFile
 import com.gosu.cloudtune.core.AppThemeMode
+import com.gosu.cloudtune.core.CloudTuneException
 import com.gosu.cloudtune.core.RepresentativeFixture
 import com.gosu.cloudtune.core.SnapshotScene
+import com.gosu.cloudtune.data.SafExporter
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
 import kotlin.math.abs
 import kotlin.math.sqrt
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -125,5 +131,60 @@ class CloudTuneSnapshotTest {
     @Config(qualifiers = "w1024dp-h768dp-mdpi")
     fun renderTabletLightAndDarkSnapshots() {
         renderAndAssertAllScenes(formFactor = "tablet", widthPx = 1024, heightPx = 768)
+    }
+
+    @Test
+    fun verifySafExporterTargetSafety() {
+        val tempRoot = Files.createTempDirectory("cloudtune-saf-export").toFile()
+        try {
+            val exportRoot = File(tempRoot, "exports").apply { mkdirs() }
+            val staged = File(tempRoot, "staged.flac")
+            val newBytes = "new-staged-flac-payload".toByteArray(Charsets.UTF_8)
+            staged.writeBytes(newBytes)
+
+            val docRoot = DocumentFile.fromFile(exportRoot)
+
+            // 1) Directory collision MUST throw and keep directory + children intact
+            val collidingDir = File(exportRoot, "Collision.flac").apply { mkdirs() }
+            val childInside = File(collidingDir, "keep.txt").apply { writeText("precious") }
+            assertThrows(CloudTuneException::class.java) {
+                SafExporter.exportToDocumentDirectory(
+                    dir = docRoot,
+                    targetName = "Collision.flac",
+                    stagedFile = staged,
+                    mimeType = "audio/flac",
+                    openOutputStream = { d -> FileOutputStream(File(d.uri.path!!)) }
+                )
+            }
+            assertTrue(childInside.isFile)
+
+            // 2) Copy/open stream failure MUST preserve existing target file intact
+            val existingFile = File(exportRoot, "Existing.flac")
+            val oldBytes = "original-precious-audio".toByteArray(Charsets.UTF_8)
+            existingFile.writeBytes(oldBytes)
+            assertThrows(CloudTuneException::class.java) {
+                SafExporter.exportToDocumentDirectory(
+                    dir = docRoot,
+                    targetName = "Existing.flac",
+                    stagedFile = staged,
+                    mimeType = "audio/flac",
+                    openOutputStream = { null }
+                )
+            }
+            assertArrayEquals(oldBytes, existingFile.readBytes())
+
+            // 3) Valid replacement writes via sibling temp document and replaces cleanly
+            SafExporter.exportToDocumentDirectory(
+                dir = docRoot,
+                targetName = "Existing.flac",
+                stagedFile = staged,
+                mimeType = "audio/flac",
+                openOutputStream = { d -> FileOutputStream(File(d.uri.path!!)) }
+            )
+            assertArrayEquals(newBytes, existingFile.readBytes())
+            assertTrue(exportRoot.list().orEmpty().none { it.contains(".tmp") })
+        } finally {
+            tempRoot.deleteRecursively()
+        }
     }
 }

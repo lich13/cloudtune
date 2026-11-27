@@ -4,10 +4,15 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -17,6 +22,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -26,7 +32,7 @@ fun interface StagedFileExporter {
 
 data class StagedDownloadManifest(
     val taskId: String,
-    val accountId: String,
+    val accountHash: String,
     val trackId: String,
     val fileName: String,
     val relativeSubpath: String,
@@ -40,10 +46,23 @@ class TransferEngine(
     private val opener: UpstreamStreamOpener = HttpUrlConnectionStreamOpener(),
     private val urlResolver: suspend (String) -> String
 ) {
+    private class InFlightCacheDownload(
+        val cacheKey: String,
+        val statusId: String,
+        val accountHash: String?,
+        val waiterIds: MutableSet<UUID>,
+        val deferred: Deferred<File>
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val persistLock = Any()
+    private val cacheDownloadLock = Any()
     private val statuses = ConcurrentHashMap<String, TransferStatus>()
+    private val statusAccountHashes = ConcurrentHashMap<String, String>()
     private val manifests = ConcurrentHashMap<String, StagedDownloadManifest>()
+    private val manifestAccountKeys = ConcurrentHashMap<String, String>()
     private val jobs = ConcurrentHashMap<String, Job>()
+    private val inFlightCacheDownloads = HashMap<String, InFlightCacheDownload>()
 
     fun snapshot(): TransferSnapshotPayload {
         val list = statuses.values.sortedBy { it.id }
@@ -52,27 +71,39 @@ class TransferEngine(
         return TransferSnapshotPayload(speed, list)
     }
 
-    fun updateExternalTransferStatus(id: String, status: TransferStatus?) {
+    fun updateExternalTransferStatus(id: String, status: TransferStatus?, accountHash: String? = null) {
         if (status != null) {
             statuses[id] = status
+            if (accountHash != null) {
+                statusAccountHashes[id] = accountHash
+            }
         } else {
             statuses.remove(id)
+            statusAccountHashes.remove(id)
         }
     }
 
     fun restorePersistedDownloads(accountId: String, stagingRootDir: File, manifestsFile: File) {
-        if (!manifestsFile.isFile) return
+        val targetHash = Cloud189Protocol.accountBucketHash(accountId)
+        val rawText = synchronized(persistLock) {
+            if (!manifestsFile.isFile) return
+            runCatching { manifestsFile.readText(Charsets.UTF_8) }.getOrNull()
+        } ?: return
+
         runCatching {
-            val arr = JSONArray(manifestsFile.readText(Charsets.UTF_8))
+            val arr = JSONArray(rawText)
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                val itemAccountId = o.optString("accountId")
-                if (itemAccountId.isNotEmpty() && itemAccountId != accountId) continue
+                val savedHash = o.optString("accountHash").trim()
+                val legacyAccountId = o.optString("accountId").trim()
+                if (savedHash.isNotEmpty() && savedHash != targetHash) continue
+                if (legacyAccountId.isNotEmpty() && Cloud189Protocol.accountBucketHash(legacyAccountId) != targetHash) continue
+
                 val rawState = o.optString("state", "paused")
                 val restoredState = if (rawState == "running") "paused" else rawState
                 val manifest = StagedDownloadManifest(
                     taskId = o.getString("taskId"),
-                    accountId = accountId,
+                    accountHash = targetHash,
                     trackId = o.getString("trackId"),
                     fileName = o.getString("fileName"),
                     relativeSubpath = o.optString("relativeSubpath", o.getString("fileName")),
@@ -81,6 +112,8 @@ class TransferEngine(
                     state = restoredState
                 )
                 manifests[manifest.taskId] = manifest
+                manifestAccountKeys[manifest.taskId] = accountId
+                statusAccountHashes[manifest.taskId] = targetHash
                 val completed = completedBytesForManifest(manifest, stagingRootDir)
                 statuses[manifest.taskId] = TransferStatus(
                     id = manifest.taskId,
@@ -100,16 +133,46 @@ class TransferEngine(
     }
 
     fun cancelAll(accountId: String) {
-        for ((id, m) in manifests) {
-            if (m.accountId == accountId) {
+        val targetHash = Cloud189Protocol.accountBucketHash(accountId)
+        for ((id, m) in manifests.entries.toList()) {
+            if (m.accountHash == targetHash) {
                 jobs.remove(id)?.cancel()
                 statuses.remove(id)
+                statusAccountHashes.remove(id)
                 manifests.remove(id)
+                manifestAccountKeys.remove(id)
+            }
+        }
+        val cacheTasksToCancel = ArrayList<InFlightCacheDownload>()
+        synchronized(cacheDownloadLock) {
+            val iter = inFlightCacheDownloads.entries.iterator()
+            while (iter.hasNext()) {
+                val entry = iter.next().value
+                if (entry.accountHash == null || entry.accountHash == targetHash) {
+                    cacheTasksToCancel.add(entry)
+                    iter.remove()
+                }
+            }
+        }
+        for (entry in cacheTasksToCancel) {
+            entry.deferred.cancel()
+            statuses.remove(entry.statusId)
+            statusAccountHashes.remove(entry.statusId)
+        }
+        for ((id, ownerHash) in statusAccountHashes.entries.toList()) {
+            if (ownerHash == targetHash) {
+                jobs.remove(id)?.cancel()
+                statuses.remove(id)
+                statusAccountHashes.remove(id)
             }
         }
         for (key in statuses.keys().toList()) {
             if (key.startsWith("stream:") || key.startsWith("prefetch:") || key.startsWith("playback:")) {
-                statuses.remove(key)
+                val owner = statusAccountHashes[key]
+                if (owner == null || owner == targetHash) {
+                    statuses.remove(key)
+                    statusAccountHashes.remove(key)
+                }
             }
         }
     }
@@ -119,22 +182,95 @@ class TransferEngine(
         cacheManager: CacheManager,
         parallelThreads: Int,
         cacheLimitBytes: Long,
-        kind: String = "playback"
-    ): File {
-        cacheManager.existingCachedFile(track.id)?.let { return it }
+        kind: String = "playback",
+        accountHash: String? = null
+    ): File = withContext(Dispatchers.IO) {
+        cacheManager.existingCachedFile(track.id)?.let { return@withContext it }
         val dest = cacheManager.cacheFile(track.id, track.name)
+        val cacheKey = runCatching { dest.canonicalPath }.getOrDefault(dest.absolutePath)
+        val waiterId = UUID.randomUUID()
+
+        val sharedDeferred: Deferred<File> = synchronized(cacheDownloadLock) {
+            cacheManager.existingCachedFile(track.id)?.let { cached ->
+                return@withContext cached
+            }
+            val existing = inFlightCacheDownloads[cacheKey]
+            if (existing != null) {
+                existing.waiterIds.add(waiterId)
+                if (kind == "playback") {
+                    statuses.computeIfPresent(existing.statusId) { _, prev -> prev.copy(kind = "playback") }
+                }
+                existing.deferred
+            } else {
+                val statusId = "$kind:${track.id}"
+                statuses[statusId] = TransferStatus(
+                    id = statusId,
+                    label = track.name,
+                    kind = kind,
+                    state = "running",
+                    totalBytes = track.sizeBytes.takeIf { it > 0L }
+                )
+                if (accountHash != null) {
+                    statusAccountHashes[statusId] = accountHash
+                }
+                val created = scope.async(Dispatchers.IO) {
+                    performCacheDownload(
+                        cacheKey = cacheKey,
+                        statusId = statusId,
+                        track = track,
+                        dest = dest,
+                        cacheManager = cacheManager,
+                        parallelThreads = parallelThreads,
+                        cacheLimitBytes = cacheLimitBytes
+                    )
+                }
+                inFlightCacheDownloads[cacheKey] = InFlightCacheDownload(
+                    cacheKey = cacheKey,
+                    statusId = statusId,
+                    accountHash = accountHash,
+                    waiterIds = mutableSetOf(waiterId),
+                    deferred = created
+                )
+                created
+            }
+        }
+
+        try {
+            sharedDeferred.await()
+        } catch (ce: CancellationException) {
+            detachCacheDownloadWaiter(cacheKey, waiterId)
+            throw ce
+        }
+    }
+
+    private fun detachCacheDownloadWaiter(cacheKey: String, waiterId: UUID) {
+        var toCancel: InFlightCacheDownload? = null
+        synchronized(cacheDownloadLock) {
+            val existing = inFlightCacheDownloads[cacheKey] ?: return
+            existing.waiterIds.remove(waiterId)
+            if (existing.waiterIds.isEmpty()) {
+                inFlightCacheDownloads.remove(cacheKey)
+                toCancel = existing
+            }
+        }
+        toCancel?.let {
+            statuses.remove(it.statusId)
+            statusAccountHashes.remove(it.statusId)
+            it.deferred.cancel()
+        }
+    }
+
+    private suspend fun performCacheDownload(
+        cacheKey: String,
+        statusId: String,
+        track: TrackSummary,
+        dest: File,
+        cacheManager: CacheManager,
+        parallelThreads: Int,
+        cacheLimitBytes: Long
+    ): File = withContext(Dispatchers.IO) {
         val partsDir = File(dest.parentFile, "${dest.name}.parts")
-        val mergedTmp = File(dest.parentFile, "${dest.name}.part")
-        val taskId = "$kind:${track.id}"
-
-        statuses[taskId] = TransferStatus(
-            id = taskId,
-            label = track.name,
-            kind = kind,
-            state = "running",
-            totalBytes = track.sizeBytes.takeIf { it > 0L }
-        )
-
+        val mergedTmp = File(dest.parentFile, "${dest.name}.merged.part")
         try {
             val remoteUrl = urlResolver(track.id)
             val probe = probeTarget(remoteUrl, track.sizeBytes)
@@ -142,22 +278,25 @@ class TransferEngine(
             val supportsRange = probe.second
             val parts = if (supportsRange && totalSize >= 1_048_576L) parallelThreads.coerceIn(1, 8) else 1
 
+            partsDir.deleteRecursively()
             partsDir.mkdirs()
-            downloadParts(taskId, track.id, remoteUrl, totalSize, parts, partsDir)
+            downloadParts(statusId, track.id, remoteUrl, totalSize, parts, partsDir)
+            ensureActive()
             mergeParts(partsDir, parts, mergedTmp, totalSize)
-            dest.delete()
-            if (!mergedTmp.renameTo(dest)) {
-                mergedTmp.copyTo(dest, overwrite = true)
-            }
+            moveOrCopyAtomically(mergedTmp, dest)
             cacheManager.recordCompletedFile(
                 trackId = track.id,
                 file = dest,
                 sizeBytes = if (totalSize > 0L) totalSize else dest.length(),
                 limitBytes = cacheLimitBytes
             )
-            return dest
+            dest
         } finally {
-            statuses.remove(taskId)
+            synchronized(cacheDownloadLock) {
+                inFlightCacheDownloads.remove(cacheKey)
+            }
+            statuses.remove(statusId)
+            statusAccountHashes.remove(statusId)
             partsDir.deleteRecursively()
             mergedTmp.delete()
         }
@@ -174,9 +313,10 @@ class TransferEngine(
     ): String {
         val taskId = "download:${UUID.randomUUID()}"
         val partCount = parallelThreads.coerceIn(1, 16)
+        val accountHash = Cloud189Protocol.accountBucketHash(accountId)
         val manifest = StagedDownloadManifest(
             taskId = taskId,
-            accountId = accountId,
+            accountHash = accountHash,
             trackId = track.id,
             fileName = track.name,
             relativeSubpath = relativeSubpath,
@@ -185,6 +325,8 @@ class TransferEngine(
             state = "running"
         )
         manifests[taskId] = manifest
+        manifestAccountKeys[taskId] = accountId
+        statusAccountHashes[taskId] = accountHash
         statuses[taskId] = TransferStatus(
             id = taskId,
             label = track.name,
@@ -196,8 +338,8 @@ class TransferEngine(
             canDelete = true,
             totalBytes = track.sizeBytes.takeIf { it > 0L }
         )
-        persistManifests(accountId, manifestsFile)
-        spawnExportJob(manifest, stagingRootDir, manifestsFile, exporter)
+        persistManifests(accountHash, manifestsFile)
+        spawnExportJob(manifest, accountId, stagingRootDir, manifestsFile, exporter)
         return taskId
     }
 
@@ -205,10 +347,11 @@ class TransferEngine(
         jobs.remove(id)?.cancel()
         val m = manifests[id] ?: return
         manifests[id] = m.copy(state = "paused")
+        statusAccountHashes[id] = m.accountHash
         statuses[id]?.let {
             statuses[id] = it.copy(state = "paused", canPause = false, canResume = true, bytesPerSecond = 0L)
         }
-        persistManifests(m.accountId, manifestsFile)
+        persistManifests(m.accountHash, manifestsFile)
     }
 
     fun resumeTransfer(
@@ -218,32 +361,39 @@ class TransferEngine(
         exporter: StagedFileExporter
     ) {
         val m = manifests[id]?.copy(state = "running") ?: return
+        val accountKey = manifestAccountKeys[id] ?: m.accountHash
         manifests[id] = m
+        statusAccountHashes[id] = m.accountHash
         statuses[id]?.let {
             statuses[id] = it.copy(state = "running", canPause = true, canResume = false)
         }
-        persistManifests(m.accountId, manifestsFile)
-        spawnExportJob(m, stagingRootDir, manifestsFile, exporter)
+        persistManifests(m.accountHash, manifestsFile)
+        spawnExportJob(m, accountKey, stagingRootDir, manifestsFile, exporter)
     }
 
     fun deleteTransfer(id: String, stagingRootDir: File, manifestsFile: File) {
         jobs.remove(id)?.cancel()
-        val accountId = manifests.remove(id)?.accountId
+        val removedManifest = manifests.remove(id)
+        manifestAccountKeys.remove(id)
         statuses.remove(id)
+        statusAccountHashes.remove(id)
         val safe = Cloud189Protocol.sanitizeFileName(id)
         File(stagingRootDir, "$safe.parts").deleteRecursively()
         File(stagingRootDir, "$safe.merged").delete()
-        if (accountId != null) persistManifests(accountId, manifestsFile)
+        if (removedManifest != null) {
+            persistManifests(removedManifest.accountHash, manifestsFile)
+        }
     }
 
     private fun spawnExportJob(
         manifest: StagedDownloadManifest,
+        accountKey: String,
         stagingRootDir: File,
         manifestsFile: File,
         exporter: StagedFileExporter
     ) {
         jobs.remove(manifest.taskId)?.cancel()
-        jobs[manifest.taskId] = scope.launch {
+        jobs[manifest.taskId] = scope.launch(Dispatchers.IO) {
             val id = manifest.taskId
             val safe = Cloud189Protocol.sanitizeFileName(id)
             val partsDir = File(stagingRootDir, "$safe.parts").apply { mkdirs() }
@@ -254,9 +404,10 @@ class TransferEngine(
                 val totalSize = maxOf(probedTotal, manifest.totalSize)
                 val effectiveParts = if (supportsRange && totalSize >= 524_288L) manifest.partCount else 1
 
+                if (!manifests.containsKey(id)) return@launch
                 val updatedManifest = manifest.copy(totalSize = totalSize, partCount = effectiveParts)
                 manifests[id] = updatedManifest
-                persistManifests(manifest.accountId, manifestsFile)
+                persistManifests(manifest.accountHash, manifestsFile)
                 val resumedCompleted = completedBytesForManifest(updatedManifest, stagingRootDir)
                 statuses.computeIfPresent(id) { _, prev ->
                     prev.copy(
@@ -268,11 +419,14 @@ class TransferEngine(
                 downloadParts(id, manifest.trackId, remoteUrl, totalSize, effectiveParts, partsDir)
                 ensureActive()
                 mergeParts(partsDir, effectiveParts, mergedFile, totalSize)
-                val exportedDisplay = exporter.export(mergedFile, manifest.relativeSubpath, manifest.accountId)
+                val exportedDisplay = exporter.export(mergedFile, manifest.relativeSubpath, accountKey)
 
                 mergedFile.delete()
                 partsDir.deleteRecursively()
+                if (!manifests.containsKey(id)) return@launch
                 manifests.remove(id)
+                manifestAccountKeys.remove(id)
+                statusAccountHashes[id] = manifest.accountHash
                 statuses[id] = TransferStatus(
                     id = id,
                     label = manifest.fileName,
@@ -285,12 +439,15 @@ class TransferEngine(
                     transferredBytes = totalSize,
                     totalBytes = totalSize.takeIf { it > 0L }
                 )
-                persistManifests(manifest.accountId, manifestsFile)
+                persistManifests(manifest.accountHash, manifestsFile)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (err: Exception) {
-                manifests[id] = manifest.copy(state = "paused")
-                persistManifests(manifest.accountId, manifestsFile)
+                if (manifests.containsKey(id)) {
+                    manifests[id] = manifest.copy(state = "paused")
+                    persistManifests(manifest.accountHash, manifestsFile)
+                }
+                statusAccountHashes[id] = manifest.accountHash
                 statuses[id]?.let {
                     statuses[id] = it.copy(
                         state = "failed: ${err.message ?: "导出失败"}",
@@ -304,21 +461,23 @@ class TransferEngine(
     }
 
     private suspend fun probeTarget(url: String, fallbackSize: Long): Pair<Long, Boolean> =
-        limiter.withPermit {
-            val opened = opener.open(url, "bytes=0-0")
-            try {
-                if (opened.statusCode != 200 && opened.statusCode != 206) {
-                    throw CloudTuneException("探测媒体长度失败 (HTTP ${opened.statusCode})")
+        withContext(Dispatchers.IO) {
+            limiter.withPermit {
+                val opened = opener.open(url, "bytes=0-0")
+                try {
+                    if (opened.statusCode != 200 && opened.statusCode != 206) {
+                        throw CloudTuneException("探测媒体长度失败 (HTTP ${opened.statusCode})")
+                    }
+                    val total = RangeHeaderValidator.extractFullAssetLength(
+                        statusCode = opened.statusCode,
+                        requestHadRange = opened.statusCode == 206,
+                        contentRangeHeader = opened.headers["content-range"],
+                        contentLengthHeader = opened.headers["content-length"]
+                    ) ?: fallbackSize
+                    maxOf(total, fallbackSize) to (opened.statusCode == 206)
+                } finally {
+                    runCatching { opened.bodyStream.close(); opened.onClose() }
                 }
-                val total = RangeHeaderValidator.extractFullAssetLength(
-                    statusCode = opened.statusCode,
-                    requestHadRange = opened.statusCode == 206,
-                    contentRangeHeader = opened.headers["content-range"],
-                    contentLengthHeader = opened.headers["content-length"]
-                ) ?: fallbackSize
-                maxOf(total, fallbackSize) to (opened.statusCode == 206)
-            } finally {
-                runCatching { opened.bodyStream.close(); opened.onClose() }
             }
         }
 
@@ -329,16 +488,18 @@ class TransferEngine(
         totalSize: Long,
         partCount: Int,
         partsDir: File
-    ) = coroutineScope {
-        if (partCount <= 1 || totalSize <= 0L) {
-            downloadSingleRange(taskId, trackId, initialUrl, 0L, if (totalSize > 0L) totalSize - 1L else null, File(partsDir, "00.part"))
-        } else {
-            val ranges = RangeHeaderValidator.splitByteRanges(totalSize, partCount)
-            ranges.mapIndexed { idx, (start, end) ->
-                async {
-                    downloadSingleRange(taskId, trackId, initialUrl, start, end, File(partsDir, "%02d.part".format(java.util.Locale.US, idx)))
-                }
-            }.awaitAll()
+    ) = withContext(Dispatchers.IO) {
+        coroutineScope {
+            if (partCount <= 1 || totalSize <= 0L) {
+                downloadSingleRange(taskId, trackId, initialUrl, 0L, if (totalSize > 0L) totalSize - 1L else null, File(partsDir, "00.part"))
+            } else {
+                val ranges = RangeHeaderValidator.splitByteRanges(totalSize, partCount)
+                ranges.mapIndexed { idx, (start, end) ->
+                    async(Dispatchers.IO) {
+                        downloadSingleRange(taskId, trackId, initialUrl, start, end, File(partsDir, "%02d.part".format(Locale.US, idx)))
+                    }
+                }.awaitAll()
+            }
         }
     }
 
@@ -349,19 +510,19 @@ class TransferEngine(
         start: Long,
         end: Long?,
         partFile: File
-    ) = coroutineScope {
+    ) = withContext(Dispatchers.IO) {
         val expectedLen = end?.let { it - start + 1L }
         var written = if (partFile.isFile) {
             expectedLen?.let { minOf(partFile.length(), it) } ?: 0L
         } else 0L
-        if (expectedLen != null && written >= expectedLen) return@coroutineScope
+        if (expectedLen != null && written >= expectedLen) return@withContext
 
         var currentUrl = initialUrl
         var attempt = 0
 
         while (true) {
             ensureActive()
-            if (expectedLen != null && written >= expectedLen) return@coroutineScope
+            if (expectedLen != null && written >= expectedLen) return@withContext
             val reqStart = start + written
             val rangeSpec = if (reqStart == 0L && end == null) null else ParsedByteRange(reqStart, end).headerValue
 
@@ -414,7 +575,7 @@ class TransferEngine(
                         runCatching { opened.bodyStream.close(); opened.onClose() }
                     }
                 }
-                if (expectedLen == null || written >= expectedLen) return@coroutineScope
+                if (expectedLen == null || written >= expectedLen) return@withContext
             } catch (ce: CancellationException) {
                 throw ce
             } catch (err: Exception) {
@@ -433,27 +594,50 @@ class TransferEngine(
         }
     }
 
-    private fun mergeParts(partsDir: File, partCount: Int, dest: File, expectedTotal: Long) {
-        dest.delete()
-        var mergedBytes = 0L
-        FileOutputStream(dest).use { out ->
-            val buf = ByteArray(262_144)
-            for (idx in 0 until partCount.coerceAtLeast(1)) {
-                val part = File(partsDir, "%02d.part".format(java.util.Locale.US, idx))
-                FileInputStream(part).use { input ->
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        if (n > 0) {
-                            out.write(buf, 0, n)
-                            mergedBytes += n.toLong()
+    private suspend fun mergeParts(partsDir: File, partCount: Int, dest: File, expectedTotal: Long) =
+        withContext(Dispatchers.IO) {
+            dest.delete()
+            var mergedBytes = 0L
+            FileOutputStream(dest).use { out ->
+                val buf = ByteArray(262_144)
+                for (idx in 0 until partCount.coerceAtLeast(1)) {
+                    val part = File(partsDir, "%02d.part".format(Locale.US, idx))
+                    FileInputStream(part).use { input ->
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            if (n > 0) {
+                                out.write(buf, 0, n)
+                                mergedBytes += n.toLong()
+                            }
                         }
                     }
                 }
+                out.fd.sync()
+            }
+            if (expectedTotal > 0L && mergedBytes != expectedTotal) {
+                throw CloudTuneException("分片合并长度不匹配：$mergedBytes != $expectedTotal")
             }
         }
-        if (expectedTotal > 0L && mergedBytes != expectedTotal) {
-            throw CloudTuneException("分片合并长度不匹配：$mergedBytes != $expectedTotal")
+
+    private fun moveOrCopyAtomically(source: File, destination: File) {
+        try {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            try {
+                Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: Exception) {
+                source.copyTo(destination, overwrite = true)
+                source.delete()
+            }
+        } catch (_: Exception) {
+            source.copyTo(destination, overwrite = true)
+            source.delete()
         }
     }
 
@@ -468,7 +652,7 @@ class TransferEngine(
         }
         var sum = 0L
         for (idx in 0 until manifest.partCount.coerceAtLeast(1)) {
-            val part = File(partsDir, "%02d.part".format(java.util.Locale.US, idx))
+            val part = File(partsDir, "%02d.part".format(Locale.US, idx))
             if (part.isFile) {
                 val raw = part.length().coerceAtLeast(0L)
                 val clamped = ranges.getOrNull(idx)?.let { (start, end) -> minOf(raw, end - start + 1L) } ?: raw
@@ -478,22 +662,36 @@ class TransferEngine(
         return if (manifest.totalSize > 0L) minOf(sum, manifest.totalSize) else sum
     }
 
-    private fun persistManifests(accountId: String, manifestsFile: File) {
-        val arr = JSONArray()
-        manifests.values.filter { it.accountId == accountId }.sortedBy { it.taskId }.forEach { m ->
-            arr.put(
-                JSONObject()
-                    .put("taskId", m.taskId)
-                    .put("accountId", m.accountId)
-                    .put("trackId", m.trackId)
-                    .put("fileName", m.fileName)
-                    .put("relativeSubpath", m.relativeSubpath)
-                    .put("totalSize", m.totalSize)
-                    .put("partCount", m.partCount)
-                    .put("state", m.state)
-            )
+    private fun persistManifests(accountHash: String, manifestsFile: File) {
+        synchronized(persistLock) {
+            val arr = JSONArray()
+            manifests.values.filter { it.accountHash == accountHash }.sortedBy { it.taskId }.forEach { m ->
+                arr.put(
+                    JSONObject()
+                        .put("taskId", m.taskId)
+                        .put("trackId", m.trackId)
+                        .put("fileName", m.fileName)
+                        .put("relativeSubpath", m.relativeSubpath)
+                        .put("totalSize", m.totalSize)
+                        .put("partCount", m.partCount)
+                        .put("state", m.state)
+                )
+            }
+            val parent = manifestsFile.parentFile
+            parent?.mkdirs()
+            val bytes = arr.toString().toByteArray(Charsets.UTF_8)
+            val tmpFile = File(parent ?: File("."), ".${manifestsFile.name}.${UUID.randomUUID()}.tmp")
+            try {
+                FileOutputStream(tmpFile).use { out ->
+                    out.write(bytes)
+                    out.fd.sync()
+                }
+                moveOrCopyAtomically(tmpFile, manifestsFile)
+            } finally {
+                if (tmpFile.exists()) {
+                    tmpFile.delete()
+                }
+            }
         }
-        manifestsFile.parentFile?.mkdirs()
-        manifestsFile.writeText(arr.toString(), Charsets.UTF_8)
     }
 }

@@ -32,6 +32,7 @@ public enum CloudTuneError: LocalizedError, Equatable, Sendable {
 public enum Cloud189Constants {
     public static let rootFolderId = "-11"
     public static let rootFolderName = "我的云盘"
+    public static let defaultAccountDisplayName = "天翼云盘用户"
     public static let webURL = "https://cloud.189.cn"
     public static let authURL = "https://open.e.189.cn"
     public static let apiURL = "https://api.cloud.189.cn"
@@ -184,7 +185,8 @@ public enum Cloud189Protocol {
         statusCode: Int,
         fallbackAccessToken: String = "",
         fallbackRefreshToken: String = "",
-        fallbackAccountName: String? = nil
+        fallbackAccountName: String? = nil,
+        fallbackAccountKey: String? = nil
     ) throws -> ParsedSessionPayload {
         let cleaned = normalizeBody(body)
         guard !cleaned.isEmpty else {
@@ -192,7 +194,9 @@ public enum Cloud189Protocol {
         }
 
         if cleaned.hasPrefix("<") {
-            let loginName = extractXMLTag("loginName", in: cleaned) ?? fallbackAccountName
+            let loginName = extractXMLTag("loginName", in: cleaned)
+                ?? extractXMLTag("userAccount", in: cleaned)
+                ?? fallbackAccountName
             let sessionKey = extractXMLTag("sessionKey", in: cleaned) ?? ""
             let sessionSecret = extractXMLTag("sessionSecret", in: cleaned) ?? ""
             guard let active = ActiveCloudSession(
@@ -203,9 +207,17 @@ public enum Cloud189Protocol {
             ) else {
                 throw CloudTuneError.protocolError("189CloudPC XML 会话初始化失败，sessionKey 为空")
             }
+            let storageKey = active.loginName
+                ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? deriveFallbackAccountKey(
+                    refreshToken: fallbackRefreshToken,
+                    accessToken: active.accessToken,
+                    sessionKey: active.sessionKey
+                )
             let persisted = PersistedRefreshCredential(
                 refreshToken: fallbackRefreshToken,
-                accountName: active.loginName
+                accountName: active.loginName,
+                accountKey: storageKey
             )
             return ParsedSessionPayload(activeSession: active, persistedCredential: persisted)
         }
@@ -221,7 +233,9 @@ public enum Cloud189Protocol {
 
         let accessToken = stringValue(json["accessToken"]) ?? fallbackAccessToken
         let refreshToken = stringValue(json["refreshToken"]) ?? fallbackRefreshToken
-        let loginName = stringValue(json["loginName"]) ?? fallbackAccountName
+        let loginName = stringValue(json["loginName"])
+            ?? stringValue(json["userAccount"])
+            ?? fallbackAccountName
         let sessionKey = stringValue(json["sessionKey"]) ?? ""
         let sessionSecret = stringValue(json["sessionSecret"]) ?? ""
 
@@ -233,8 +247,95 @@ public enum Cloud189Protocol {
         ) else {
             throw CloudTuneError.protocolError("189CloudPC 会话初始化失败，sessionKey 为空")
         }
-        let persisted = PersistedRefreshCredential(refreshToken: refreshToken, accountName: active.loginName)
+        let storageKey = active.loginName
+            ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? deriveFallbackAccountKey(
+                refreshToken: refreshToken,
+                accessToken: active.accessToken,
+                sessionKey: active.sessionKey
+            )
+        let persisted = PersistedRefreshCredential(
+            refreshToken: refreshToken,
+            accountName: active.loginName,
+            accountKey: storageKey
+        )
         return ParsedSessionPayload(activeSession: active, persistedCredential: persisted)
+    }
+
+    public static func isTrustedTianyiOrigin(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "https",
+              let rawHost = url.host?.lowercased() else {
+            return false
+        }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        if let port = url.port, port != 443 {
+            return false
+        }
+        return host == "cloud.189.cn"
+            || host.hasSuffix(".cloud.189.cn")
+            || host == "e.189.cn"
+            || host.hasSuffix(".e.189.cn")
+    }
+
+    public static func isSameOrigin(_ a: URL, _ b: URL) -> Bool {
+        guard let schemeA = a.scheme?.lowercased(),
+              let schemeB = b.scheme?.lowercased(),
+              schemeA == schemeB,
+              let hostA = a.host?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+              let hostB = b.host?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+              !hostA.isEmpty,
+              hostA == hostB else {
+            return false
+        }
+        let defaultPort: (String) -> Int? = { scheme in
+            switch scheme {
+            case "https": return 443
+            case "http": return 80
+            default: return nil
+            }
+        }
+        let portA = a.port ?? defaultPort(schemeA)
+        let portB = b.port ?? defaultPort(schemeB)
+        return portA == portB
+    }
+
+    public static func deriveFallbackAccountKey(
+        refreshToken: String? = nil,
+        accessToken: String? = nil,
+        sessionKey: String
+    ) -> String {
+        let seed = [refreshToken, accessToken, Optional(sessionKey)]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? sessionKey
+        let digest = SHA256.hash(data: Data("cloudtune-anon-account:\(seed)".utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "acct:\(hex)"
+    }
+
+    public static func resolveAccountIdentity(
+        activeSession: ActiveCloudSession,
+        persistedCredential: PersistedRefreshCredential? = nil,
+        priorAccountKey: String? = nil
+    ) -> (storageKey: String, displayName: String) {
+        let explicitLogin = activeSession.loginName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? persistedCredential?.accountName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        if let explicitLogin, explicitLogin != Cloud189Constants.defaultAccountDisplayName {
+            return (explicitLogin, explicitLogin)
+        }
+        if let prior = priorAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+           prior != Cloud189Constants.defaultAccountDisplayName {
+            return (prior, Cloud189Constants.defaultAccountDisplayName)
+        }
+        if let savedKey = persistedCredential?.accountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+           savedKey != Cloud189Constants.defaultAccountDisplayName {
+            return (savedKey, Cloud189Constants.defaultAccountDisplayName)
+        }
+        let derived = deriveFallbackAccountKey(
+            refreshToken: persistedCredential?.refreshToken,
+            accessToken: activeSession.accessToken,
+            sessionKey: activeSession.sessionKey
+        )
+        return (derived, Cloud189Constants.defaultAccountDisplayName)
     }
 
     public static func extractAPIErrorMessage(_ body: String) -> String? {

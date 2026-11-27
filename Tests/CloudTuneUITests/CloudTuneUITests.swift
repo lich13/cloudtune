@@ -32,12 +32,14 @@ struct CloudTuneUITests {
         let rejected = await vm.commitCacheLimitDraft()
         #expect(rejected == false)
         #expect(vm.settingsValidationError != nil)
+        #expect(vm.statusMessage == vm.settingsValidationError)
         #expect(vm.committedSettings.cacheLimitMb == 2048)
 
-        // Editing draft resets stale error immediately
+        // Editing draft resets both settingsValidationError AND stale validation statusMessage immediately
         vm.cacheLimitDraft = "4096"
         vm.noteDraftEdited()
         #expect(vm.settingsValidationError == nil)
+        #expect(vm.statusMessage == nil)
 
         let accepted = await vm.commitCacheLimitDraft()
         #expect(accepted == true)
@@ -60,6 +62,125 @@ struct CloudTuneUITests {
         )
         #expect(vm.isPlaying == false)
         #expect(vm.statusMessage?.contains(".ape") == true)
+    }
+
+    @Test("Anonymous loginName accounts keep isolated accountStorageKeys, preserve real subfolder export paths, and enforce retry cap")
+    @MainActor
+    func verifyAnonymousAccountIsolationSubfolderExportAndRetryCap() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-vm-reg-\(UUID().uuidString)")
+        let exportDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-vm-exp-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir)
+        }
+        try FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+
+        actor DynamicMockTransport: CloudHTTPTransport {
+            var sessionIndex = 0
+            var failDownloadUrlCalls = false
+            var downloadUrlCallCount = 0
+
+            func setSessionIndex(_ idx: Int) { sessionIndex = idx }
+            func setFailDownloadUrl(_ fail: Bool) {
+                failDownloadUrlCalls = fail
+                downloadUrlCallCount = 0
+            }
+            func getDownloadUrlCalls() -> Int { downloadUrlCallCount }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                let path = url.path
+                let query = url.query ?? ""
+                if path.contains("getSessionForPC.action") {
+                    // Omit loginName to exercise anonymous account key separation
+                    let body = """
+                    {"res_code":0,"accessToken":"at_\(sessionIndex)","refreshToken":"rt_unique_\(sessionIndex)","sessionKey":"sk_\(sessionIndex)","sessionSecret":"ss_\(sessionIndex)"}
+                    """
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if path.contains("listFiles.action") {
+                    if query.contains("folderId=cd1") {
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"f-cd1-01","name":"01. Track.flac","size":4}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    if query.contains("folderId=cd2") {
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"f-cd2-01","name":"01. Track.flac","size":4}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    let rootBody = #"{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"cd1","name":"CD 1"},{"id":"cd2","name":"CD 2"}],"fileList":[]}}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(rootBody.utf8), finalURL: url)
+                }
+                if path.contains("getFileDownloadUrl.action") {
+                    downloadUrlCallCount += 1
+                    if failDownloadUrlCalls {
+                        throw URLError(.cannotFindHost)
+                    }
+                    return CloudHTTPResponse(statusCode: 200, body: Data(#"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/t.flac"}"#.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let transport = DynamicMockTransport()
+        let client = Cloud189Client(transport: transport)
+        let store = try AccountScopedStore(rootDirectory: root)
+        let vm = CloudTuneViewModel(cloudClient: client, accountStore: store, enableLiveObservers: false)
+        vm.retryBaseDelayMs = 5
+
+        // 1) Two accounts that both omit loginName MUST NOT share storage bucket
+        await transport.setSessionIndex(1)
+        await vm.completeEmbeddedWebLogin(callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=1")!, cookies: [])
+        #expect(vm.accountName == "天翼云盘用户")
+        let key1 = try #require(vm.accountStorageKey)
+        #expect(key1 != "天翼云盘用户")
+        try await store.saveLibrary([TrackSummary(id: "u1-song", name: "User1Only.flac", folderPath: "CD 1", sizeBytes: 100)], for: key1)
+
+        await vm.logout()
+        await transport.setSessionIndex(2)
+        await vm.completeEmbeddedWebLogin(callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=2")!, cookies: [])
+        #expect(vm.accountName == "天翼云盘用户")
+        let key2 = try #require(vm.accountStorageKey)
+        #expect(key2 != key1)
+        #expect(vm.tracks.isEmpty)
+
+        // 2) Browsing into CD 1 and CD 2 preserves real folder names (never "当前目录")
+        await vm.browseTo(folderId: "cd1", nextBreadcrumbs: [.root, BreadcrumbItem(id: "cd1", name: "CD 1")])
+        #expect(vm.browser?.currentFolderName == "CD 1")
+        #expect(vm.browser?.audioFiles.first?.folderPath == "CD 1")
+
+        await vm.saveExportDirectoryBookmark(exportDir)
+        await vm.enqueueCurrentFolderDownload(explicitDirectoryURL: exportDir)
+        let cd1Subpath = vm.downloadTransfers.first?.path
+        #expect(cd1Subpath == "CD 1/01. Track.flac")
+
+        await vm.browseTo(folderId: "cd2", nextBreadcrumbs: [.root, BreadcrumbItem(id: "cd2", name: "CD 2")])
+        #expect(vm.browser?.currentFolderName == "CD 2")
+        await vm.enqueueCurrentFolderDownload(explicitDirectoryURL: exportDir)
+        let allPaths = Set(vm.downloadTransfers.compactMap(\.path))
+        #expect(allPaths.contains("CD 1/01. Track.flac"))
+        #expect(allPaths.contains("CD 2/01. Track.flac"))
+
+        // 3) Transient playback failure with resumeTime == 0 enforces maxRecoveryAttempts (1 initial + 6 retries = 7 total)
+        await vm.updatePlaybackMode(.streamCache)
+        await transport.setFailDownloadUrl(true)
+        let smallTrack = TrackSummary(id: "f-transient", name: "Transient.mp3", folderPath: "CD 2", sizeBytes: 1024)
+        await vm.playTrack(smallTrack)
+        #expect(await transport.getDownloadUrlCalls() == 1 + PlaybackDecisionPolicy.maxRecoveryAttempts)
+        #expect(vm.statusMessage?.contains("已停止自动重试") == true)
+
+        // 4) Manual logout during retry backoff cancels stale retry
+        vm.retryBaseDelayMs = 80
+        await transport.setFailDownloadUrl(true)
+        let retryTask = Task { @MainActor in
+            await vm.playTrack(smallTrack)
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        await vm.logout()
+        await retryTask.value
+        #expect(await transport.getDownloadUrlCalls() == 1)
     }
 
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")

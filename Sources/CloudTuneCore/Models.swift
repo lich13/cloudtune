@@ -64,12 +64,37 @@ public struct ActiveCloudSession: Equatable, Sendable {
 public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
     public let refreshToken: String
     public let accountName: String?
+    public let accountKey: String?
 
-    public init?(refreshToken: String, accountName: String?) {
+    public init?(refreshToken: String, accountName: String?, accountKey: String? = nil) {
         let trimmed = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         self.refreshToken = trimmed
-        self.accountName = accountName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let normalizedName = accountName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.accountName = normalizedName
+        let normalizedKey = accountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.accountKey = normalizedKey ?? normalizedName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let rawToken = (try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawToken.isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .refreshToken, in: c, debugDescription: "Empty refreshToken")
+        }
+        self.refreshToken = rawToken
+        let decodedName = (try c.decodeIfPresent(String.self, forKey: .accountName))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        self.accountName = decodedName
+        self.accountKey = (try c.decodeIfPresent(String.self, forKey: .accountKey))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty ?? decodedName
+    }
+
+    public func withAccountKey(_ key: String) -> PersistedRefreshCredential {
+        PersistedRefreshCredential(refreshToken: refreshToken, accountName: accountName, accountKey: key) ?? self
     }
 }
 

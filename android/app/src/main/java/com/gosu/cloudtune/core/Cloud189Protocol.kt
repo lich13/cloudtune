@@ -18,6 +18,7 @@ class CloudTuneException(message: String, val isSessionExpired: Boolean = false)
 object Cloud189Constants {
     const val ROOT_FOLDER_ID = "-11"
     const val ROOT_FOLDER_NAME = "我的云盘"
+    const val DEFAULT_ACCOUNT_DISPLAY_NAME = "天翼云盘用户"
     const val WEB_URL = "https://cloud.189.cn"
     const val AUTH_URL = "https://open.e.189.cn"
     const val API_URL = "https://api.cloud.189.cn"
@@ -37,6 +38,11 @@ object Cloud189Protocol {
     data class ParsedSessionPayload(
         val activeSession: ActiveCloudSession,
         val persistedCredential: PersistedRefreshCredential?
+    )
+
+    data class AccountIdentity(
+        val storageKey: String,
+        val displayName: String
     )
 
     private val httpDateFormatter = DateTimeFormatter
@@ -146,14 +152,17 @@ object Cloud189Protocol {
         statusCode: Int,
         fallbackAccessToken: String = "",
         fallbackRefreshToken: String = "",
-        fallbackAccountName: String? = null
+        fallbackAccountName: String? = null,
+        fallbackAccountKey: String? = null
     ): ParsedSessionPayload {
         val cleaned = normalizeBody(body)
         if (cleaned.isEmpty()) {
             throw CloudTuneException("会话接口返回空响应，HTTP $statusCode")
         }
         if (cleaned.startsWith("<")) {
-            val loginName = extractXmlTag("loginName", cleaned) ?: fallbackAccountName
+            val loginName = extractXmlTag("loginName", cleaned)
+                ?: extractXmlTag("userAccount", cleaned)
+                ?: fallbackAccountName
             val sessionKey = extractXmlTag("sessionKey", cleaned).orEmpty()
             val sessionSecret = extractXmlTag("sessionSecret", cleaned).orEmpty()
             val active = ActiveCloudSession.createOrNull(
@@ -162,7 +171,18 @@ object Cloud189Protocol {
                 sessionSecret = sessionSecret,
                 loginName = loginName
             ) ?: throw CloudTuneException("189CloudPC XML 会话初始化失败，sessionKey 为空")
-            val persisted = PersistedRefreshCredential.createOrNull(fallbackRefreshToken, active.loginName)
+            val storageKey = active.loginName
+                ?: fallbackAccountKey?.trim()?.takeIf { it.isNotEmpty() }
+                ?: deriveFallbackAccountKey(
+                    refreshToken = fallbackRefreshToken,
+                    accessToken = active.accessToken,
+                    sessionKey = active.sessionKey
+                )
+            val persisted = PersistedRefreshCredential.createOrNull(
+                refreshToken = fallbackRefreshToken,
+                accountName = active.loginName,
+                accountKey = storageKey
+            )
             return ParsedSessionPayload(active, persisted)
         }
 
@@ -172,7 +192,9 @@ object Cloud189Protocol {
         }
         val accessToken = optNonBlank(json, "accessToken") ?: fallbackAccessToken
         val refreshToken = optNonBlank(json, "refreshToken") ?: fallbackRefreshToken
-        val loginName = optNonBlank(json, "loginName") ?: fallbackAccountName
+        val loginName = optNonBlank(json, "loginName")
+            ?: optNonBlank(json, "userAccount")
+            ?: fallbackAccountName
         val sessionKey = optNonBlank(json, "sessionKey").orEmpty()
         val sessionSecret = optNonBlank(json, "sessionSecret").orEmpty()
 
@@ -182,8 +204,93 @@ object Cloud189Protocol {
             sessionSecret = sessionSecret,
             loginName = loginName
         ) ?: throw CloudTuneException("189CloudPC 会话初始化失败，sessionKey 为空")
-        val persisted = PersistedRefreshCredential.createOrNull(refreshToken, active.loginName)
+        val storageKey = active.loginName
+            ?: fallbackAccountKey?.trim()?.takeIf { it.isNotEmpty() }
+            ?: deriveFallbackAccountKey(
+                refreshToken = refreshToken,
+                accessToken = active.accessToken,
+                sessionKey = active.sessionKey
+            )
+        val persisted = PersistedRefreshCredential.createOrNull(
+            refreshToken = refreshToken,
+            accountName = active.loginName,
+            accountKey = storageKey
+        )
         return ParsedSessionPayload(active, persisted)
+    }
+
+    fun isTrustedTianyiOrigin(uri: URI): Boolean {
+        val scheme = uri.scheme?.lowercase(Locale.US) ?: return false
+        if (scheme != "https") return false
+        val host = uri.host?.lowercase(Locale.US)?.trimEnd('.') ?: return false
+        val port = uri.port
+        if (port != -1 && port != 443) return false
+        return host == "cloud.189.cn" ||
+            host.endsWith(".cloud.189.cn") ||
+            host == "e.189.cn" ||
+            host.endsWith(".e.189.cn")
+    }
+
+    fun isSameOrigin(a: URI, b: URI): Boolean {
+        val schemeA = a.scheme?.lowercase(Locale.US) ?: return false
+        val schemeB = b.scheme?.lowercase(Locale.US) ?: return false
+        if (schemeA != schemeB) return false
+        val hostA = a.host?.lowercase(Locale.US)?.trimEnd('.')?.takeIf { it.isNotEmpty() } ?: return false
+        val hostB = b.host?.lowercase(Locale.US)?.trimEnd('.')?.takeIf { it.isNotEmpty() } ?: return false
+        if (hostA != hostB) return false
+        val portA = if (a.port == -1) defaultPort(schemeA) else a.port
+        val portB = if (b.port == -1) defaultPort(schemeB) else b.port
+        return portA == portB
+    }
+
+    private fun defaultPort(scheme: String): Int = when (scheme) {
+        "https" -> 443
+        "http" -> 80
+        else -> -1
+    }
+
+    fun deriveFallbackAccountKey(
+        refreshToken: String? = null,
+        accessToken: String? = null,
+        sessionKey: String
+    ): String {
+        val seed = listOf(refreshToken, accessToken, sessionKey)
+            .mapNotNull { it?.trim() }
+            .firstOrNull { it.isNotEmpty() } ?: sessionKey
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("cloudtune-anon-account:$seed".toByteArray(Charsets.UTF_8))
+        val hex = digest.joinToString("") { "%02x".format(Locale.US, it) }
+        return "acct:$hex"
+    }
+
+    fun resolveAccountIdentity(
+        activeSession: ActiveCloudSession,
+        persistedCredential: PersistedRefreshCredential? = null,
+        priorAccountKey: String? = null
+    ): AccountIdentity {
+        val explicitLogin = activeSession.loginName?.trim()?.takeIf { it.isNotEmpty() }
+            ?: persistedCredential?.accountName?.trim()?.takeIf { it.isNotEmpty() }
+        if (explicitLogin != null && explicitLogin != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME) {
+            return AccountIdentity(storageKey = explicitLogin, displayName = explicitLogin)
+        }
+        val prior = priorAccountKey?.trim()?.takeIf {
+            it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME
+        }
+        if (prior != null) {
+            return AccountIdentity(storageKey = prior, displayName = Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME)
+        }
+        val savedKey = persistedCredential?.accountKey?.trim()?.takeIf {
+            it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME
+        }
+        if (savedKey != null) {
+            return AccountIdentity(storageKey = savedKey, displayName = Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME)
+        }
+        val derived = deriveFallbackAccountKey(
+            refreshToken = persistedCredential?.refreshToken,
+            accessToken = activeSession.accessToken,
+            sessionKey = activeSession.sessionKey
+        )
+        return AccountIdentity(storageKey = derived, displayName = Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME)
     }
 
     fun extractApiErrorMessage(body: String): String? {

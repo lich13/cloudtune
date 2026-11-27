@@ -109,7 +109,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyLocalStreamServerProbeResumeAndRevocation() = runBlocking {
+    fun verifyLocalStreamServerProbeResumeAndRevocation(): Unit = runBlocking {
         val tempRoot = Files.createTempDirectory("cloudtune-stream-test").toFile()
         try {
             val cacheManager = CacheManager(tempRoot)
@@ -212,7 +212,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyGlobalConcurrencyCapAccountIsolationAndDraftSafety() = runBlocking {
+    fun verifyGlobalConcurrencyCapAccountIsolationAndDraftSafety(): Unit = runBlocking {
         // 1) GlobalTransferLimiter <= 8 peak concurrency
         val limiter = GlobalTransferLimiter(maxPermits = 8)
         val jobs = (0 until 24).map {
@@ -277,7 +277,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyCrossRestartResumeAndMultiOriginWebCookieSync() = runBlocking {
+    fun verifyCrossRestartResumeAndMultiOriginWebCookieSync(): Unit = runBlocking {
         // 1) Multi-origin WebView cookies must reach api.cloud.189.cn during actual exchangeRedirectForSession
         var capturedApiCookieHeader: String? = null
         val innerTransport = HttpUrlConnectionTransport()
@@ -390,7 +390,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyRedirectCredentialGuardAndApiStatusValidation() = runBlocking {
+    fun verifyRedirectCredentialGuardAndApiStatusValidation(): Unit = runBlocking {
         assertTrue(Cloud189Protocol.isTrustedTianyiOrigin(URI("https://api.cloud.189.cn/listFiles.action")))
         assertTrue(Cloud189Protocol.isTrustedTianyiOrigin(URI("https://open.e.189.cn/api/oauth2/refreshToken.do")))
         assertFalse(Cloud189Protocol.isTrustedTianyiOrigin(URI("http://api.cloud.189.cn/listFiles.action")))
@@ -485,7 +485,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyCompletedDownloadIsolationZeroPiiCoalescingAndActiveStreamTeardown() = runBlocking {
+    fun verifyCompletedDownloadIsolationZeroPiiCoalescingAndActiveStreamTeardown(): Unit = runBlocking {
         val tempRoot = Files.createTempDirectory("cloudtune-isolation-coalesce").toFile()
         try {
             val store = AccountStore(tempRoot)
@@ -628,7 +628,7 @@ class Cloud189ProtocolAndProxyTest {
     }
 
     @Test
-    fun verifyAnonymousAccountKeySubfolderExportRetryCapAndServiceSurvival() = runBlocking {
+    fun verifyAnonymousAccountKeySubfolderExportRetryCapAndServiceSurvival(): Unit = runBlocking {
         val tempRoot = Files.createTempDirectory("cloudtune-vm-android").toFile()
         try {
             val sessionIdx = AtomicInteger(1)
@@ -763,6 +763,7 @@ class Cloud189ProtocolAndProxyTest {
             assertTrue(runtime.lastPreparedPlaybackUrl?.startsWith("http://127.0.0.1:${runtime.streamServer!!.port}/stream/") == true)
 
             runtime.streamServer?.close()
+            Unit
         } finally {
             tempRoot.deleteRecursively()
         }

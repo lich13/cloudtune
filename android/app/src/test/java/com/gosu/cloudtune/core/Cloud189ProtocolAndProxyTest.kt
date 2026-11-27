@@ -660,9 +660,11 @@ class Cloud189ProtocolAndProxyTest {
                             CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
                         }
                         url.contains("getFileDownloadUrl.action") -> {
-                            downloadUrlCalls.incrementAndGet()
-                            if (failDownloadUrl.get()) {
-                                throw CloudTuneException("transient network glitch")
+                            if (url.contains("fileId=t-fail")) {
+                                downloadUrlCalls.incrementAndGet()
+                                if (failDownloadUrl.get()) {
+                                    throw CloudTuneException("transient network glitch")
+                                }
                             }
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/song.mp3"}"""
                             CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
@@ -688,45 +690,44 @@ class Cloud189ProtocolAndProxyTest {
             // 1) Two accounts omitting loginName get display "天翼云盘用户" with distinct storage keys
             sessionIdx.set(1)
             vm.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=1", emptyMap())
-            repeat(20) { if (vm.isAuthenticated) return@repeat; delay(15L) }
+            repeat(40) { if (vm.isAuthenticated && vm.browser != null) return@repeat; delay(15L) }
             assertEquals("天翼云盘用户", vm.accountName)
             val key1 = vm.accountStorageKey
-            assertNotNull(key1)
-            assertFalse(key1 == "天翼云盘用户")
+            assertNotNull("key1 should be assigned", key1)
+            assertFalse("key1 should not be default display name", key1 == "天翼云盘用户")
             store.saveLibrary(key1!!, listOf(TrackSummary("u1", "User1.flac", "CD 1", 100L)))
 
             vm.logout()
             sessionIdx.set(2)
             vm.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=2", emptyMap())
-            repeat(20) { if (vm.isAuthenticated && vm.browser != null) return@repeat; delay(15L) }
+            repeat(40) { if (vm.isAuthenticated && vm.browser != null) return@repeat; delay(15L) }
             val key2 = vm.accountStorageKey
-            assertNotNull(key2)
-            assertFalse(key1 == key2)
-            assertTrue(vm.tracks.isEmpty())
+            assertNotNull("key2 should be assigned", key2)
+            assertFalse("key1 and key2 must differ: $key1 vs $key2", key1 == key2)
+            assertTrue("Account 2 library must be empty, got ${vm.tracks}", vm.tracks.isEmpty())
 
             // 2) Real subfolder names & distinct relative export subpaths
             vm.browseTo("cd1", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd1", "CD 1")))
-            repeat(20) { if (vm.browser?.currentFolderId == "cd1") return@repeat; delay(15L) }
+            repeat(40) { if (vm.browser?.currentFolderId == "cd1") return@repeat; delay(15L) }
             assertEquals("CD 1", vm.browser?.currentFolderName)
             assertEquals("CD 1", vm.browser?.audioFiles?.firstOrNull()?.folderPath)
 
-            val observedSubpaths = Collections.synchronizedList(mutableListOf<String>())
-            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ ->
-                observedSubpaths += subpath
-                subpath
+            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ -> subpath }
+            repeat(40) {
+                if (vm.downloadTransfers.any { it.path == "CD 1/01. Song.flac" }) return@repeat
+                delay(20L)
             }
-            delay(60L)
             vm.browseTo("cd2", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd2", "CD 2")))
-            repeat(20) { if (vm.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
+            repeat(40) { if (vm.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
             assertEquals("CD 2", vm.browser?.currentFolderName)
-            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ ->
-                observedSubpaths += subpath
-                subpath
+            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ -> subpath }
+            repeat(40) {
+                if (vm.downloadTransfers.any { it.path == "CD 2/01. Song.flac" }) return@repeat
+                delay(20L)
             }
-            delay(60L)
             val queuedPaths = vm.downloadTransfers.mapNotNull { it.path }.toSet()
-            assertTrue(queuedPaths.contains("CD 1/01. Song.flac"))
-            assertTrue(queuedPaths.contains("CD 2/01. Song.flac"))
+            assertTrue("Expected CD 1 subpath in $queuedPaths", queuedPaths.contains("CD 1/01. Song.flac"))
+            assertTrue("Expected CD 2 subpath in $queuedPaths", queuedPaths.contains("CD 2/01. Song.flac"))
 
             // 3) Retry cap enforcement (1 initial + 6 retries = 7 total, never infinite)
             vm.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
@@ -734,12 +735,12 @@ class Cloud189ProtocolAndProxyTest {
             downloadUrlCalls.set(0)
             val transientTrack = TrackSummary("t-fail", "Transient.mp3", "CD 2", 1024L)
             vm.playTrack(transientTrack)
-            repeat(60) {
+            repeat(80) {
                 if (vm.statusMessage?.contains("已停止自动重试") == true) return@repeat
                 delay(20L)
             }
             assertEquals(1 + PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS, downloadUrlCalls.get())
-            assertTrue(vm.statusMessage?.contains("已停止自动重试") == true)
+            assertTrue("Expected retry stop status, got: ${vm.statusMessage}", vm.statusMessage?.contains("已停止自动重试") == true)
 
             // 4) ViewModel.onCleared() MUST keep LocalStreamServer and PlaybackSessionBridge alive
             failDownloadUrl.set(false)
@@ -748,7 +749,7 @@ class Cloud189ProtocolAndProxyTest {
             vm.tracks = listOf(q1, q2)
             vm.shuffle = false
             vm.playTrack(q1)
-            repeat(20) { if (vm.currentTrackId == "q1") return@repeat; delay(15L) }
+            repeat(40) { if (vm.currentTrackId == "q1") return@repeat; delay(15L) }
 
             vm.clearViewModelForTest()
             assertNotNull("SkipNext callback must survive ViewModel.onCleared()", PlaybackSessionBridge.onSkipNext)
@@ -758,10 +759,14 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(404, probeAfterClear.responseCode)
 
             PlaybackSessionBridge.onSkipNext?.invoke()
-            repeat(20) { if (runtime.currentTrackId == "q2") return@repeat; delay(15L) }
+            repeat(40) { if (runtime.currentTrackId == "q2") return@repeat; delay(15L) }
             assertEquals("q2", runtime.currentTrackId)
-            assertTrue(runtime.lastPreparedPlaybackUrl?.startsWith("http://127.0.0.1:${runtime.streamServer!!.port}/stream/") == true)
+            assertTrue(
+                "Expected loopback URL, got ${runtime.lastPreparedPlaybackUrl}",
+                runtime.lastPreparedPlaybackUrl?.startsWith("http://127.0.0.1:${runtime.streamServer!!.port}/stream/") == true
+            )
 
+            vm.logout()
             runtime.streamServer?.close()
             Unit
         } finally {

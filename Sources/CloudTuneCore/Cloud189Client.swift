@@ -358,11 +358,7 @@ public actor Cloud189Client {
         }
         let parsed = try Cloud189Protocol.parseSessionResponse(
             resp.text,
-            statusCode: resp.statusCode,
-            fallbackAccessToken: activeSession?.accessToken ?? "",
-            fallbackRefreshToken: persistedCredential?.refreshToken ?? "",
-            fallbackAccountName: activeSession?.loginName,
-            fallbackAccountKey: persistedCredential?.accountKey
+            statusCode: resp.statusCode
         )
         self.activeSession = parsed.activeSession
         self.persistedCredential = parsed.persistedCredential

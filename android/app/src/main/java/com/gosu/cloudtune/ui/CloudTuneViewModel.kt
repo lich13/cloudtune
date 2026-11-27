@@ -507,11 +507,9 @@ class CloudTuneAppRuntime(
             streamServer?.revokeAllSources(Cloud189Protocol.accountBucketHash(key))
             transferEngine.cancelAll(key)
         }
-        scope.launch {
-            withContext(Dispatchers.IO) {
-                credentialStore?.clearCredential()
-            }
-            cloudClient.clearSession()
+        cloudClient.clearSessionImmediate()
+        scope.launch(Dispatchers.IO) {
+            credentialStore?.clearCredential()
         }
 
         isAuthenticated = false

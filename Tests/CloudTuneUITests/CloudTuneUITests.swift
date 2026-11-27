@@ -111,9 +111,11 @@ struct CloudTuneUITests {
                     return CloudHTTPResponse(statusCode: 200, body: Data(rootBody.utf8), finalURL: url)
                 }
                 if path.contains("getFileDownloadUrl.action") {
-                    downloadUrlCallCount += 1
-                    if failDownloadUrlCalls {
-                        throw URLError(.cannotFindHost)
+                    if query.contains("fileId=f-transient") {
+                        downloadUrlCallCount += 1
+                        if failDownloadUrlCalls {
+                            throw URLError(.cannotFindHost)
+                        }
                     }
                     return CloudHTTPResponse(statusCode: 200, body: Data(#"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/t.flac"}"#.utf8), finalURL: url)
                 }

@@ -225,11 +225,15 @@ class Cloud189Client(
     val isAuthenticated: Boolean get() = activeSession != null
     val accountName: String? get() = activeSession?.loginName ?: persistedCredential?.accountName
 
-    suspend fun clearSession() = mutex.withLock {
+    fun clearSessionImmediate() {
         activeSession = null
         persistedCredential = null
         pendingQr = null
         transport.clearCookies()
+    }
+
+    suspend fun clearSession() = mutex.withLock {
+        clearSessionImmediate()
     }
 
     fun importWebCookies(domainUrl: String, cookieHeader: String?) {
@@ -495,11 +499,7 @@ class Cloud189Client(
         }
         val parsed = Cloud189Protocol.parseSessionResponse(
             body = resp.text,
-            statusCode = resp.statusCode,
-            fallbackAccessToken = activeSession?.accessToken.orEmpty(),
-            fallbackRefreshToken = persistedCredential?.refreshToken.orEmpty(),
-            fallbackAccountName = activeSession?.loginName,
-            fallbackAccountKey = persistedCredential?.accountKey
+            statusCode = resp.statusCode
         )
         activeSession = parsed.activeSession
         persistedCredential = parsed.persistedCredential

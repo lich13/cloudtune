@@ -1,0 +1,260 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main, rewrite-candidate]
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Swift 6 Xcode toolchain
+        run: |
+          if ! swift --version | grep -q 'Swift version 6'; then
+            XCODE16=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1 || true)
+            if [[ -n "$XCODE16" ]]; then
+              sudo xcode-select -s "$XCODE16/Contents/Developer"
+            fi
+          fi
+          swift --version
+
+      - name: Run Python verification suite
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Run Swift tests and render macOS Light/Dark snapshots
+        env:
+          CLOUDTUNE_RENDER_SNAPSHOTS: '1'
+        run: swift test
+
+      - name: Build macOS .app bundle and DMG
+        env:
+          PACKAGE_DMG: '1'
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="1.0.0-ci"
+          fi
+          APP_VERSION="${VERSION}" ./scripts/build-macos.sh release
+
+      - name: Verify macOS binary privacy and code signature
+        run: |
+          python3 scripts/verify_native_privacy.py dist/CloudTune.app/Contents/MacOS/CloudTune
+          codesign --verify --deep --strict dist/CloudTune.app
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+      - name: Upload macOS Light/Dark snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-snapshots-macos
+          path: dist/snapshots/macos/**/*.png
+          if-no-files-found: error
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Swift 6 Xcode with iOS SDK & Simulator runtime
+        run: |
+          if ! swift --version | grep -q 'Swift version 6'; then
+            XCODE16=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1 || true)
+            if [[ -n "$XCODE16" ]]; then
+              sudo xcode-select -s "$XCODE16/Contents/Developer"
+            fi
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Build unsigned iOS ARM64 IPA and verify platform IOS
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="1.0.0-ci"
+          fi
+          APP_VERSION="${VERSION}" ./scripts/build-ios.sh release
+          python3 scripts/verify_ipa.py "dist/CloudTune-${VERSION}-ios-arm64.ipa"
+
+      - name: Run iPhone & iPad Simulator Light/Dark snapshot tests
+        run: |
+          SIM_UDID=$(python3 - <<'PY'
+          import json, subprocess
+          raw = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True)
+          devices = json.loads(raw).get("devices", {})
+          candidates = []
+          for runtime, items in sorted(devices.items(), reverse=True):
+              if "iOS-" not in runtime:
+                  continue
+              for dev in items:
+                  if dev.get("isAvailable") and "iPhone" in dev.get("name", ""):
+                      candidates.append(dev["udid"])
+          if not candidates:
+              raise SystemExit("No available iPhone Simulator found")
+          print(candidates[0])
+          PY
+          )
+          echo "Selected iOS Simulator UDID: ${SIM_UDID}"
+          xcrun simctl boot "${SIM_UDID}" || true
+          TEST_RUNNER_CLOUDTUNE_IOS_SNAPSHOT_DIR="/tmp/cloudtune-ios-snapshots" \
+            xcodebuild test \
+            -project ios/CloudTuneIOS.xcodeproj \
+            -scheme CloudTuneIOS \
+            -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload iOS ARM64 IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-ios-arm64
+          path: dist/*.ipa
+          if-no-files-found: error
+
+      - name: Upload iPhone & iPad Light/Dark snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-snapshots-ios
+          path: /tmp/cloudtune-ios-snapshots/**/*.png
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CJK fonts for Robolectric Compose snapshot rendering
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '27'
+
+      - uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '15859902'
+          log-accepted-android-sdk-licenses: false
+          packages: 'platform-tools platforms;android-37.2 platforms;android-36 build-tools;37.0.0'
+
+      - name: Run Python verification tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Configure Android release signing
+        if: github.event_name != 'pull_request'
+        env:
+          SIGNING_KEY: ${{ secrets.CLOUDTUNE_ANDROID_KEYSTORE }}
+          SIGNING_PROPERTIES: ${{ secrets.CLOUDTUNE_ANDROID_SIGNING }}
+        run: |
+          test -n "$SIGNING_KEY" && test -n "$SIGNING_PROPERTIES"
+          umask 077
+          printf '%s' "$SIGNING_KEY" | base64 --decode > /tmp/cloudtune-android-release.p12
+          printf '%s' "$SIGNING_PROPERTIES" > /tmp/cloudtune-android-release.properties
+          echo 'CLOUDTUNE_ANDROID_SIGNING_PROPERTIES=/tmp/cloudtune-android-release.properties' >> "$GITHUB_ENV"
+
+      - name: Run JUnit + Robolectric snapshots, Lint, and build ARM64 APK
+        working-directory: android
+        env:
+          CLOUDTUNE_RENDER_SNAPSHOTS: '1'
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="1.0.0-ci"
+          fi
+          ./gradlew testDebugUnitTest lintRelease --no-daemon -PappVersion="${VERSION}"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            ./gradlew assembleDebug --no-daemon -PappVersion="${VERSION}"
+          else
+            ./gradlew assembleRelease --no-daemon -PappVersion="${VERSION}"
+          fi
+
+      - name: Verify and package ARM64 APK
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="1.0.0-ci"
+          fi
+          mkdir -p artifacts
+          APK=$(find android/app/build/outputs/apk -name '*.apk' ! -name '*unsigned*' -print -quit)
+          test -n "$APK"
+          python3 scripts/verify_android.py "$APK"
+          cp "$APK" "artifacts/CloudTune_${VERSION}_arm64-v8a.apk"
+
+      - name: Upload Android ARM64 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-android-arm64
+          path: artifacts/*.apk
+          if-no-files-found: error
+
+      - name: Upload Android Phone & Tablet Light/Dark snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTune-snapshots-android
+          path: android/app/build/outputs/snapshots/**/*.png
+          if-no-files-found: error
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f -- /tmp/cloudtune-android-release.p12 /tmp/cloudtune-android-release.properties
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, ios, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: CloudTune-macos
+          path: artifacts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: CloudTune-ios-arm64
+          path: artifacts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: CloudTune-android-arm64
+          path: artifacts
+
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: sha256sum *.dmg *.ipa *.apk > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --verify-tag \
+            --title "CloudTune ${GITHUB_REF_NAME#v}" \
+            --generate-notes

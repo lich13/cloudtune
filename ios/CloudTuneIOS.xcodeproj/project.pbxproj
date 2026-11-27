@@ -1,0 +1,401 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000012B00000100000001 /* CloudTuneIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000022B00000100000001 /* CloudTuneIOSApp.swift */; };
+		A10000032B00000100000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000042B00000100000001 /* Assets.xcassets */; };
+		A10000052B00000100000001 /* CloudTuneCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000062B00000100000001 /* CloudTuneCore */; };
+		A10000072B00000100000001 /* CloudTuneUI in Frameworks */ = {isa = PBXBuildFile; productRef = A10000082B00000100000001 /* CloudTuneUI */; };
+		A10000212B00000100000001 /* CloudTuneIOSSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000222B00000100000001 /* CloudTuneIOSSnapshotTests.swift */; };
+		A10000232B00000100000001 /* representative-state.json in Resources */ = {isa = PBXBuildFile; fileRef = A10000242B00000100000001 /* representative-state.json */; };
+		A10000252B00000100000001 /* CloudTuneCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000262B00000100000001 /* CloudTuneCore */; };
+		A10000272B00000100000001 /* CloudTuneUI in Frameworks */ = {isa = PBXBuildFile; productRef = A10000282B00000100000001 /* CloudTuneUI */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A10000292B00000100000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000162B00000100000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A100000D2B00000100000001;
+			remoteInfo = CloudTuneIOS;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A10000022B00000100000001 /* CloudTuneIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudTuneIOSApp.swift; sourceTree = "<group>"; };
+		A10000042B00000100000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A10000092B00000100000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A100000E2B00000100000001 /* CloudTuneIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CloudTuneIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000222B00000100000001 /* CloudTuneIOSSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudTuneIOSSnapshotTests.swift; sourceTree = "<group>"; };
+		A10000242B00000100000001 /* representative-state.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = "representative-state.json"; path = "../../contracts/representative-state.json"; sourceTree = "<group>"; };
+		A100002A2B00000100000001 /* CloudTuneIOSSnapshotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CloudTuneIOSSnapshotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A100000B2B00000100000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000052B00000100000001 /* CloudTuneCore in Frameworks */,
+				A10000072B00000100000001 /* CloudTuneUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100002B2B00000100000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000252B00000100000001 /* CloudTuneCore in Frameworks */,
+				A10000272B00000100000001 /* CloudTuneUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A100000F2B00000100000001 = {
+			isa = PBXGroup;
+			children = (
+				A10000102B00000100000001 /* CloudTuneIOS */,
+				A100002C2B00000100000001 /* CloudTuneIOSSnapshotTests */,
+				A10000112B00000100000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A10000102B00000100000001 /* CloudTuneIOS */ = {
+			isa = PBXGroup;
+			children = (
+				A10000022B00000100000001 /* CloudTuneIOSApp.swift */,
+				A10000042B00000100000001 /* Assets.xcassets */,
+				A10000092B00000100000001 /* Info.plist */,
+			);
+			path = CloudTuneIOS;
+			sourceTree = "<group>";
+		};
+		A100002C2B00000100000001 /* CloudTuneIOSSnapshotTests */ = {
+			isa = PBXGroup;
+			children = (
+				A10000222B00000100000001 /* CloudTuneIOSSnapshotTests.swift */,
+				A10000242B00000100000001 /* representative-state.json */,
+			);
+			path = CloudTuneIOSSnapshotTests;
+			sourceTree = "<group>";
+		};
+		A10000112B00000100000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A100000E2B00000100000001 /* CloudTuneIOS.app */,
+				A100002A2B00000100000001 /* CloudTuneIOSSnapshotTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A100000D2B00000100000001 /* CloudTuneIOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000122B00000100000001 /* Build configuration list for PBXNativeTarget "CloudTuneIOS" */;
+			buildPhases = (
+				A100000A2B00000100000001 /* Sources */,
+				A100000B2B00000100000001 /* Frameworks */,
+				A100000C2B00000100000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CloudTuneIOS;
+			packageProductDependencies = (
+				A10000062B00000100000001 /* CloudTuneCore */,
+				A10000082B00000100000001 /* CloudTuneUI */,
+			);
+			productName = CloudTuneIOS;
+			productReference = A100000E2B00000100000001 /* CloudTuneIOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A100002D2B00000100000001 /* CloudTuneIOSSnapshotTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000312B00000100000001 /* Build configuration list for PBXNativeTarget "CloudTuneIOSSnapshotTests" */;
+			buildPhases = (
+				A100002E2B00000100000001 /* Sources */,
+				A100002B2B00000100000001 /* Frameworks */,
+				A100002F2B00000100000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A10000302B00000100000001 /* PBXTargetDependency */,
+			);
+			name = CloudTuneIOSSnapshotTests;
+			packageProductDependencies = (
+				A10000262B00000100000001 /* CloudTuneCore */,
+				A10000282B00000100000001 /* CloudTuneUI */,
+			);
+			productName = CloudTuneIOSSnapshotTests;
+			productReference = A100002A2B00000100000001 /* CloudTuneIOSSnapshotTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000162B00000100000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = A10000172B00000100000001 /* Build configuration list for PBXProject "CloudTuneIOS" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = zh_CN;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				zh_CN,
+				Base,
+			);
+			mainGroup = A100000F2B00000100000001;
+			packageReferences = (
+				A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */,
+			);
+			productRefGroup = A10000112B00000100000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A100000D2B00000100000001 /* CloudTuneIOS */,
+				A100002D2B00000100000001 /* CloudTuneIOSSnapshotTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A100000C2B00000100000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000032B00000100000001 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100002F2B00000100000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000232B00000100000001 /* representative-state.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A100000A2B00000100000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000012B00000100000001 /* CloudTuneIOSApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100002E2B00000100000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000212B00000100000001 /* CloudTuneIOSSnapshotTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A10000302B00000100000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000D2B00000100000001 /* CloudTuneIOS */;
+			targetProxy = A10000292B00000100000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A10000132B00000100000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CloudTuneIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gosu.cloudtune.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A10000142B00000100000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CloudTuneIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gosu.cloudtune.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A10000182B00000100000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A10000192B00000100000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A10000322B00000100000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gosu.cloudtune.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CloudTuneIOS.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CloudTuneIOS";
+			};
+			name = Debug;
+		};
+		A10000332B00000100000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gosu.cloudtune.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CloudTuneIOS.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CloudTuneIOS";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000122B00000100000001 /* Build configuration list for PBXNativeTarget "CloudTuneIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000132B00000100000001 /* Debug */,
+				A10000142B00000100000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000172B00000100000001 /* Build configuration list for PBXProject "CloudTuneIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000182B00000100000001 /* Debug */,
+				A10000192B00000100000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000312B00000100000001 /* Build configuration list for PBXNativeTarget "CloudTuneIOSSnapshotTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000322B00000100000001 /* Debug */,
+				A10000332B00000100000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000062B00000100000001 /* CloudTuneCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */;
+			productName = CloudTuneCore;
+		};
+		A10000082B00000100000001 /* CloudTuneUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */;
+			productName = CloudTuneUI;
+		};
+		A10000262B00000100000001 /* CloudTuneCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */;
+			productName = CloudTuneCore;
+		};
+		A10000282B00000100000001 /* CloudTuneUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100001A2B00000100000001 /* XCLocalSwiftPackageReference ".." */;
+			productName = CloudTuneUI;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A10000162B00000100000001 /* Project object */;
+}

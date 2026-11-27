@@ -1,0 +1,24 @@
+# macOS & Apple
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+dist/
+artifacts/
+*.xcuserdata/
+
+# Android & Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+*.p12
+
+# Python & Node
+__pycache__/
+*.pyc
+node_modules/

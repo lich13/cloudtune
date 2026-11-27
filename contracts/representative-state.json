@@ -1,0 +1,229 @@
+{
+  "accountName": "cloudtune_demo@example.invalid",
+  "currentFolder": {
+    "id": "folder-lossless-01",
+    "name": "无损古典与爵士精选"
+  },
+  "settings": {
+    "cacheLimitMb": 2048,
+    "downloadThreads": 8,
+    "cacheThreads": 4,
+    "playbackMode": "stream_cache",
+    "cacheUsageBytes": 385875968
+  },
+  "qrLogin": {
+    "qrContent": "https://open.e.189.cn/api/logbox/oauth2/qr/fixture-8f4a2c91",
+    "message": "二维码已生成，等待手机扫码",
+    "host": "open.e.189.cn"
+  },
+  "breadcrumbs": [
+    {
+      "id": null,
+      "name": "我的云盘"
+    },
+    {
+      "id": "folder-lossless-01",
+      "name": "无损古典与爵士精选"
+    }
+  ],
+  "browser": {
+    "currentFolderId": "folder-lossless-01",
+    "currentFolderName": "无损古典与爵士精选",
+    "parentFolderId": "-11",
+    "isRoot": false,
+    "folders": [
+      {
+        "id": "folder-chamber-2025",
+        "name": "2025 室内乐现场录音",
+        "parentId": "folder-lossless-01"
+      },
+      {
+        "id": "folder-evans-remaster",
+        "name": "Bill Evans Trio Remasters",
+        "parentId": "folder-lossless-01"
+      },
+      {
+        "id": "folder-hisaishi-symphony",
+        "name": "久石让交响作品集",
+        "parentId": "folder-lossless-01"
+      },
+      {
+        "id": "folder-concert-video",
+        "name": "现场演出蓝光原盘视频",
+        "parentId": "folder-lossless-01"
+      }
+    ],
+    "audioFiles": [
+      {
+        "id": "track-goldberg-01",
+        "name": "01. Goldberg Variations, BWV 988 - Aria.flac",
+        "folderPath": "无损古典与爵士精选/2025 室内乐现场录音",
+        "sizeBytes": 48234496,
+        "modifiedAt": "2026-10-18 21:14:00"
+      },
+      {
+        "id": "track-waltz-02",
+        "name": "02. Waltz for Debby (Live at Village Vanguard).flac",
+        "folderPath": "无损古典与爵士精选/Bill Evans Trio Remasters",
+        "sizeBytes": 62914560,
+        "modifiedAt": "2026-10-19 19:08:32"
+      },
+      {
+        "id": "track-summer-03",
+        "name": "03. Summer - 菊次郎的夏天 (Concert Hall).m4a",
+        "folderPath": "无损古典与爵士精选/久石让交响作品集",
+        "sizeBytes": 18454937,
+        "modifiedAt": "2026-10-20 14:22:10"
+      },
+      {
+        "id": "track-clair-04",
+        "name": "04. Clair de Lune, L. 75 No. 3.wav",
+        "folderPath": "无损古典与爵士精选/2025 室内乐现场录音",
+        "sizeBytes": 54525952,
+        "modifiedAt": "2026-10-21 09:45:19"
+      }
+    ],
+    "videoFiles": [
+      {
+        "id": "video-vienna-01",
+        "name": "Vienna_New_Year_Concert_4K_HDR.mp4",
+        "folderPath": "无损古典与爵士精选/现场演出蓝光原盘视频",
+        "sizeBytes": 1932735283,
+        "modifiedAt": "2026-10-15 20:00:00"
+      },
+      {
+        "id": "video-jazz-02",
+        "name": "Jazz_Club_Live_Session_1080p.mkv",
+        "folderPath": "无损古典与爵士精选/现场演出蓝光原盘视频",
+        "sizeBytes": 894435328,
+        "modifiedAt": "2026-10-16 22:30:00"
+      },
+      {
+        "id": "video-studio-03",
+        "name": "Studio_Behind_The_Scenes.mov",
+        "folderPath": "无损古典与爵士精选/现场演出蓝光原盘视频",
+        "sizeBytes": 412090368,
+        "modifiedAt": "2026-10-17 16:12:00"
+      }
+    ],
+    "otherFiles": [
+      {
+        "id": "other-booklet-01",
+        "name": "Album_Booklet_Scan.pdf",
+        "folderPath": "无损古典与爵士精选",
+        "sizeBytes": 12582912,
+        "modifiedAt": "2026-10-18 11:00:00"
+      },
+      {
+        "id": "other-cue-02",
+        "name": "Session_Master_Sheet.cue",
+        "folderPath": "无损古典与爵士精选",
+        "sizeBytes": 4096,
+        "modifiedAt": "2026-10-18 11:02:00"
+      }
+    ]
+  },
+  "libraryTracks": [
+    {
+      "id": "track-goldberg-01",
+      "name": "01. Goldberg Variations, BWV 988 - Aria.flac",
+      "folderPath": "无损古典与爵士精选/2025 室内乐现场录音",
+      "sizeBytes": 48234496,
+      "modifiedAt": "2026-10-18 21:14:00"
+    },
+    {
+      "id": "track-waltz-02",
+      "name": "02. Waltz for Debby (Live at Village Vanguard).flac",
+      "folderPath": "无损古典与爵士精选/Bill Evans Trio Remasters",
+      "sizeBytes": 62914560,
+      "modifiedAt": "2026-10-19 19:08:32"
+    },
+    {
+      "id": "track-summer-03",
+      "name": "03. Summer - 菊次郎的夏天 (Concert Hall).m4a",
+      "folderPath": "无损古典与爵士精选/久石让交响作品集",
+      "sizeBytes": 18454937,
+      "modifiedAt": "2026-10-20 14:22:10"
+    },
+    {
+      "id": "track-clair-04",
+      "name": "04. Clair de Lune, L. 75 No. 3.wav",
+      "folderPath": "无损古典与爵士精选/2025 室内乐现场录音",
+      "sizeBytes": 54525952,
+      "modifiedAt": "2026-10-21 09:45:19"
+    },
+    {
+      "id": "track-nocturne-05",
+      "name": "05. 夜曲 Nocturne Op.9 No.2 (24bit-96kHz).flac",
+      "folderPath": "无损古典与爵士精选/2025 室内乐现场录音",
+      "sizeBytes": 71303168,
+      "modifiedAt": "2026-10-22 20:11:05"
+    },
+    {
+      "id": "track-blues-06",
+      "name": "06. 蓝调即兴 Archive Session.ape",
+      "folderPath": "无损古典与爵士精选/Bill Evans Trio Remasters",
+      "sizeBytes": 39845888,
+      "modifiedAt": "2026-10-23 18:05:44"
+    }
+  ],
+  "nowPlaying": {
+    "trackId": "track-waltz-02",
+    "title": "02. Waltz for Debby (Live at Village Vanguard).flac",
+    "artist": "Bill Evans Trio",
+    "album": "无损古典与爵士精选",
+    "isPlaying": true,
+    "currentTimeSeconds": 118,
+    "durationSeconds": 416,
+    "shuffle": true,
+    "loopMode": "all",
+    "statusMessage": "边播边缓存《02. Waltz for Debby (Live at Village Vanguard).flac》"
+  },
+  "transferSnapshot": {
+    "totalSpeedBytesPerSecond": 12582912,
+    "items": [
+      {
+        "id": "download:evans-remaster-flac",
+        "label": "02. Waltz for Debby (Live at Village Vanguard).flac",
+        "kind": "download",
+        "state": "running",
+        "path": "/Exports/Music/02. Waltz for Debby.flac",
+        "canPause": true,
+        "canResume": false,
+        "canDelete": true,
+        "bytesPerSecond": 8912896,
+        "transferredBytes": 40579891,
+        "totalBytes": 62914560
+      },
+      {
+        "id": "download:vienna-4k-mp4",
+        "label": "Vienna_New_Year_Concert_4K_HDR.mp4",
+        "kind": "download",
+        "state": "paused",
+        "path": "/Exports/Video/Vienna_New_Year_Concert_4K_HDR.mp4",
+        "canPause": false,
+        "canResume": true,
+        "canDelete": true,
+        "bytesPerSecond": 0,
+        "transferredBytes": 618475290,
+        "totalBytes": 1932735283
+      },
+      {
+        "id": "stream:track-waltz-02",
+        "label": "02. Waltz for Debby (Live at Village Vanguard).flac",
+        "kind": "stream",
+        "state": "running",
+        "path": null,
+        "canPause": false,
+        "canResume": false,
+        "canDelete": false,
+        "bytesPerSecond": 3670016,
+        "transferredBytes": 49199186,
+        "totalBytes": 62914560
+      }
+    ]
+  },
+  "errorBanner": {
+    "statusMessage": "本地完整文件编码不受系统解码器支持（.ape），已停止自动重试，请使用外部播放器打开。"
+  }
+}

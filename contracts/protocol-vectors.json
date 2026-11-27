@@ -1,0 +1,135 @@
+{
+  "hmacSignature": {
+    "sessionKey": "sk_fixture_9a8b7c6d5e4f",
+    "sessionSecret": "ss_fixture_secret_42_alpha_beta",
+    "method": "GET",
+    "url": "https://api.cloud.189.cn/listFiles.action?folderId=-11&pageSize=1000",
+    "date": "Fri, 27 Nov 2026 07:30:00 GMT",
+    "expectedRequestUri": "/listFiles.action",
+    "expectedPayload": "SessionKey=sk_fixture_9a8b7c6d5e4f&Operate=GET&RequestURI=/listFiles.action&Date=Fri, 27 Nov 2026 07:30:00 GMT",
+    "expectedSignature": "FE0A4A8E40D1D8AB0AF39CCFA8E56CC47C5C35B1"
+  },
+  "loginHtmlExtraction": {
+    "html": "<!doctype html><html><body><img class=\"result-ico\" alt=\"二维码登录成功\" /><script>var clientType = '10020'; var lt = \"EAF984F45AC0457C0753F261\"; var paramId = \"95F094E020E7C7FDAC72FCAF\"; var reqId = \"8d662364d7c04866\";</script></body></html>",
+    "expectedLt": "EAF984F45AC0457C0753F261",
+    "expectedParamId": "95F094E020E7C7FDAC72FCAF",
+    "expectedReqId": "8d662364d7c04866"
+  },
+  "qrPollDateFormat": {
+    "year": 2026,
+    "month": 11,
+    "day": 27,
+    "hour": 15,
+    "minute": 42,
+    "second": 9,
+    "millisecond": 73,
+    "expected": "2026-11-2715:42:09.073"
+  },
+  "qrPollPayloads": [
+    {
+      "name": "redirect_camel",
+      "json": "{\"status\":0,\"redirectUrl\":\"https://cloud.189.cn/udb/udb_login.jsp?paras=T1\"}",
+      "expectedState": "authenticated",
+      "expectedRedirectUrl": "https://cloud.189.cn/udb/udb_login.jsp?paras=T1"
+    },
+    {
+      "name": "redirect_upper_url",
+      "json": "{\"status\":0,\"redirectURL\":\"https://cloud.189.cn/udb/udb_login.jsp?paras=T2\"}",
+      "expectedState": "authenticated",
+      "expectedRedirectUrl": "https://cloud.189.cn/udb/udb_login.jsp?paras=T2"
+    },
+    {
+      "name": "to_url",
+      "json": "{\"status\":0,\"toUrl\":\"https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=T3\"}",
+      "expectedState": "authenticated",
+      "expectedRedirectUrl": "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=T3"
+    },
+    {
+      "name": "waiting_scan",
+      "json": "{\"status\":-106}",
+      "expectedState": "waiting_scan",
+      "expectedRedirectUrl": null
+    },
+    {
+      "name": "waiting_confirm",
+      "json": "{\"status\":-11002}",
+      "expectedState": "waiting_confirm",
+      "expectedRedirectUrl": null
+    },
+    {
+      "name": "expired",
+      "json": "{\"status\":-11001}",
+      "expectedState": "expired",
+      "expectedRedirectUrl": null
+    }
+  ],
+  "sessionPayloads": [
+    {
+      "name": "json_with_refresh_token",
+      "body": "{\"res_code\":0,\"accessToken\":\"at_live_01\",\"refreshToken\":\"rt_persist_01\",\"loginName\":\"cloudtune_demo@example.invalid\",\"sessionKey\":\"sk_live_01\",\"sessionSecret\":\"ss_live_01\"}",
+      "expectedAccountName": "cloudtune_demo@example.invalid",
+      "expectedSessionKey": "sk_live_01",
+      "expectedSessionSecret": "ss_live_01",
+      "expectedPersistedRefreshToken": "rt_persist_01"
+    },
+    {
+      "name": "xml_without_refresh_token",
+      "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><userSession><loginName>cloudtune_demo@example.invalid</loginName><sessionKey>sk_xml_02</sessionKey><sessionSecret>ss_xml_02</sessionSecret></userSession>",
+      "expectedAccountName": "cloudtune_demo@example.invalid",
+      "expectedSessionKey": "sk_xml_02",
+      "expectedSessionSecret": "ss_xml_02",
+      "expectedPersistedRefreshToken": null
+    }
+  ],
+  "webLoginCallbacks": [
+    {
+      "url": "https://cloud.189.cn/api/portal/unifyLoginForPC.action?appId=8025431004&clientType=10020",
+      "shouldIntercept": false
+    },
+    {
+      "url": "https://open.e.189.cn/api/logbox/oauth2/unifyAccountLogin.do?appId=8025431004&paras=ABC",
+      "shouldIntercept": false
+    },
+    {
+      "url": "https://cloud.189.cn/udb/udb_login.jsp?redirectURL=https%3A%2F%2Fm.cloud.189.cn%2Fzhuanti%2F2020%2FloginErrorPc%2Findex.html&paras=CALLBACK_1",
+      "shouldIntercept": true
+    },
+    {
+      "url": "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=CALLBACK_2&sign=99AA",
+      "shouldIntercept": true
+    }
+  ],
+  "rangeValidation": {
+    "probeRangeHeader": "bytes=0-1",
+    "midSeekRangeHeader": "bytes=65536-",
+    "fullOpenRangeHeader": "bytes=0-",
+    "partialContentRangeHeader": "bytes 0-1/48234496",
+    "expectedTotalFromContentRange": 48234496,
+    "resumeOffset": 4096,
+    "validResumeContentRange": "bytes 4096-9999/10000",
+    "mismatchedResumeContentRange": "bytes 0-9999/10000"
+  },
+  "playbackFallbackPolicy": {
+    "largeTrackThresholdBytes": 16777216,
+    "globalMaxRemotePermits": 8,
+    "sampleLargeTrackBytes": 48234496,
+    "sampleSmallTrackBytes": 8388608
+  },
+  "accountIsolation": [
+    {
+      "rawAccountId": "  CloudTune_Demo@Example.Invalid ",
+      "normalizedAccountId": "cloudtune_demo@example.invalid",
+      "expectedBucketHash": "07fa47b0966e89586a34389d3b0b4720fae8fdb96eebd5ac8e108d70c7810625"
+    },
+    {
+      "rawAccountId": "alice@example.invalid",
+      "normalizedAccountId": "alice@example.invalid",
+      "expectedBucketHash": "78d66dbfbec60c3f74aa150451ce5c0c7d4ad25f09f23a30f2f20dd3eb59ac21"
+    },
+    {
+      "rawAccountId": "bob@example.invalid",
+      "normalizedAccountId": "bob@example.invalid",
+      "expectedBucketHash": "454ce552e83c0fabe3df7c762cd5b044e35e85d92f13bd4e4fbc66a0efe53dc5"
+    }
+  ]
+}

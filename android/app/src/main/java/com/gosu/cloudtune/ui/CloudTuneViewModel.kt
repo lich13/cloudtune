@@ -4,7 +4,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
+import android.webkit.CookieManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -12,15 +14,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.gosu.cloudtune.core.AccountSettings
-import com.gosu.cloudtune.core.AppThemeMode
+import com.gosu.cloudtune.core.AppearanceMode
 import com.gosu.cloudtune.core.BreadcrumbItem
+import com.gosu.cloudtune.core.BrowserPaneState
+import com.gosu.cloudtune.core.BrowserScope
 import com.gosu.cloudtune.core.CacheManager
 import com.gosu.cloudtune.core.Cloud189Client
 import com.gosu.cloudtune.core.Cloud189Constants
@@ -34,6 +41,7 @@ import com.gosu.cloudtune.core.ModuleTab
 import com.gosu.cloudtune.core.PlaybackDecisionPolicy
 import com.gosu.cloudtune.core.PlaybackFailureAction
 import com.gosu.cloudtune.core.PlaybackMode
+import com.gosu.cloudtune.core.PlaybackQueueResolver
 import com.gosu.cloudtune.core.QrLoginState
 import com.gosu.cloudtune.core.RepresentativeFixture
 import com.gosu.cloudtune.core.SnapshotScene
@@ -54,20 +62,34 @@ import com.gosu.cloudtune.media.PlaybackSessionBridge
 import com.gosu.cloudtune.media.QrCodeHelper
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+data class PendingExternalVideoAction(
+    val video: TrackSummary,
+    val streamUrl: String
+)
 
 /**
- * Application/service-scoped runtime holder keeping `LocalStreamServer`, `MediaController`,
- * queue state, and lockscreen Next/Previous callbacks alive across `Activity` / `ViewModel` recreation.
+ * Application/service-scoped runtime keeping `LocalStreamServer`, `MediaController`,
+ * unified queue state, lifecycle-safe video `ExoPlayer`, and lockscreen callbacks alive.
  */
 class CloudTuneAppRuntime(
     appContext: Context? = null,
@@ -78,11 +100,15 @@ class CloudTuneAppRuntime(
     val credentialStore: CredentialStore? = appContext?.applicationContext?.let { EncryptedCredentialStore(it) },
     val limiter: GlobalTransferLimiter = GlobalTransferLimiter(maxPermits = 8),
     val enableLiveLoops: Boolean = true,
-    dispatcher: CoroutineDispatcher = if (appContext != null) Dispatchers.Main.immediate else Dispatchers.Unconfined
+    dispatcher: CoroutineDispatcher = if (appContext != null) Dispatchers.Main.immediate else Dispatchers.Unconfined,
+    private val ioDispatcher: CoroutineDispatcher = if (appContext != null) Dispatchers.IO else Dispatchers.Unconfined
 ) {
+    private val appCtx: Context? = appContext?.applicationContext
+    private val uiPrefs = appCtx?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
-    var themeMode by mutableStateOf(AppThemeMode.SYSTEM)
+    var themeMode by mutableStateOf(AppearanceMode.SYSTEM)
+    var dynamicColorEnabled by mutableStateOf(false)
     var activeModule by mutableStateOf(ModuleTab.MUSIC)
     var isBootstrapping by mutableStateOf(false)
     var busyLabel by mutableStateOf<String?>(null)
@@ -109,26 +135,46 @@ class CloudTuneAppRuntime(
     var qrHint by mutableStateOf<String?>(null)
     var isShowingWebLoginDialog by mutableStateOf(false)
 
-    // Cloud browser & library
-    var breadcrumbs by mutableStateOf(listOf(BreadcrumbItem.ROOT))
-    var browser by mutableStateOf<FolderBrowsePayload?>(null)
+    // Decoupled Cloud & Video folder browsers + Music library
+    var cloudBrowser by mutableStateOf(BrowserPaneState())
+    var videoBrowser by mutableStateOf(BrowserPaneState())
     var tracks by mutableStateOf<List<TrackSummary>>(emptyList())
     var searchQuery by mutableStateOf("")
 
-    // Playback state
+    var breadcrumbs: List<BreadcrumbItem>
+        get() = cloudBrowser.breadcrumbs
+        set(value) { cloudBrowser = cloudBrowser.copy(breadcrumbs = value) }
+
+    var browser: FolderBrowsePayload?
+        get() = cloudBrowser.payload
+        set(value) { cloudBrowser = cloudBrowser.copy(payload = value) }
+
+    // Playback & unified queue state
+    var activeTrack by mutableStateOf<TrackSummary?>(null)
     var currentTrackId by mutableStateOf<String?>(null)
     var nowPlayingTitle by mutableStateOf<String?>(null)
     var nowPlayingArtist by mutableStateOf<String?>(null)
+    var nowPlayingAlbum by mutableStateOf<String?>(null)
+    var nowPlayingArtwork by mutableStateOf<Bitmap?>(null)
     var isPlaying by mutableStateOf(false)
     var loadingTrackId by mutableStateOf<String?>(null)
     var shuffle by mutableStateOf(true)
     var loopMode by mutableStateOf(LoopMode.ALL)
     var currentTime by mutableDoubleStateOf(0.0)
     var duration by mutableDoubleStateOf(0.0)
+    var upNextQueue by mutableStateOf<List<TrackSummary>>(emptyList())
+    var shuffleOrderIds by mutableStateOf<List<String>>(emptyList())
+    var isShowingNowPlayingSheet by mutableStateOf(false)
+    var isUserScrubbing by mutableStateOf(false)
 
-    // Video state
-    var activeVideoUrl by mutableStateOf<String?>(null)
+    // Lifecycle-safe Video player state
+    var activeVideoTrack by mutableStateOf<TrackSummary?>(null)
     var activeVideoTitle by mutableStateOf<String?>(null)
+    var activeVideoUrl by mutableStateOf<String?>(null)
+    var isVideoPlaying by mutableStateOf(false)
+    var videoPlayer by mutableStateOf<ExoPlayer?>(null)
+        private set
+    var pendingExternalVideoAction by mutableStateOf<PendingExternalVideoAction?>(null)
 
     // Transfers
     var transferSnapshot by mutableStateOf(TransferSnapshotPayload())
@@ -146,6 +192,11 @@ class CloudTuneAppRuntime(
                 onAccountStreamStatusUpdate = { id, accountHash, status ->
                     transferEngine.updateExternalTransferStatus(id, status, accountHash)
                 },
+                onWriteThroughCompleted = { accountHash, trackId, localFile ->
+                    scope.launch {
+                        handleWriteThroughCompleted(accountHash, trackId, localFile)
+                    }
+                },
                 urlRefresher = { trackId ->
                     cloudClient.resolveDownloadUrl(trackId)
                 }
@@ -153,27 +204,46 @@ class CloudTuneAppRuntime(
         }.getOrNull()
     } else null
 
-    private val hasAndroidContext: Boolean = appContext != null
+    private val hasAndroidContext: Boolean = appCtx != null
+    private val settingsMutexes = ConcurrentHashMap<String, Mutex>()
+    private val bootstrapLock = Any()
+    private var bootstrapDeferred: Deferred<Unit>? = null
+    internal var cookieCleanupDeferred: Deferred<Unit>? = null
     private var cacheManager: CacheManager? = null
     private var mediaController: MediaController? = null
     private var pendingMediaItem: MediaItem? = null
     internal var lastPreparedPlaybackUrl: String? = null
     private var qrPollJob: Job? = null
-    private var transferPollJob: Job? = null
+    private var transferRefreshJob: Job? = null
+    private var uiProgressClockJob: Job? = null
+    private var scheduledPrefetchJob: Job? = null
     private var prefetchedTrackId: String? = null
     private var prefetchingTrackId: String? = null
-    private var plannedShuffleNextTrackId: String? = null
     private var playbackGeneration: Int = 0
     private var recoveryAttempts = 0
     private var currentPlaybackIsLoopback = false
     private var attachedUiCount = 0
+    private var isUiForegroundVisible = true
 
     init {
+        uiPrefs?.let { prefs ->
+            themeMode = AppearanceMode.fromWire(prefs.getString(KEY_APPEARANCE_MODE, null))
+            dynamicColorEnabled = prefs.getBoolean(KEY_DYNAMIC_COLOR, false)
+            committedSettings = committedSettings.copy(
+                appearanceMode = themeMode,
+                dynamicColorEnabled = dynamicColorEnabled
+            )
+        }
         syncDraftsFromCommitted()
+        transferEngine.setOnActivityChange { snapshot, hasActive ->
+            scope.launch {
+                handleTransferActivityChange(snapshot, hasActive)
+            }
+        }
         if (enableLiveLoops) {
             bindSkipBridge()
-            if (appContext != null) {
-                connectMediaController(appContext.applicationContext)
+            if (appCtx != null) {
+                connectMediaController(appCtx)
             }
         }
     }
@@ -182,14 +252,16 @@ class CloudTuneAppRuntime(
         if (!enableLiveLoops) return
         PlaybackSessionBridge.onSkipNext = { playAdjacent(1) }
         PlaybackSessionBridge.onSkipPrevious = { playAdjacent(-1) }
+        syncQueueAvailabilityToBridge()
     }
 
     internal fun onUiAttached() {
         attachedUiCount += 1
         if (enableLiveLoops) {
             bindSkipBridge()
-            if (isAuthenticated && (transferPollJob == null || transferPollJob?.isActive != true)) {
-                startTransferPolling()
+            updateUiProgressClock()
+            if (isAuthenticated && transferEngine.hasActiveTransfers()) {
+                ensureTransferRefreshRunning()
             }
         }
     }
@@ -201,9 +273,25 @@ class CloudTuneAppRuntime(
         if (attachedUiCount > 0) return
         qrPollJob?.cancel()
         qrPollJob = null
-        if (!isPlaying) {
-            transferPollJob?.cancel()
-            transferPollJob = null
+        transferRefreshJob?.cancel()
+        transferRefreshJob = null
+        updateUiProgressClock()
+    }
+
+    fun setUiForegroundVisible(visible: Boolean) {
+        if (isUiForegroundVisible == visible) return
+        isUiForegroundVisible = visible
+        updateUiProgressClock()
+        if (visible && isAuthenticated) {
+            transferSnapshot = transferEngine.snapshot()
+            if (transferSnapshot.hasActiveItems) {
+                ensureTransferRefreshRunning()
+            }
+            mediaController?.let { mc ->
+                if (mc.duration > 0L) duration = mc.duration / 1000.0
+                if (!isUserScrubbing) currentTime = mc.currentPosition.coerceAtLeast(0L) / 1000.0
+                isPlaying = mc.isPlaying
+            }
         }
     }
 
@@ -228,15 +316,70 @@ class CloudTuneAppRuntime(
         }
 
     val currentTrack: TrackSummary?
-        get() = currentTrackId?.let { id ->
-            tracks.firstOrNull { it.id == id } ?: browser?.audioFiles?.firstOrNull { it.id == id }
+        get() {
+            val held = activeTrack
+            if (held != null && (held.id == currentTrackId || currentTrackId == null)) {
+                return held
+            }
+            val id = currentTrackId ?: return null
+            return tracks.firstOrNull { it.id == id }
+                ?: cloudBrowser.payload?.audioFiles?.firstOrNull { it.id == id }
+                ?: held
         }
+
+    val upcomingTracks: List<TrackSummary>
+        get() = PlaybackQueueResolver.upcomingPreview(
+            currentTrack = currentTrack,
+            libraryTracks = tracks,
+            upNextQueue = upNextQueue,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            loopMode = loopMode,
+            limit = 20
+        )
+
+    val canSkipNext: Boolean
+        get() = PlaybackQueueResolver.canSkipNext(
+            currentTrack = currentTrack,
+            libraryTracks = tracks,
+            upNextQueue = upNextQueue,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            loopMode = loopMode
+        )
+
+    val canSkipPrevious: Boolean
+        get() = PlaybackQueueResolver.canSkipPrevious(
+            currentTrack = currentTrack,
+            libraryTracks = tracks,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            loopMode = loopMode
+        )
 
     val downloadTransfers: List<TransferStatus>
         get() = transferSnapshot.items.filter { it.kind == "download" }
 
+    val activeStreamTransfers: List<TransferStatus>
+        get() = transferSnapshot.items.filter { it.kind != "download" }
+
     val downloadableFiles: List<TrackSummary>
-        get() = browser?.let { it.audioFiles + it.videoFiles + it.otherFiles } ?: emptyList()
+        get() = cloudBrowser.payload?.let { it.audioFiles + it.videoFiles + it.otherFiles } ?: emptyList()
+
+    private fun syncQueueAvailabilityToBridge() {
+        if (!enableLiveLoops) return
+        PlaybackSessionBridge.updateAvailability(canNext = canSkipNext, canPrev = canSkipPrevious)
+    }
+
+    private fun settingsMutexFor(accountId: String): Mutex =
+        settingsMutexes.computeIfAbsent(accountId) { Mutex() }
+
+    private fun mirrorThemePrefs(mode: AppearanceMode, dynamicColor: Boolean) {
+        uiPrefs?.edit()
+            ?.putString(KEY_APPEARANCE_MODE, mode.wireValue)
+            ?.putBoolean(KEY_DYNAMIC_COLOR, dynamicColor)
+            ?.apply()
+    }
 
     fun syncDraftsFromCommitted() {
         cacheLimitDraft = committedSettings.cacheLimitMb.toString()
@@ -257,6 +400,44 @@ class CloudTuneAppRuntime(
         settingsValidationError = null
     }
 
+    suspend fun mutateAccountSettings(
+        successMessage: String? = null,
+        resyncDrafts: Boolean = false,
+        transform: (AccountSettings) -> AccountSettings
+    ): Boolean {
+        val acct = activeAccountKey
+        if (acct == null) {
+            val updated = transform(committedSettings)
+            committedSettings = updated
+            if (resyncDrafts) syncDraftsFromCommitted()
+            if (successMessage != null) statusMessage = successMessage
+            return true
+        }
+        val mutex = settingsMutexFor(acct)
+        return mutex.withLock {
+            val ioResult = runCatching {
+                withContext(ioDispatcher) {
+                    val base = accountStore.loadSettingsOrNull(acct) ?: committedSettings
+                    val updated = transform(base)
+                    accountStore.saveSettings(acct, updated)
+                    updated
+                }
+            }
+            val saved = ioResult.getOrElse { err ->
+                if (activeAccountKey == acct) {
+                    statusMessage = "保存设置失败：${err.message ?: "磁盘写入异常"}"
+                }
+                return@withLock false
+            }
+            if (activeAccountKey == acct) {
+                committedSettings = saved
+                if (resyncDrafts) syncDraftsFromCommitted()
+                if (successMessage != null) statusMessage = successMessage
+            }
+            true
+        }
+    }
+
     fun commitCacheLimitDraft(): Boolean {
         val parsed = cacheLimitDraft.trim().toLongOrNull()
         if (parsed == null || parsed < AccountSettings.MIN_CACHE_LIMIT_MB) {
@@ -265,24 +446,24 @@ class CloudTuneAppRuntime(
             statusMessage = msg
             return false
         }
-        val next = committedSettings.copy(cacheLimitMb = parsed)
-        committedSettings = next
-        syncDraftsFromCommitted()
-        val acct = activeAccountKey
         val cm = cacheManager
-        if (acct != null || cm != null) {
-            scope.launch {
-                val prunedUsage = withContext(Dispatchers.IO) {
-                    acct?.let { accountStore.saveSettings(it, next) }
-                    cm?.pruneToLimit(next.cacheLimitBytes)
-                }
+        var immediateOutcome = true
+        scope.launch {
+            val ok = mutateAccountSettings(
+                successMessage = "缓存限制已更新",
+                resyncDrafts = true
+            ) { prev -> prev.copy(cacheLimitMb = parsed) }
+            immediateOutcome = ok
+            if (ok && cm != null) {
+                val prunedUsage = runCatching {
+                    withContext(ioDispatcher) { cm.pruneToLimit(parsed * 1024L * 1024L) }
+                }.getOrNull()
                 if (prunedUsage != null && cm === cacheManager) {
                     cacheUsageBytes = prunedUsage
                 }
             }
         }
-        statusMessage = "缓存限制已更新"
-        return true
+        return immediateOutcome
     }
 
     fun commitTransferThreadsDraft(): Boolean {
@@ -300,36 +481,53 @@ class CloudTuneAppRuntime(
             statusMessage = msg
             return false
         }
-        val next = committedSettings.copy(downloadThreads = dl, cacheThreads = ct)
-        committedSettings = next
-        syncDraftsFromCommitted()
-        activeAccountKey?.let { acct ->
-            scope.launch(Dispatchers.IO) {
-                accountStore.saveSettings(acct, next)
-            }
+        var immediateOutcome = true
+        scope.launch {
+            immediateOutcome = mutateAccountSettings(
+                successMessage = "传输参数已更新",
+                resyncDrafts = true
+            ) { prev -> prev.copy(downloadThreads = dl, cacheThreads = ct) }
         }
-        statusMessage = "传输参数已更新"
-        return true
+        return immediateOutcome
     }
 
     fun updatePlaybackMode(mode: PlaybackMode) {
-        val next = committedSettings.copy(playbackMode = mode)
-        committedSettings = next
-        activeAccountKey?.let { acct ->
-            scope.launch(Dispatchers.IO) {
-                accountStore.saveSettings(acct, next)
-            }
+        val msg = if (mode == PlaybackMode.DOWNLOAD_FIRST) "已切到优先缓存播放" else "已切到边播边缓存"
+        scope.launch {
+            mutateAccountSettings(successMessage = msg) { prev -> prev.copy(playbackMode = mode) }
+            scheduleUpcomingPrefetch()
         }
-        statusMessage = if (mode == PlaybackMode.DOWNLOAD_FIRST) "已切到优先缓存播放" else "已切到边播边缓存"
     }
 
-    fun bootstrap() {
-        if (isAuthenticated || isBootstrapping) return
+    fun updateAppearanceMode(mode: AppearanceMode) {
+        themeMode = mode
+        mirrorThemePrefs(mode, dynamicColorEnabled)
         scope.launch {
-            val stored = withContext(Dispatchers.IO) { credentialStore?.loadCredential() } ?: return@launch
-            isBootstrapping = true
-            busyLabel = "恢复天翼登录会话..."
+            mutateAccountSettings { prev -> prev.copy(appearanceMode = mode) }
+        }
+    }
+
+    fun updateDynamicColorEnabled(enabled: Boolean) {
+        dynamicColorEnabled = enabled
+        mirrorThemePrefs(themeMode, enabled)
+        scope.launch {
+            mutateAccountSettings { prev -> prev.copy(dynamicColorEnabled = enabled) }
+        }
+    }
+
+    /**
+     * Single-flight cold-start bootstrap shared between `MainActivity` and `PlaybackService`
+     * so concurrent launches never trigger duplicate refresh-token exchanges.
+     */
+    fun bootstrap(): Deferred<Unit> = synchronized(bootstrapLock) {
+        if (isAuthenticated) return CompletableDeferred(Unit)
+        val existing = bootstrapDeferred
+        if (existing != null && existing.isActive) return existing
+        val created = scope.async {
             try {
+                val stored = withContext(ioDispatcher) { credentialStore?.loadCredential() } ?: return@async
+                isBootstrapping = true
+                busyLabel = "恢复天翼登录会话..."
                 val restored = cloudClient.restoreFromRefreshCredential(stored)
                 val identity = Cloud189Protocol.resolveAccountIdentity(
                     activeSession = restored.activeSession,
@@ -337,12 +535,16 @@ class CloudTuneAppRuntime(
                     priorAccountKey = stored.accountKey
                 )
                 restored.persistedCredential?.let { cred ->
-                    withContext(Dispatchers.IO) {
-                        credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                    runCatching {
+                        withContext(ioDispatcher) {
+                            credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                        }
+                    }.onFailure { err ->
+                        statusMessage = "登录凭据持久化警告：${err.message}"
                     }
                 }
                 activateAccount(storageKey = identity.storageKey, displayName = identity.displayName)
-                browseToSuspend(null, listOf(BreadcrumbItem.ROOT), showBusy = false)
+                browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
@@ -351,8 +553,13 @@ class CloudTuneAppRuntime(
             } finally {
                 busyLabel = null
                 isBootstrapping = false
+                synchronized(bootstrapLock) {
+                    bootstrapDeferred = null
+                }
             }
         }
+        bootstrapDeferred = created
+        created
     }
 
     fun beginQrLogin() {
@@ -364,7 +571,7 @@ class CloudTuneAppRuntime(
                 qrContent = start.qrContent
                 qrHint = start.message
                 statusMessage = start.message
-                qrBitmap = withContext(Dispatchers.IO) {
+                qrBitmap = withContext(ioDispatcher) {
                     QrCodeHelper.generateQrBitmap(start.qrContent, 480)
                 }
                 startQrPolling()
@@ -407,14 +614,18 @@ class CloudTuneAppRuntime(
                                 Cloud189Protocol.AccountIdentity(fallbackKey, fallbackDisplay)
                             }
                             persisted?.let { cred ->
-                                withContext(Dispatchers.IO) {
-                                    credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                                runCatching {
+                                    withContext(ioDispatcher) {
+                                        credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                                    }
+                                }.onFailure { err ->
+                                    statusMessage = "登录凭据保存异常：${err.message}"
                                 }
                             }
                             qrContent = null
                             qrBitmap = null
                             activateAccount(storageKey = identity.storageKey, displayName = identity.displayName)
-                            browseToSuspend(null, listOf(BreadcrumbItem.ROOT), showBusy = false)
+                            browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                             return@launch
                         }
                         QrLoginState.EXPIRED -> {
@@ -459,8 +670,12 @@ class CloudTuneAppRuntime(
                     persistedCredential = parsed.persistedCredential
                 )
                 parsed.persistedCredential?.let { cred ->
-                    withContext(Dispatchers.IO) {
-                        credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                    runCatching {
+                        withContext(ioDispatcher) {
+                            credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                        }
+                    }.onFailure { err ->
+                        statusMessage = "登录凭据保存异常：${err.message}"
                     }
                 }
                 isShowingWebLoginDialog = false
@@ -468,7 +683,7 @@ class CloudTuneAppRuntime(
                 qrContent = null
                 qrBitmap = null
                 activateAccount(storageKey = identity.storageKey, displayName = identity.displayName)
-                browseToSuspend(null, listOf(BreadcrumbItem.ROOT), showBusy = false)
+                browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                 statusMessage = "天翼官方网页一键登录成功"
             } catch (ce: CancellationException) {
                 throw ce
@@ -483,11 +698,12 @@ class CloudTuneAppRuntime(
     }
 
     internal suspend fun activateAccount(storageKey: String, displayName: String) {
-        val loaded = withContext(Dispatchers.IO) {
+        val loaded = withContext(ioDispatcher) {
             val paths = accountStore.paths(storageKey)
             val cm = CacheManager(paths.cacheDir)
             val usage = cm.usageBytes()
-            val savedSettings = accountStore.loadSettings(storageKey)
+            val savedSettings = accountStore.loadSettingsOrNull(storageKey)
+                ?: AccountSettings(appearanceMode = themeMode, dynamicColorEnabled = dynamicColorEnabled)
             val savedTracks = accountStore.loadLibrary(storageKey)
             transferEngine.restorePersistedDownloads(storageKey, paths.stagingDir, paths.transfersFile)
             val snap = transferEngine.snapshot()
@@ -499,12 +715,15 @@ class CloudTuneAppRuntime(
         cacheManager = loaded.cacheManager
         cacheUsageBytes = loaded.usageBytes
         committedSettings = loaded.settings
+        themeMode = loaded.settings.appearanceMode
+        dynamicColorEnabled = loaded.settings.dynamicColorEnabled
+        mirrorThemePrefs(themeMode, dynamicColorEnabled)
         syncDraftsFromCommitted()
         tracks = loaded.tracks
+        shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(loaded.tracks, currentTrackId)
         transferSnapshot = loaded.snapshot
-        if (enableLiveLoops) {
-            startTransferPolling()
-        }
+        syncQueueAvailabilityToBridge()
+        handleTransferActivityChange(loaded.snapshot, loaded.snapshot.hasActiveItems)
     }
 
     private data class LoadedAccountState(
@@ -516,14 +735,24 @@ class CloudTuneAppRuntime(
     )
 
     fun logout() {
+        synchronized(bootstrapLock) {
+            bootstrapDeferred?.cancel()
+            bootstrapDeferred = null
+        }
         qrPollJob?.cancel()
-        transferPollJob?.cancel()
+        qrPollJob = null
+        transferRefreshJob?.cancel()
+        transferRefreshJob = null
+        uiProgressClockJob?.cancel()
+        uiProgressClockJob = null
+        scheduledPrefetchJob?.cancel()
+        scheduledPrefetchJob = null
         playbackGeneration += 1
         recoveryAttempts = 0
         pendingMediaItem = null
         prefetchedTrackId = null
         prefetchingTrackId = null
-        plannedShuffleNextTrackId = null
+        closeVideoPlayer()
         mediaController?.stop()
         mediaController?.clearMediaItems()
         activeAccountKey?.let { key ->
@@ -531,8 +760,13 @@ class CloudTuneAppRuntime(
             transferEngine.cancelAll(key)
         }
         cloudClient.clearSessionImmediate()
-        scope.launch(Dispatchers.IO) {
-            credentialStore?.clearCredential()
+        cookieCleanupDeferred = scope.async {
+            runCatching {
+                withContext(ioDispatcher) { credentialStore?.clearCredential() }
+            }
+            if (hasAndroidContext) {
+                clearWebViewCookiesAndFlush()
+            }
         }
 
         isAuthenticated = false
@@ -540,29 +774,76 @@ class CloudTuneAppRuntime(
         accountStorageKey = null
         cacheManager = null
         cacheUsageBytes = 0L
-        browser = null
+        cloudBrowser = BrowserPaneState()
+        videoBrowser = BrowserPaneState()
         tracks = emptyList()
-        breadcrumbs = listOf(BreadcrumbItem.ROOT)
+        upNextQueue = emptyList()
+        shuffleOrderIds = emptyList()
+        activeTrack = null
         currentTrackId = null
         nowPlayingTitle = null
         nowPlayingArtist = null
+        nowPlayingAlbum = null
+        nowPlayingArtwork = null
         isPlaying = false
+        loadingTrackId = null
         currentTime = 0.0
         duration = 0.0
+        isShowingNowPlayingSheet = false
+        pendingExternalVideoAction = null
         transferSnapshot = TransferSnapshotPayload()
-        committedSettings = AccountSettings()
+        committedSettings = AccountSettings(
+            appearanceMode = themeMode,
+            dynamicColorEnabled = dynamicColorEnabled
+        )
         syncDraftsFromCommitted()
+        syncQueueAvailabilityToBridge()
         statusMessage = "已退出登录并清理当前会话"
     }
 
-    fun browseTo(folderId: String?, nextCrumbs: List<BreadcrumbItem>, showBusy: Boolean = true) {
-        if (!isAuthenticated) return
-        scope.launch {
-            browseToSuspend(folderId, nextCrumbs, showBusy)
+    private suspend fun clearWebViewCookiesAndFlush() {
+        val cookieMgr = runCatching { CookieManager.getInstance() }.getOrNull() ?: return
+        withTimeoutOrNull(1500L) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                runCatching {
+                    cookieMgr.removeAllCookies {
+                        if (cont.isActive) cont.resume(Unit)
+                    }
+                }.onFailure {
+                    if (cont.isActive) cont.resume(Unit)
+                }
+            }
+        }
+        withContext(Dispatchers.IO) {
+            runCatching { cookieMgr.flush() }
         }
     }
 
+    fun browseTo(folderId: String?, nextCrumbs: List<BreadcrumbItem>, showBusy: Boolean = true) {
+        browseTo(BrowserScope.CLOUD, folderId, nextCrumbs, showBusy)
+    }
+
+    fun browseTo(
+        scopeTarget: BrowserScope,
+        folderId: String?,
+        nextCrumbs: List<BreadcrumbItem>,
+        showBusy: Boolean = true
+    ) {
+        if (!isAuthenticated) return
+        scope.launch {
+            browseToSuspend(scopeTarget, folderId, nextCrumbs, showBusy)
+        }
+    }
+
+    fun navigateBackInBrowser(scopeTarget: BrowserScope) {
+        val crumbs = if (scopeTarget == BrowserScope.CLOUD) cloudBrowser.breadcrumbs else videoBrowser.breadcrumbs
+        if (crumbs.size <= 1) return
+        val nextCrumbs = crumbs.dropLast(1)
+        browseTo(scopeTarget, nextCrumbs.lastOrNull()?.id, nextCrumbs)
+    }
+
     private suspend fun browseToSuspend(
+        scopeTarget: BrowserScope,
         folderId: String?,
         nextCrumbs: List<BreadcrumbItem>,
         showBusy: Boolean
@@ -582,12 +863,26 @@ class CloudTuneAppRuntime(
             nonRootCrumbs.map { it.name }.filter { it.isNotEmpty() }.joinToString("/").takeIf { it.isNotEmpty() }
         }
         try {
-            browser = cloudClient.listRemoteFolder(
+            val listing = cloudClient.listRemoteFolder(
                 folderId = folderId,
                 folderName = resolvedName,
                 folderPath = resolvedPath
             )
-            breadcrumbs = nextCrumbs
+            val nextPane = BrowserPaneState(breadcrumbs = nextCrumbs, payload = listing)
+            when (scopeTarget) {
+                BrowserScope.CLOUD -> {
+                    cloudBrowser = nextPane
+                    if (isRoot && videoBrowser.payload == null) {
+                        videoBrowser = nextPane
+                    }
+                }
+                BrowserScope.VIDEO -> {
+                    videoBrowser = nextPane
+                    if (isRoot && cloudBrowser.payload == null) {
+                        cloudBrowser = nextPane
+                    }
+                }
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
@@ -597,27 +892,29 @@ class CloudTuneAppRuntime(
         }
     }
 
-    fun setCurrentFolderAsMusicLibrary() {
-        val b = browser ?: return
-        val crumb = breadcrumbs.lastOrNull() ?: return
-        val acct = activeAccountKey ?: return
+    fun setCurrentFolderAsMusicLibrary(pane: BrowserPaneState = cloudBrowser) {
+        val b = pane.payload ?: return
+        val crumb = pane.breadcrumbs.lastOrNull() ?: return
         val displayName = if (crumb.id == b.currentFolderId || (b.isRoot && crumb.id == null)) {
             crumb.name
         } else {
             b.currentFolderName
         }
-        val next = committedSettings.copy(musicFolder = FolderSelection(b.currentFolderId, displayName))
-        committedSettings = next
-        scope.launch(Dispatchers.IO) {
-            accountStore.saveSettings(acct, next)
+        scope.launch {
+            val ok = mutateAccountSettings(
+                successMessage = "音乐目录已设置为 $displayName"
+            ) { prev ->
+                prev.copy(musicFolder = FolderSelection(b.currentFolderId, displayName))
+            }
+            if (ok) {
+                scanMusicLibrary()
+            }
         }
-        statusMessage = "音乐目录已设置为 $displayName"
-        scanMusicLibrary()
     }
 
     fun scanMusicLibrary() {
         val folder = committedSettings.musicFolder ?: run {
-            statusMessage = "请先选择音乐目录"
+            statusMessage = "请先在云盘目录中设为音乐库"
             return
         }
         val acct = activeAccountKey ?: return
@@ -626,10 +923,20 @@ class CloudTuneAppRuntime(
             try {
                 val scanned = cloudClient.scanMusicLibrary(folder.id, folder.name)
                 tracks = scanned
-                withContext(Dispatchers.IO) {
-                    accountStore.saveLibrary(acct, scanned)
+                if (shuffle) {
+                    shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(scanned, currentTrackId)
                 }
-                statusMessage = "已载入 ${scanned.size} 首音乐"
+                syncQueueAvailabilityToBridge()
+                val persistedOk = runCatching {
+                    withContext(ioDispatcher) {
+                        accountStore.saveLibrary(acct, scanned)
+                    }
+                }.isSuccess
+                statusMessage = if (persistedOk) {
+                    "已载入 ${scanned.size} 首音乐"
+                } else {
+                    "已载入 ${scanned.size} 首音乐（本地索引保存失败）"
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
@@ -640,6 +947,50 @@ class CloudTuneAppRuntime(
         }
     }
 
+    fun playNext(track: TrackSummary) {
+        upNextQueue = PlaybackQueueResolver.insertPlayNext(upNextQueue, track)
+        prefetchedTrackId = null
+        syncQueueAvailabilityToBridge()
+        statusMessage = "已设为下一首播放：《${track.name}》"
+        scheduleUpcomingPrefetch()
+    }
+
+    fun appendToQueue(track: TrackSummary) {
+        upNextQueue = PlaybackQueueResolver.appendToQueue(upNextQueue, track)
+        syncQueueAvailabilityToBridge()
+        statusMessage = "已加入待播队列：《${track.name}》"
+    }
+
+    fun removeFromQueue(trackId: String) {
+        upNextQueue = PlaybackQueueResolver.removeFromQueue(upNextQueue, trackId)
+        syncQueueAvailabilityToBridge()
+    }
+
+    fun clearUpNextQueue() {
+        upNextQueue = emptyList()
+        syncQueueAvailabilityToBridge()
+    }
+
+    fun toggleShuffle() {
+        shuffle = !shuffle
+        if (shuffle) {
+            shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks, currentTrackId)
+        }
+        prefetchedTrackId = null
+        syncQueueAvailabilityToBridge()
+        scheduleUpcomingPrefetch()
+    }
+
+    fun cycleLoopMode() {
+        loopMode = when (loopMode) {
+            LoopMode.OFF -> LoopMode.ALL
+            LoopMode.ALL -> LoopMode.ONE
+            LoopMode.ONE -> LoopMode.OFF
+        }
+        syncQueueAvailabilityToBridge()
+        scheduleUpcomingPrefetch()
+    }
+
     fun playTrack(
         track: TrackSummary,
         modeOverride: PlaybackMode? = null,
@@ -647,28 +998,41 @@ class CloudTuneAppRuntime(
         isRecoveryRetry: Boolean = false
     ) {
         val acctKey = activeAccountKey ?: return
-        val artistFallback = accountName ?: "CloudTune"
         val cm = cacheManager ?: return
+        closeVideoPlayer()
         playbackGeneration += 1
         val gen = playbackGeneration
+        activeTrack = track
+        currentTrackId = track.id
         prefetchedTrackId = null
         prefetchingTrackId = null
-        plannedShuffleNextTrackId = null
+        scheduledPrefetchJob?.cancel()
+        if (shuffle && track.id !in shuffleOrderIds && tracks.any { it.id == track.id }) {
+            shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks, track.id)
+        }
+        syncQueueAvailabilityToBridge()
         if (!isRecoveryRetry) {
             recoveryAttempts = 0
         }
         val accountHash = Cloud189Protocol.accountBucketHash(acctKey)
+        val fallbackAlbum = track.folderPath.ifBlank { committedSettings.musicFolder?.name ?: "CloudTune" }
+
         scope.launch {
             loadingTrackId = track.id
             val effectiveMode = modeOverride ?: committedSettings.playbackMode
             try {
-                val cached = withContext(Dispatchers.IO) {
+                val cached = withContext(ioDispatcher) {
                     cm.setProtectedTrackIds(setOf(track.id))
                     cm.existingCachedFile(track.id)
                 }
                 if (cached != null) {
-                    val (usage, meta) = withContext(Dispatchers.IO) {
-                        cm.usageBytes() to AudioMetadataHelper.extract(cached, track.name, artistFallback, track.folderPath)
+                    val (usage, meta) = withContext(ioDispatcher) {
+                        cm.usageBytes() to AudioMetadataHelper.extract(
+                            localFile = cached,
+                            fallbackTitle = track.name,
+                            fallbackArtist = null,
+                            fallbackAlbum = fallbackAlbum
+                        )
                     }
                     if (gen != playbackGeneration || !isAuthenticated) return@launch
                     cacheUsageBytes = usage
@@ -691,8 +1055,13 @@ class CloudTuneAppRuntime(
                         accountHash = accountHash
                     )
                     if (gen != playbackGeneration || !isAuthenticated) return@launch
-                    val (usage, meta) = withContext(Dispatchers.IO) {
-                        cm.usageBytes() to AudioMetadataHelper.extract(file, track.name, artistFallback, track.folderPath)
+                    val (usage, meta) = withContext(ioDispatcher) {
+                        cm.usageBytes() to AudioMetadataHelper.extract(
+                            localFile = file,
+                            fallbackTitle = track.name,
+                            fallbackArtist = null,
+                            fallbackAlbum = fallbackAlbum
+                        )
                     }
                     if (gen != playbackGeneration || !isAuthenticated) return@launch
                     cacheUsageBytes = usage
@@ -701,7 +1070,7 @@ class CloudTuneAppRuntime(
                 } else {
                     val remoteUrl = cloudClient.resolveDownloadUrl(track.id)
                     if (gen != playbackGeneration || !isAuthenticated) return@launch
-                    val dest = withContext(Dispatchers.IO) { cm.cacheFile(track.id, track.name) }
+                    val dest = withContext(ioDispatcher) { cm.cacheFile(track.id, track.name) }
                     val playUrl = streamServer?.registerSource(
                         StreamSourceRegistration(
                             accountHash = accountHash,
@@ -730,6 +1099,30 @@ class CloudTuneAppRuntime(
         }
     }
 
+    private fun decodeArtworkBitmap(bytes: ByteArray?): Bitmap? {
+        if (bytes == null || bytes.isEmpty()) return null
+        return runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
+    }
+
+    private fun buildMediaMetadata(
+        track: TrackSummary,
+        title: String,
+        artist: String?,
+        album: String,
+        artworkBytes: ByteArray?
+    ): MediaMetadata {
+        val builder = MediaMetadata.Builder()
+            .setTitle(title)
+            .setAlbumTitle(album.ifBlank { track.folderPath })
+        if (!artist.isNullOrBlank()) {
+            builder.setArtist(artist)
+        }
+        if (artworkBytes != null && artworkBytes.isNotEmpty()) {
+            builder.setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        }
+        return builder.build()
+    }
+
     private fun startControllerPlayback(
         track: TrackSummary,
         uriString: String,
@@ -737,23 +1130,31 @@ class CloudTuneAppRuntime(
         metadata: ExtractedAudioMetadata?
     ) {
         currentPlaybackIsLoopback = isLoopback
+        activeTrack = track
         currentTrackId = track.id
         lastPreparedPlaybackUrl = uriString
-        nowPlayingTitle = metadata?.title ?: track.name
-        nowPlayingArtist = metadata?.artist ?: (accountName ?: "CloudTune")
+        val resolvedTitle = metadata?.title ?: track.name
+        val resolvedArtist = metadata?.artist
+        val resolvedAlbum = metadata?.album ?: track.folderPath.ifBlank { committedSettings.musicFolder?.name ?: "CloudTune" }
+        nowPlayingTitle = resolvedTitle
+        nowPlayingArtist = resolvedArtist
+        nowPlayingAlbum = resolvedAlbum
+        nowPlayingArtwork = decodeArtworkBitmap(metadata?.artworkBytes)
+        currentTime = 0.0
+
         val controller = mediaController
         if (controller != null || hasAndroidContext) {
-            val metaBuilder = MediaMetadata.Builder()
-                .setTitle(nowPlayingTitle)
-                .setArtist(nowPlayingArtist)
-                .setAlbumTitle(metadata?.album ?: track.folderPath)
-            metadata?.artworkBytes?.let { art ->
-                metaBuilder.setArtworkData(art, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-            }
+            val mediaMeta = buildMediaMetadata(
+                track = track,
+                title = resolvedTitle,
+                artist = resolvedArtist,
+                album = resolvedAlbum,
+                artworkBytes = metadata?.artworkBytes
+            )
             val item = MediaItem.Builder()
                 .setMediaId(track.id)
                 .setUri(uriString)
-                .setMediaMetadata(metaBuilder.build())
+                .setMediaMetadata(mediaMeta)
                 .build()
             if (controller != null) {
                 pendingMediaItem = null
@@ -765,7 +1166,56 @@ class CloudTuneAppRuntime(
             }
         }
         isPlaying = true
+        updateUiProgressClock()
+        syncQueueAvailabilityToBridge()
+        scheduleUpcomingPrefetch()
         statusMessage = if (isLoopback) "边播边缓存《${track.name}》" else "正在播放《${track.name}》"
+    }
+
+    internal suspend fun handleWriteThroughCompleted(
+        accountHash: String,
+        trackId: String,
+        localFile: File
+    ) {
+        val acct = activeAccountKey ?: return
+        if (!isAuthenticated || Cloud189Protocol.accountBucketHash(acct) != accountHash) return
+        cacheManager?.let { cm ->
+            cacheUsageBytes = withContext(ioDispatcher) { cm.usageBytes() }
+        }
+        val track = currentTrack ?: return
+        if (currentTrackId != trackId) return
+        val gen = playbackGeneration
+        val fallbackAlbum = track.folderPath.ifBlank { committedSettings.musicFolder?.name ?: "CloudTune" }
+        val (enriched, bmp) = withContext(ioDispatcher) {
+            val m = AudioMetadataHelper.extract(
+                localFile = localFile,
+                fallbackTitle = track.name,
+                fallbackArtist = null,
+                fallbackAlbum = fallbackAlbum
+            )
+            m to decodeArtworkBitmap(m.artworkBytes)
+        }
+        if (!isAuthenticated || gen != playbackGeneration || currentTrackId != trackId) return
+        nowPlayingTitle = enriched.title
+        nowPlayingArtist = enriched.artist
+        nowPlayingAlbum = enriched.album
+        nowPlayingArtwork = bmp
+        mediaController?.let { mc ->
+            if (mc.currentMediaItem?.mediaId == trackId && mc.currentMediaItem != null) {
+                val updatedItem = mc.currentMediaItem!!.buildUpon()
+                    .setMediaMetadata(
+                        buildMediaMetadata(
+                            track = track,
+                            title = enriched.title,
+                            artist = enriched.artist,
+                            album = enriched.album,
+                            artworkBytes = enriched.artworkBytes
+                        )
+                    )
+                    .build()
+                runCatching { mc.replaceMediaItem(mc.currentMediaItemIndex, updatedItem) }
+            }
+        }
     }
 
     fun handlePlaybackError(
@@ -814,14 +1264,17 @@ class CloudTuneAppRuntime(
             }
             is PlaybackFailureAction.StopImmediatelyUnsupportedCodec -> {
                 isPlaying = false
+                updateUiProgressClock()
                 statusMessage = action.userMessage
             }
             PlaybackFailureAction.StopAfterMaxRetries -> {
                 isPlaying = false
+                updateUiProgressClock()
                 statusMessage = "播放异常，已停止自动重试《${track.name}》"
             }
             is PlaybackFailureAction.RetryTransientAfterDelay -> {
                 isPlaying = false
+                updateUiProgressClock()
                 if (!isAuthenticated || playbackGeneration != failedGeneration) return
                 statusMessage = "播放波动，正在重试《${track.name}》(${action.attempt}/${PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS})"
                 val delayMs = maxOf(0L, retryBaseDelayMs) * action.attempt
@@ -840,13 +1293,14 @@ class CloudTuneAppRuntime(
 
     fun togglePlayback() {
         val curr = currentTrack ?: run {
-            val candidate = if (shuffle) tracks.randomOrNull() else tracks.firstOrNull()
-            candidate?.let { playTrack(it) }
+            val candidate = if (shuffle) tracks.randomOrNull() else visibleTracks.firstOrNull()
+            (candidate ?: tracks.firstOrNull())?.let { playTrack(it) }
             return
         }
         val controller = mediaController
         if (controller == null) {
             isPlaying = !isPlaying
+            updateUiProgressClock()
             return
         }
         if (controller.isPlaying) {
@@ -856,49 +1310,90 @@ class CloudTuneAppRuntime(
             if (controller.mediaItemCount == 0) playTrack(curr) else controller.play()
             isPlaying = true
         }
+        updateUiProgressClock()
+        scheduleUpcomingPrefetch()
     }
 
-    fun playAdjacent(direction: Int) {
-        if (tracks.isEmpty()) return
-        if (shuffle && tracks.size > 1) {
-            if (direction > 0) {
-                val preselectedId = prefetchedTrackId ?: plannedShuffleNextTrackId
-                val preselected = preselectedId
-                    ?.takeIf { it != currentTrackId }
-                    ?.let { id -> tracks.firstOrNull { it.id == id } }
-                if (preselected != null) {
-                    playTrack(preselected)
-                    return
-                }
-            }
-            val pool = tracks.filter { it.id != currentTrackId }
-            pool.randomOrNull()?.let { playTrack(it) }
-            return
+    fun playAdjacent(direction: Int, autoAdvanceAtEnd: Boolean = false) {
+        val step = if (direction >= 0) {
+            PlaybackQueueResolver.resolveNext(
+                currentTrack = currentTrack,
+                libraryTracks = tracks,
+                upNextQueue = upNextQueue,
+                shuffle = shuffle,
+                shuffleOrderIds = shuffleOrderIds,
+                loopMode = loopMode,
+                autoAdvanceAtEnd = autoAdvanceAtEnd
+            )
+        } else {
+            PlaybackQueueResolver.resolvePrevious(
+                currentTrack = currentTrack,
+                libraryTracks = tracks,
+                upNextQueue = upNextQueue,
+                shuffle = shuffle,
+                shuffleOrderIds = shuffleOrderIds,
+                loopMode = loopMode
+            )
         }
-        val idx = tracks.indexOfFirst { it.id == currentTrackId }
-        val nextIdx = idx + direction
-        if (nextIdx in tracks.indices) {
-            playTrack(tracks[nextIdx])
-        } else if (loopMode == LoopMode.ALL) {
-            playTrack(if (direction > 0) tracks.first() else tracks.last())
+        upNextQueue = step.remainingUpNext
+        syncQueueAvailabilityToBridge()
+        if (step.track != null) {
+            playTrack(step.track)
+        } else if (autoAdvanceAtEnd) {
+            isPlaying = false
+            updateUiProgressClock()
         }
     }
 
     fun seekTo(seconds: Double) {
-        currentTime = seconds.coerceAtLeast(0.0)
-        mediaController?.seekTo((currentTime * 1000.0).toLong())
+        val clamped = if (duration > 0.0) seconds.coerceIn(0.0, duration) else seconds.coerceAtLeast(0.0)
+        currentTime = clamped
+        mediaController?.seekTo((clamped * 1000.0).toLong())
+        scheduleUpcomingPrefetch()
     }
+
+    // MARK: - Lifecycle-Safe In-App Video ExoPlayer & Safe External Handoff
 
     fun openVideoInApp(video: TrackSummary) {
         playbackGeneration += 1
         recoveryAttempts = 0
+        scheduledPrefetchJob?.cancel()
         mediaController?.pause()
         isPlaying = false
+        updateUiProgressClock()
+
         scope.launch {
-            busyLabel = "获取视频地址..."
+            busyLabel = "准备视频播放 ${video.name}..."
             try {
+                val cm = cacheManager
+                val acct = activeAccountKey
+                val cached = withContext(ioDispatcher) { cm?.existingCachedFile(video.id) }
+                val resolvedPlayUrl = if (cached != null) {
+                    Uri.fromFile(cached)?.toString() ?: cached.toURI().toString()
+                } else {
+                    val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
+                    if (streamServer != null && cm != null && acct != null) {
+                        val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
+                        streamServer.registerSource(
+                            StreamSourceRegistration(
+                                accountHash = Cloud189Protocol.accountBucketHash(acct),
+                                trackId = video.id,
+                                remoteUrl = remoteUrl,
+                                cacheDestination = dest,
+                                expectedSize = video.sizeBytes,
+                                fileName = video.name,
+                                cacheLimitBytes = committedSettings.cacheLimitBytes
+                            ),
+                            cacheManager = cm
+                        )
+                    } else {
+                        remoteUrl
+                    }
+                }
+                activeVideoTrack = video
                 activeVideoTitle = video.name
-                activeVideoUrl = cloudClient.resolveDownloadUrl(video.id)
+                activeVideoUrl = resolvedPlayUrl
+                prepareRuntimeVideoPlayer(resolvedPlayUrl)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
@@ -909,12 +1404,52 @@ class CloudTuneAppRuntime(
         }
     }
 
+    private fun prepareRuntimeVideoPlayer(playUrl: String) {
+        val ctx = appCtx ?: return
+        val player = videoPlayer ?: run {
+            val videoAttrs = AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build()
+            ExoPlayer.Builder(ctx)
+                .setAudioAttributes(videoAttrs, true)
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+                .also { created ->
+                    created.addListener(object : Player.Listener {
+                        override fun onIsPlayingChanged(playing: Boolean) {
+                            isVideoPlaying = playing
+                        }
+                    })
+                    videoPlayer = created
+                }
+        }
+        player.setMediaItem(MediaItem.fromUri(playUrl))
+        player.prepare()
+        player.playWhenReady = true
+        isVideoPlaying = true
+    }
+
+    fun closeVideoPlayer() {
+        isVideoPlaying = false
+        activeVideoUrl = null
+        activeVideoTitle = null
+        activeVideoTrack = null
+        videoPlayer?.let { p ->
+            runCatching {
+                p.stop()
+                p.release()
+            }
+        }
+        videoPlayer = null
+    }
+
     fun saveQrToGallery(context: Context) {
         val bmp = qrBitmap ?: return
-        val appCtx = context.applicationContext
+        val targetCtx = context.applicationContext
         scope.launch {
-            val ok = withContext(Dispatchers.IO) {
-                QrCodeHelper.saveQrBitmapToGallery(appCtx, bmp)
+            val ok = withContext(ioDispatcher) {
+                QrCodeHelper.saveQrBitmapToGallery(targetCtx, bmp)
             }
             statusMessage = if (ok) "二维码已保存到系统相册" else "保存二维码失败"
         }
@@ -923,59 +1458,113 @@ class CloudTuneAppRuntime(
     fun openVideoExternally(context: Context, video: TrackSummary) {
         scope.launch {
             try {
-                val cached = withContext(Dispatchers.IO) { cacheManager?.existingCachedFile(video.id) }
-                val uri = if (cached != null) {
-                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", cached)
-                } else {
-                    Uri.parse(cloudClient.resolveDownloadUrl(video.id))
+                val cached = withContext(ioDispatcher) { cacheManager?.existingCachedFile(video.id) }
+                if (cached != null) {
+                    launchFileProviderVideoIntent(context, cached, video.name)
+                    return@launch
                 }
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, PlaybackDecisionPolicy.guessMimeType(video.name))
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(Intent.createChooser(intent, "选择外部播放器"))
+                val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
+                val cm = cacheManager
+                val acct = activeAccountKey
+                val loopbackUrl = if (streamServer != null && cm != null && acct != null) {
+                    val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
+                    streamServer.registerSource(
+                        StreamSourceRegistration(
+                            accountHash = Cloud189Protocol.accountBucketHash(acct),
+                            trackId = video.id,
+                            remoteUrl = remoteUrl,
+                            cacheDestination = dest,
+                            expectedSize = video.sizeBytes,
+                            fileName = video.name,
+                            cacheLimitBytes = committedSettings.cacheLimitBytes
+                        ),
+                        cacheManager = cm
+                    )
+                } else remoteUrl
+                pendingExternalVideoAction = PendingExternalVideoAction(video, loopbackUrl)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = "无法唤起外部播放器：${e.message}"
+                statusMessage = "准备外部播放失败：${e.message}"
             }
         }
     }
 
-    fun onSafTreeSelected(context: Context, treeUri: Uri) {
+    fun downloadVideoAndOpenExternally(context: Context, video: TrackSummary) {
+        val cm = cacheManager ?: return
         val acct = activeAccountKey ?: return
-        val appCtx = context.applicationContext
-        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-        runCatching { appCtx.contentResolver.takePersistableUriPermission(treeUri, flags) }
-        val initialName = treeUri.lastPathSegment ?: "已选文件夹"
-        val immediate = committedSettings.copy(
-            exportTreeUri = treeUri.toString(),
-            exportFolderDisplayName = initialName
-        )
-        committedSettings = immediate
-        statusMessage = "导出目录已设为 $initialName"
+        pendingExternalVideoAction = null
+        val appContextRef = context.applicationContext
         scope.launch {
-            val resolvedName = withContext(Dispatchers.IO) {
-                runCatching { SafExporter.persistTreePermission(appCtx, treeUri) }.getOrDefault(initialName)
+            busyLabel = "正在缓存视频《${video.name}》..."
+            try {
+                val localFile = transferEngine.downloadTrackToCache(
+                    track = video,
+                    cacheManager = cm,
+                    parallelThreads = committedSettings.downloadThreads,
+                    cacheLimitBytes = maxOf(committedSettings.cacheLimitBytes, video.sizeBytes),
+                    kind = "playback",
+                    accountHash = Cloud189Protocol.accountBucketHash(acct)
+                )
+                cacheUsageBytes = withContext(ioDispatcher) { cm.usageBytes() }
+                launchFileProviderVideoIntent(appContextRef, localFile, video.name)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                statusMessage = "缓存视频失败：${e.message}"
+            } finally {
+                busyLabel = null
             }
-            val updated = committedSettings.copy(
-                exportTreeUri = treeUri.toString(),
-                exportFolderDisplayName = resolvedName
-            )
-            committedSettings = updated
-            statusMessage = "导出目录已设为 $resolvedName"
-            withContext(Dispatchers.IO) {
-                accountStore.saveSettings(acct, updated)
+        }
+    }
+
+    fun launchLoopbackStreamInVideoApp(context: Context, action: PendingExternalVideoAction) {
+        pendingExternalVideoAction = null
+        val mime = PlaybackDecisionPolicy.guessMimeType(action.video.name)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(Uri.parse(action.streamUrl), mime)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching {
+            context.startActivity(Intent.createChooser(intent, "选择本地视频播放器"))
+        }.onFailure { err ->
+            statusMessage = "未能唤起外部视频播放器：${err.message}"
+        }
+    }
+
+    private fun launchFileProviderVideoIntent(context: Context, localFile: File, fileName: String) {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", localFile)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, PlaybackDecisionPolicy.guessMimeType(fileName))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(Intent.createChooser(intent, "选择本地视频播放器"))
+    }
+
+    fun onSafTreeSelected(context: Context, treeUri: Uri) {
+        val appContextRef = context.applicationContext
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { appContextRef.contentResolver.takePersistableUriPermission(treeUri, flags) }
+        val fallbackName = treeUri.lastPathSegment ?: "已选文件夹"
+        scope.launch {
+            val resolvedName = withContext(ioDispatcher) {
+                runCatching { SafExporter.persistTreePermission(appContextRef, treeUri) }.getOrDefault(fallbackName)
+            }
+            mutateAccountSettings(successMessage = "导出目录已设为 $resolvedName") { prev ->
+                prev.copy(
+                    exportTreeUri = treeUri.toString(),
+                    exportFolderDisplayName = resolvedName
+                )
             }
         }
     }
 
     fun enqueueDownload(context: Context, track: TrackSummary) {
-        val appCtx = context.applicationContext
+        val appContextRef = context.applicationContext
         val acct = activeAccountKey ?: return
         val threads = committedSettings.downloadThreads
         scope.launch {
-            val (taskId, snap) = withContext(Dispatchers.IO) {
+            val (taskId, snap) = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
                 val id = transferEngine.enqueueExportDownload(
                     accountId = acct,
@@ -986,7 +1575,7 @@ class CloudTuneAppRuntime(
                     manifestsFile = paths.transfersFile
                 ) { staged, rel, _ ->
                     SafExporter.exportToSafTree(
-                        context = appCtx,
+                        context = appContextRef,
                         treeUriString = committedSettings.exportTreeUri,
                         stagedFile = staged,
                         relativeSubpath = rel,
@@ -1000,11 +1589,11 @@ class CloudTuneAppRuntime(
         }
     }
 
-    fun enqueueCurrentFolderDownload(context: Context) {
-        val appCtx = context.applicationContext
-        enqueueCurrentFolderDownloadWithExporter { staged, subpath, _ ->
+    fun enqueueCurrentFolderDownload(context: Context, pane: BrowserPaneState = cloudBrowser) {
+        val appContextRef = context.applicationContext
+        enqueueCurrentFolderDownloadWithExporter(pane) { staged, subpath, _ ->
             SafExporter.exportToSafTree(
-                context = appCtx,
+                context = appContextRef,
                 treeUriString = committedSettings.exportTreeUri,
                 stagedFile = staged,
                 relativeSubpath = subpath,
@@ -1013,10 +1602,13 @@ class CloudTuneAppRuntime(
         }
     }
 
-    internal fun enqueueCurrentFolderDownloadWithExporter(exporter: StagedFileExporter) {
-        val b = browser ?: return
+    internal fun enqueueCurrentFolderDownloadWithExporter(
+        pane: BrowserPaneState = cloudBrowser,
+        exporter: StagedFileExporter
+    ) {
+        val b = pane.payload ?: return
         val acct = activeAccountKey ?: return
-        val nonRootCrumbs = breadcrumbs.filter { it.id != null && it.id != Cloud189Constants.ROOT_FOLDER_ID }
+        val nonRootCrumbs = pane.breadcrumbs.filter { it.id != null && it.id != Cloud189Constants.ROOT_FOLDER_ID }
         val crumbPath = if (!b.isRoot && nonRootCrumbs.lastOrNull()?.id == b.currentFolderId) {
             nonRootCrumbs.map { it.name }.filter { it.isNotEmpty() }.joinToString("/").takeIf { it.isNotEmpty() }
         } else null
@@ -1026,7 +1618,7 @@ class CloudTuneAppRuntime(
             busyLabel = "扫描文件夹 ${b.currentFolderName}..."
             try {
                 val allFiles = cloudClient.scanAllFiles(b.currentFolderId, rootExportFolder)
-                val snap = withContext(Dispatchers.IO) {
+                val snap = withContext(ioDispatcher) {
                     val paths = accountStore.paths(acct)
                     for (item in allFiles) {
                         val rel = if (item.folderPath.startsWith(rootExportFolder)) {
@@ -1061,7 +1653,7 @@ class CloudTuneAppRuntime(
     fun pauseTransfer(id: String) {
         val acct = activeAccountKey ?: return
         scope.launch {
-            val snap = withContext(Dispatchers.IO) {
+            val snap = withContext(ioDispatcher) {
                 transferEngine.pauseTransfer(id, accountStore.paths(acct).transfersFile)
                 transferEngine.snapshot()
             }
@@ -1070,14 +1662,14 @@ class CloudTuneAppRuntime(
     }
 
     fun resumeTransfer(context: Context, id: String) {
-        val appCtx = context.applicationContext
+        val appContextRef = context.applicationContext
         val acct = activeAccountKey ?: return
         scope.launch {
-            val snap = withContext(Dispatchers.IO) {
+            val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
                 transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _ ->
                     SafExporter.exportToSafTree(
-                        context = appCtx,
+                        context = appContextRef,
                         treeUriString = committedSettings.exportTreeUri,
                         stagedFile = staged,
                         relativeSubpath = rel,
@@ -1093,7 +1685,7 @@ class CloudTuneAppRuntime(
     fun deleteTransfer(id: String) {
         val acct = activeAccountKey ?: return
         scope.launch {
-            val snap = withContext(Dispatchers.IO) {
+            val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
                 transferEngine.deleteTransfer(id, paths.stagingDir, paths.transfersFile)
                 transferEngine.snapshot()
@@ -1102,34 +1694,119 @@ class CloudTuneAppRuntime(
         }
     }
 
-    private fun startTransferPolling() {
-        transferPollJob?.cancel()
-        transferPollJob = scope.launch {
-            while (isActive) {
-                delay(850L)
-                transferSnapshot = transferEngine.snapshot()
-                cacheManager?.let { cm ->
-                    cacheUsageBytes = withContext(Dispatchers.IO) { cm.usageBytes() }
+    // MARK: - Event-Driven Transfer Refresh, Foreground UI Clock & One-Shot Prefetch Scheduler
+
+    private fun handleTransferActivityChange(snapshot: TransferSnapshotPayload, hasActive: Boolean) {
+        transferSnapshot = snapshot
+        if (hasActive && enableLiveLoops && attachedUiCount > 0 && isUiForegroundVisible) {
+            ensureTransferRefreshRunning()
+        } else if (!hasActive) {
+            transferRefreshJob?.cancel()
+            transferRefreshJob = null
+            cacheManager?.let { cm ->
+                scope.launch {
+                    val bytes = withContext(ioDispatcher) { cm.usageBytes() }
+                    if (cm === cacheManager) {
+                        cacheUsageBytes = bytes
+                    }
                 }
-                mediaController?.let { mc ->
-                    if (mc.duration > 0L) duration = mc.duration / 1000.0
-                    currentTime = mc.currentPosition.coerceAtLeast(0L) / 1000.0
-                    isPlaying = mc.isPlaying
-                }
-                maybePrefetchUpcomingTrack()
             }
         }
     }
 
-    private fun maybePrefetchUpcomingTrack() {
+    private fun ensureTransferRefreshRunning() {
+        if (transferRefreshJob?.isActive == true) return
+        transferRefreshJob = scope.launch {
+            while (isActive && attachedUiCount > 0 && isUiForegroundVisible) {
+                delay(400L)
+                val latest = transferEngine.snapshot()
+                transferSnapshot = latest
+                if (!latest.hasActiveItems) {
+                    cacheManager?.let { cm ->
+                        val bytes = withContext(ioDispatcher) { cm.usageBytes() }
+                        if (cm === cacheManager) cacheUsageBytes = bytes
+                    }
+                    break
+                }
+            }
+            transferRefreshJob = null
+        }
+    }
+
+    private fun updateUiProgressClock() {
+        val shouldRun = enableLiveLoops &&
+            attachedUiCount > 0 &&
+            isUiForegroundVisible &&
+            isPlaying &&
+            mediaController != null
+        if (!shouldRun) {
+            uiProgressClockJob?.cancel()
+            uiProgressClockJob = null
+            return
+        }
+        if (uiProgressClockJob?.isActive == true) return
+        uiProgressClockJob = scope.launch {
+            while (isActive && attachedUiCount > 0 && isUiForegroundVisible && isPlaying) {
+                mediaController?.let { mc ->
+                    if (mc.duration > 0L) {
+                        duration = mc.duration / 1000.0
+                    }
+                    if (!isUserScrubbing) {
+                        currentTime = mc.currentPosition.coerceAtLeast(0L) / 1000.0
+                    }
+                }
+                delay(200L)
+            }
+            uiProgressClockJob = null
+        }
+    }
+
+    /**
+     * Zero-polling lockscreen-safe next-track prefetch scheduler:
+     * - `DOWNLOAD_FIRST`: triggers immediately upon playback start.
+     * - `STREAM_CACHE`: schedules a single one-shot timer for `remainingMs - 30_000L` based on `Player` state/seek.
+     */
+    private fun scheduleUpcomingPrefetch() {
+        scheduledPrefetchJob?.cancel()
+        scheduledPrefetchJob = null
+        if (!enableLiveLoops || !isAuthenticated || loopMode == LoopMode.ONE || currentTrack == null) return
+
+        if (committedSettings.playbackMode == PlaybackMode.DOWNLOAD_FIRST) {
+            triggerUpcomingPrefetchNow()
+            return
+        }
+
+        val mc = mediaController
+        val durMs = mc?.duration?.takeIf { it > 0L } ?: (duration * 1000.0).toLong()
+        val posMs = mc?.currentPosition?.coerceAtLeast(0L) ?: (currentTime * 1000.0).toLong()
+        if (durMs <= 0L) return
+
+        val remainingMs = (durMs - posMs).coerceAtLeast(0L)
+        if (remainingMs <= 30_000L) {
+            triggerUpcomingPrefetchNow()
+        } else if (isPlaying) {
+            val waitMs = remainingMs - 30_000L
+            val gen = playbackGeneration
+            scheduledPrefetchJob = scope.launch {
+                delay(waitMs)
+                if (isActive && isAuthenticated && isPlaying && gen == playbackGeneration) {
+                    triggerUpcomingPrefetchNow()
+                }
+            }
+        }
+    }
+
+    private fun triggerUpcomingPrefetchNow() {
         val cm = cacheManager ?: return
         if (!isAuthenticated || loopMode == LoopMode.ONE || currentTrack == null) return
-        val remaining = duration - currentTime
-        val shouldPrefetch = committedSettings.playbackMode == PlaybackMode.DOWNLOAD_FIRST ||
-            (remaining.isFinite() && remaining > 0.0 && remaining <= 30.0)
-        if (!shouldPrefetch) return
-
-        val next = pickPrefetchCandidate() ?: return
+        val next = PlaybackQueueResolver.peekPrefetchCandidate(
+            currentTrack = currentTrack,
+            libraryTracks = tracks,
+            upNextQueue = upNextQueue,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            loopMode = loopMode
+        ) ?: return
         if (next.id == prefetchedTrackId || next.id == prefetchingTrackId) return
 
         prefetchingTrackId = next.id
@@ -1137,7 +1814,7 @@ class CloudTuneAppRuntime(
         val accountHash = activeAccountKey?.let { Cloud189Protocol.accountBucketHash(it) }
         scope.launch {
             try {
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     cm.setProtectedTrackIds(setOf(activeId, next.id))
                 }
                 transferEngine.downloadTrackToCache(
@@ -1161,23 +1838,6 @@ class CloudTuneAppRuntime(
         }
     }
 
-    private fun pickPrefetchCandidate(): TrackSummary? {
-        if (tracks.isEmpty()) return null
-        if (shuffle) {
-            val existingPlanned = plannedShuffleNextTrackId
-                ?.takeIf { it != currentTrackId }
-                ?.let { id -> tracks.firstOrNull { it.id == id } }
-            if (existingPlanned != null) return existingPlanned
-            val picked = tracks.filter { it.id != currentTrackId }.randomOrNull() ?: tracks.firstOrNull()
-            plannedShuffleNextTrackId = picked?.id
-            return picked
-        }
-        val idx = tracks.indexOfFirst { it.id == currentTrackId }
-        if (idx < 0) return tracks.firstOrNull()
-        val next = idx + 1
-        return if (next in tracks.indices) tracks[next] else if (loopMode == LoopMode.ALL) tracks.firstOrNull() else null
-    }
-
     private fun connectMediaController(context: Context) {
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
         val future = MediaController.Builder(context, token).buildAsync()
@@ -1188,21 +1848,31 @@ class CloudTuneAppRuntime(
                 controller.addListener(object : Player.Listener {
                     override fun onIsPlayingChanged(playing: Boolean) {
                         isPlaying = playing
-                        if (playing && enableLiveLoops && isAuthenticated && (transferPollJob == null || transferPollJob?.isActive != true)) {
-                            startTransferPolling()
-                        }
+                        updateUiProgressClock()
+                        scheduleUpcomingPrefetch()
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
                             recoveryAttempts = 0
-                        } else if (playbackState == Player.STATE_ENDED) {
-                            if (loopMode == LoopMode.ONE) {
-                                currentTrack?.let { playTrack(it) }
-                            } else {
-                                playAdjacent(1)
+                            if (controller.duration > 0L) {
+                                duration = controller.duration / 1000.0
                             }
+                            scheduleUpcomingPrefetch()
+                        } else if (playbackState == Player.STATE_ENDED) {
+                            playAdjacent(1, autoAdvanceAtEnd = true)
                         }
+                    }
+
+                    override fun onPositionDiscontinuity(
+                        oldPosition: Player.PositionInfo,
+                        newPosition: Player.PositionInfo,
+                        reason: Int
+                    ) {
+                        if (!isUserScrubbing) {
+                            currentTime = newPosition.positionMs.coerceAtLeast(0L) / 1000.0
+                        }
+                        scheduleUpcomingPrefetch()
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
@@ -1241,11 +1911,16 @@ class CloudTuneAppRuntime(
                         controller.play()
                     }
                 }
+                updateUiProgressClock()
             }
         }, context.mainExecutor)
     }
 
     companion object {
+        private const val PREFS_NAME = "cloudtune_ui_prefs"
+        private const val KEY_APPEARANCE_MODE = "appearance_mode"
+        private const val KEY_DYNAMIC_COLOR = "dynamic_color_enabled"
+
         private val instanceLock = Any()
         @Volatile private var sharedInstance: CloudTuneAppRuntime? = null
 
@@ -1288,166 +1963,43 @@ class CloudTuneViewModel(
         runtime.onUiAttached()
     }
 
-    val cloudClient: Cloud189Client get() = runtime.cloudClient
-    val accountStore: AccountStore get() = runtime.accountStore
-    val limiter: GlobalTransferLimiter get() = runtime.limiter
-    val transferEngine: TransferEngine get() = runtime.transferEngine
-
-    var themeMode: AppThemeMode
+    // Minimal lifecycle & contract entrypoints; Compose UI binds directly to `viewModel.runtime`.
+    var themeMode: AppearanceMode
         get() = runtime.themeMode
         set(value) { runtime.themeMode = value }
-
     var activeModule: ModuleTab
         get() = runtime.activeModule
         set(value) { runtime.activeModule = value }
-
-    var isBootstrapping: Boolean
-        get() = runtime.isBootstrapping
-        set(value) { runtime.isBootstrapping = value }
-
-    var busyLabel: String?
-        get() = runtime.busyLabel
-        set(value) { runtime.busyLabel = value }
-
-    var statusMessage: String?
-        get() = runtime.statusMessage
-        set(value) { runtime.statusMessage = value }
-
     var isAuthenticated: Boolean
         get() = runtime.isAuthenticated
         set(value) { runtime.isAuthenticated = value }
-
-    var accountName: String?
-        get() = runtime.accountName
-        set(value) { runtime.accountName = value }
-
-    val accountStorageKey: String?
-        get() = runtime.accountStorageKey
-
-    val committedSettings: AccountSettings
-        get() = runtime.committedSettings
-
+    val accountName: String? get() = runtime.accountName
+    val accountStorageKey: String? get() = runtime.accountStorageKey
+    val committedSettings: AccountSettings get() = runtime.committedSettings
     var cacheLimitDraft: String
         get() = runtime.cacheLimitDraft
         set(value) { runtime.cacheLimitDraft = value }
-
-    var downloadThreadsDraft: String
-        get() = runtime.downloadThreadsDraft
-        set(value) { runtime.downloadThreadsDraft = value }
-
-    var cacheThreadsDraft: String
-        get() = runtime.cacheThreadsDraft
-        set(value) { runtime.cacheThreadsDraft = value }
-
-    var settingsValidationError: String?
-        get() = runtime.settingsValidationError
-        set(value) { runtime.settingsValidationError = value }
-
-    var cacheUsageBytes: Long
-        get() = runtime.cacheUsageBytes
-        set(value) { runtime.cacheUsageBytes = value }
-
-    var qrContent: String?
-        get() = runtime.qrContent
-        set(value) { runtime.qrContent = value }
-
-    var qrBitmap: Bitmap?
-        get() = runtime.qrBitmap
-        set(value) { runtime.qrBitmap = value }
-
-    var qrHint: String?
-        get() = runtime.qrHint
-        set(value) { runtime.qrHint = value }
-
-    var isShowingWebLoginDialog: Boolean
-        get() = runtime.isShowingWebLoginDialog
-        set(value) { runtime.isShowingWebLoginDialog = value }
-
-    var breadcrumbs: List<BreadcrumbItem>
-        get() = runtime.breadcrumbs
-        set(value) { runtime.breadcrumbs = value }
-
-    var browser: FolderBrowsePayload?
-        get() = runtime.browser
-        set(value) { runtime.browser = value }
-
+    val settingsValidationError: String? get() = runtime.settingsValidationError
+    val statusMessage: String? get() = runtime.statusMessage
+    val browser: FolderBrowsePayload? get() = runtime.browser
     var tracks: List<TrackSummary>
         get() = runtime.tracks
         set(value) { runtime.tracks = value }
-
-    var searchQuery: String
-        get() = runtime.searchQuery
-        set(value) { runtime.searchQuery = value }
-
-    var currentTrackId: String?
-        get() = runtime.currentTrackId
-        set(value) { runtime.currentTrackId = value }
-
-    var nowPlayingTitle: String?
-        get() = runtime.nowPlayingTitle
-        set(value) { runtime.nowPlayingTitle = value }
-
-    var nowPlayingArtist: String?
-        get() = runtime.nowPlayingArtist
-        set(value) { runtime.nowPlayingArtist = value }
-
-    var isPlaying: Boolean
-        get() = runtime.isPlaying
-        set(value) { runtime.isPlaying = value }
-
-    var loadingTrackId: String?
-        get() = runtime.loadingTrackId
-        set(value) { runtime.loadingTrackId = value }
-
+    val currentTrackId: String? get() = runtime.currentTrackId
     var shuffle: Boolean
         get() = runtime.shuffle
         set(value) { runtime.shuffle = value }
-
-    var loopMode: LoopMode
-        get() = runtime.loopMode
-        set(value) { runtime.loopMode = value }
-
-    var currentTime: Double
-        get() = runtime.currentTime
-        set(value) { runtime.currentTime = value }
-
-    var duration: Double
-        get() = runtime.duration
-        set(value) { runtime.duration = value }
-
-    var activeVideoUrl: String?
-        get() = runtime.activeVideoUrl
-        set(value) { runtime.activeVideoUrl = value }
-
-    var activeVideoTitle: String?
-        get() = runtime.activeVideoTitle
-        set(value) { runtime.activeVideoTitle = value }
-
-    var transferSnapshot: TransferSnapshotPayload
-        get() = runtime.transferSnapshot
-        set(value) { runtime.transferSnapshot = value }
-
-    val visibleTracks: List<TrackSummary> get() = runtime.visibleTracks
-    val currentTrack: TrackSummary? get() = runtime.currentTrack
     val downloadTransfers: List<TransferStatus> get() = runtime.downloadTransfers
-    val downloadableFiles: List<TrackSummary> get() = runtime.downloadableFiles
 
-    fun syncDraftsFromCommitted() = runtime.syncDraftsFromCommitted()
+    fun bootstrap(): Deferred<Unit> = runtime.bootstrap()
     fun noteDraftEdited() = runtime.noteDraftEdited()
     fun commitCacheLimitDraft(): Boolean = runtime.commitCacheLimitDraft()
-    fun commitTransferThreadsDraft(): Boolean = runtime.commitTransferThreadsDraft()
     fun updatePlaybackMode(mode: PlaybackMode) = runtime.updatePlaybackMode(mode)
-    fun bootstrap() = runtime.bootstrap()
-    fun beginQrLogin() = runtime.beginQrLogin()
-    fun completeEmbeddedWebLogin(callbackUrl: String, cookieHeader: String?) =
-        runtime.completeEmbeddedWebLogin(callbackUrl, cookieHeader)
     fun completeEmbeddedWebLogin(callbackUrl: String, cookiesByOrigin: Map<String, String?>) =
         runtime.completeEmbeddedWebLogin(callbackUrl, cookiesByOrigin)
     fun logout() = runtime.logout()
     fun browseTo(folderId: String?, nextCrumbs: List<BreadcrumbItem>, showBusy: Boolean = true) =
         runtime.browseTo(folderId, nextCrumbs, showBusy)
-    fun setCurrentFolderAsMusicLibrary() = runtime.setCurrentFolderAsMusicLibrary()
-    fun scanMusicLibrary() = runtime.scanMusicLibrary()
     fun playTrack(
         track: TrackSummary,
         modeOverride: PlaybackMode? = null,
@@ -1460,18 +2012,7 @@ class CloudTuneViewModel(
         wasLoopback: Boolean,
         explicitIsDecode: Boolean? = null
     ) = runtime.handlePlaybackError(track, message, wasLoopback, explicitIsDecode)
-    fun togglePlayback() = runtime.togglePlayback()
-    fun playAdjacent(direction: Int) = runtime.playAdjacent(direction)
-    fun seekTo(seconds: Double) = runtime.seekTo(seconds)
     fun openVideoInApp(video: TrackSummary) = runtime.openVideoInApp(video)
-    fun saveQrToGallery(context: Context) = runtime.saveQrToGallery(context)
-    fun openVideoExternally(context: Context, video: TrackSummary) = runtime.openVideoExternally(context, video)
-    fun onSafTreeSelected(context: Context, treeUri: Uri) = runtime.onSafTreeSelected(context, treeUri)
-    fun enqueueDownload(context: Context, track: TrackSummary) = runtime.enqueueDownload(context, track)
-    fun enqueueCurrentFolderDownload(context: Context) = runtime.enqueueCurrentFolderDownload(context)
-    fun pauseTransfer(id: String) = runtime.pauseTransfer(id)
-    fun resumeTransfer(context: Context, id: String) = runtime.resumeTransfer(context, id)
-    fun deleteTransfer(id: String) = runtime.deleteTransfer(id)
 
     internal fun clearViewModelForTest() {
         onCleared()
@@ -1486,62 +2027,82 @@ class CloudTuneViewModel(
         fun fixture(scene: SnapshotScene, fixture: RepresentativeFixture): CloudTuneViewModel {
             val isolatedDir = File(System.getProperty("java.io.tmpdir"), "cloudtune-fixture-${UUID.randomUUID()}")
             val vm = CloudTuneViewModel(accountStore = AccountStore(isolatedDir), enableLiveLoops = false)
-            vm.runtime.committedSettings = AccountSettings(
+            val rt = vm.runtime
+            rt.committedSettings = AccountSettings(
                 musicFolder = fixture.currentFolder,
                 cacheLimitMb = fixture.cacheLimitMb,
                 downloadThreads = fixture.downloadThreads,
                 cacheThreads = fixture.cacheThreads,
                 playbackMode = fixture.playbackMode,
-                exportFolderDisplayName = "MusicExports"
+                exportFolderDisplayName = "MusicExports",
+                appearanceMode = fixture.appearanceMode,
+                dynamicColorEnabled = fixture.dynamicColorEnabled
             )
-            vm.syncDraftsFromCommitted()
+            rt.themeMode = fixture.appearanceMode
+            rt.dynamicColorEnabled = fixture.dynamicColorEnabled
+            rt.syncDraftsFromCommitted()
 
             when (scene) {
                 SnapshotScene.AUTH_IDLE -> {
-                    vm.isAuthenticated = false
-                    vm.accountName = null
-                    vm.runtime.accountStorageKey = null
-                    vm.cacheUsageBytes = 0L
+                    rt.isAuthenticated = false
+                    rt.accountName = null
+                    rt.accountStorageKey = null
+                    rt.cacheUsageBytes = 0L
                 }
                 SnapshotScene.AUTH_QR -> {
-                    vm.isAuthenticated = false
-                    vm.accountName = null
-                    vm.runtime.accountStorageKey = null
-                    vm.cacheUsageBytes = 0L
-                    vm.qrContent = fixture.qrContent
-                    vm.qrHint = fixture.qrMessage
-                    vm.statusMessage = fixture.qrMessage
-                    vm.qrBitmap = QrCodeHelper.generateQrBitmap(fixture.qrContent, 420)
+                    rt.isAuthenticated = false
+                    rt.accountName = null
+                    rt.accountStorageKey = null
+                    rt.cacheUsageBytes = 0L
+                    rt.qrContent = fixture.qrContent
+                    rt.qrHint = fixture.qrMessage
+                    rt.statusMessage = fixture.qrMessage
+                    rt.qrBitmap = QrCodeHelper.generateQrBitmap(fixture.qrContent, 420)
                 }
                 SnapshotScene.MUSIC,
                 SnapshotScene.VIDEO,
                 SnapshotScene.DOWNLOAD,
-                SnapshotScene.ERROR_BANNER -> {
-                    vm.isAuthenticated = true
-                    vm.accountName = fixture.accountName
-                    vm.runtime.accountStorageKey = fixture.accountName
-                    vm.cacheUsageBytes = fixture.cacheUsageBytes
-                    vm.breadcrumbs = fixture.breadcrumbs
-                    vm.browser = fixture.browser
-                    vm.tracks = fixture.libraryTracks
-                    vm.currentTrackId = fixture.nowPlayingTrackId
-                    vm.nowPlayingTitle = fixture.nowPlayingTitle
-                    vm.nowPlayingArtist = fixture.nowPlayingArtist
-                    vm.isPlaying = fixture.isPlaying
-                    vm.currentTime = fixture.currentTimeSeconds
-                    vm.duration = fixture.durationSeconds
-                    vm.shuffle = fixture.shuffle
-                    vm.loopMode = fixture.loopMode
-                    vm.transferSnapshot = fixture.transferSnapshot
-                    vm.statusMessage = if (scene == SnapshotScene.ERROR_BANNER) {
+                SnapshotScene.ERROR_BANNER,
+                SnapshotScene.CLOUD,
+                SnapshotScene.SETTINGS,
+                SnapshotScene.NOW_PLAYING -> {
+                    rt.isAuthenticated = true
+                    rt.accountName = fixture.accountName
+                    rt.accountStorageKey = fixture.accountName
+                    rt.cacheUsageBytes = fixture.cacheUsageBytes
+                    val pane = BrowserPaneState(breadcrumbs = fixture.breadcrumbs, payload = fixture.browser)
+                    rt.cloudBrowser = pane
+                    rt.videoBrowser = pane
+                    rt.tracks = fixture.libraryTracks
+                    rt.activeTrack = fixture.libraryTracks.firstOrNull { it.id == fixture.nowPlayingTrackId }
+                        ?: fixture.browser.audioFiles.firstOrNull { it.id == fixture.nowPlayingTrackId }
+                    rt.currentTrackId = fixture.nowPlayingTrackId
+                    rt.nowPlayingTitle = fixture.nowPlayingTitle
+                    rt.nowPlayingArtist = fixture.nowPlayingArtist
+                    rt.nowPlayingAlbum = fixture.nowPlayingAlbum
+                    rt.isPlaying = scene != SnapshotScene.ERROR_BANNER && fixture.isPlaying
+                    rt.currentTime = fixture.currentTimeSeconds
+                    rt.duration = fixture.durationSeconds
+                    rt.shuffle = fixture.shuffle
+                    rt.shuffleOrderIds = fixture.libraryTracks.map { it.id }
+                    rt.loopMode = fixture.loopMode
+                    rt.upNextQueue = fixture.libraryTracks.filterNot { it.id == fixture.nowPlayingTrackId }.take(2)
+                    rt.transferSnapshot = fixture.transferSnapshot
+                    rt.statusMessage = if (scene == SnapshotScene.ERROR_BANNER) {
                         fixture.errorBannerMessage
                     } else {
                         fixture.statusMessage
                     }
-                    vm.activeModule = when (scene) {
-                        SnapshotScene.VIDEO -> ModuleTab.VIDEO
-                        SnapshotScene.DOWNLOAD -> ModuleTab.DOWNLOAD
-                        else -> ModuleTab.MUSIC
+                    when (scene) {
+                        SnapshotScene.VIDEO -> rt.activeModule = ModuleTab.VIDEO
+                        SnapshotScene.DOWNLOAD -> rt.activeModule = ModuleTab.TRANSFERS
+                        SnapshotScene.CLOUD -> rt.activeModule = ModuleTab.CLOUD
+                        SnapshotScene.SETTINGS -> rt.activeModule = ModuleTab.SETTINGS
+                        SnapshotScene.NOW_PLAYING -> {
+                            rt.activeModule = ModuleTab.MUSIC
+                            rt.isShowingNowPlayingSheet = true
+                        }
+                        else -> rt.activeModule = ModuleTab.MUSIC
                     }
                 }
             }

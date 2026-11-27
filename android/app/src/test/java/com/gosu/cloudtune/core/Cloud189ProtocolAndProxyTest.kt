@@ -1,6 +1,7 @@
 package com.gosu.cloudtune.core
 
 import com.gosu.cloudtune.data.AccountStore
+import com.gosu.cloudtune.data.CredentialStore
 import com.gosu.cloudtune.media.PlaybackSessionBridge
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import com.gosu.cloudtune.ui.CloudTuneViewModel
@@ -793,6 +794,130 @@ class Cloud189ProtocolAndProxyTest {
             )
 
             vm.logout()
+            runtime.streamServer?.close()
+            Unit
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyBootstrapSingleFlightDecoupledBrowsersActiveTrackAndCheckedSettings(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-s1b-contract").toFile()
+        try {
+            val refreshCalls = AtomicInteger(0)
+            val transport = object : CloudHttpTransport {
+                override suspend fun send(
+                    url: String,
+                    method: String,
+                    headers: Map<String, String>,
+                    formBody: List<Pair<String, String>>?
+                ): CloudHttpResponse {
+                    return when {
+                        url.contains("refreshToken.do") -> {
+                            refreshCalls.incrementAndGet()
+                            delay(40L)
+                            val b = """{"res_code":0,"accessToken":"at_boot","refreshToken":"rt_boot_2"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("getSessionForPC.action") -> {
+                            val b = """{"res_code":0,"loginName":"audiophile@example.invalid","sessionKey":"sk_boot","sessionSecret":"ss_boot","refreshToken":"rt_boot_2"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("listFiles.action") -> {
+                            val b = when {
+                                url.contains("folderId=jazz") ->
+                                    """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"cloud-jazz","name":"Solo.flac","size":2048}]}}"""
+                                url.contains("folderId=video") ->
+                                    """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"vid-live","name":"Live.mp4","size":4096}]}}"""
+                                else ->
+                                    """{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"jazz","name":"Jazz"},{"id":"video","name":"Video"}],"fileList":[]}}"""
+                            }
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("getFileDownloadUrl.action") -> {
+                            val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/solo.flac"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                    }
+                }
+                override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
+                override fun clearCookies() {}
+            }
+
+            var savedCred = PersistedRefreshCredential.createOrNull("rt_boot_1", "audiophile@example.invalid")
+            val memCredStore = object : CredentialStore {
+                override fun loadCredential(): PersistedRefreshCredential? = savedCred
+                override fun saveCredential(credential: PersistedRefreshCredential) { savedCred = credential }
+                override fun clearCredential() { savedCred = null }
+            }
+
+            val store = AccountStore(tempRoot)
+            val runtime = CloudTuneAppRuntime(
+                appContext = null,
+                cloudClient = Cloud189Client(transport),
+                accountStore = store,
+                credentialStore = memCredStore,
+                limiter = GlobalTransferLimiter(8),
+                enableLiveLoops = true
+            )
+
+            // 1) Concurrent cold-start bootstrap() from MainActivity + PlaybackService exchanges token ONCE
+            listOf(
+                runtime.bootstrap(),
+                runtime.bootstrap(),
+                runtime.bootstrap(),
+                runtime.bootstrap()
+            ).awaitAll()
+            assertEquals("Concurrent bootstrap must refresh token only once", 1, refreshCalls.get())
+            assertTrue(runtime.isAuthenticated)
+
+            // 2) Cloud & Video browsers stay decoupled; playing ad-hoc cloud track survives folder changes and NEVER uses accountName as artist
+            runtime.browseTo(BrowserScope.CLOUD, "jazz", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("jazz", "Jazz")))
+            runtime.browseTo(BrowserScope.VIDEO, "video", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("video", "Video")))
+            repeat(40) {
+                if (runtime.cloudBrowser.payload?.currentFolderId == "jazz" && runtime.videoBrowser.payload?.currentFolderId == "video") return@repeat
+                delay(15L)
+            }
+            val jazzTrack = runtime.cloudBrowser.payload!!.audioFiles.first()
+            runtime.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
+            runtime.playTrack(jazzTrack)
+            repeat(40) { if (runtime.currentTrackId == "cloud-jazz") return@repeat; delay(15L) }
+            assertEquals("cloud-jazz", runtime.currentTrack?.id)
+            assertNull("Account email must never be used as artist fallback", runtime.nowPlayingArtist)
+
+            runtime.browseTo(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT))
+            repeat(40) { if (runtime.cloudBrowser.payload?.isRoot == true) return@repeat; delay(15L) }
+            assertEquals("Active track must survive cloud folder navigation", "cloud-jazz", runtime.currentTrack?.id)
+            assertEquals("Video browser must stay on video folder", "video", runtime.videoBrowser.payload?.currentFolderId)
+
+            // 3) Queue availability syncs with LoopMode.OFF vs Play Next queue
+            val s1 = TrackSummary("s1", "01.flac", "Album", 100L)
+            val s2 = TrackSummary("s2", "02.flac", "Album", 100L)
+            runtime.tracks = listOf(s1, s2)
+            runtime.shuffle = false
+            runtime.loopMode = LoopMode.OFF
+            runtime.playTrack(s2)
+            repeat(40) { if (runtime.currentTrackId == "s2") return@repeat; delay(15L) }
+            assertFalse("End of queue with LoopMode.OFF must disable skip next", PlaybackSessionBridge.canSkipNext)
+            assertTrue("Second item must allow skip previous", PlaybackSessionBridge.canSkipPrevious)
+            runtime.playNext(s1)
+            assertTrue("Enqueuing Play Next must enable skip next immediately", PlaybackSessionBridge.canSkipNext)
+
+            // 4) Settings write failure keeps draft & committedSettings intact and reports error instead of claiming success
+            val acctPaths = store.paths(runtime.accountStorageKey!!)
+            acctPaths.settingsFile.delete()
+            acctPaths.settingsFile.mkdirs()
+            val prevLimit = runtime.committedSettings.cacheLimitMb
+            runtime.cacheLimitDraft = "4096"
+            val ok = runtime.commitCacheLimitDraft()
+            assertFalse("Write failure must return false", ok)
+            assertEquals(prevLimit, runtime.committedSettings.cacheLimitMb)
+            assertEquals("4096", runtime.cacheLimitDraft)
+            assertTrue(runtime.statusMessage?.contains("保存设置失败") == true)
+
+            runtime.logout()
             runtime.streamServer?.close()
             Unit
         } finally {

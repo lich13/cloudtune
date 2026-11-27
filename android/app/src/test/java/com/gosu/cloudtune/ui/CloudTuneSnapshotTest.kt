@@ -6,8 +6,9 @@ import android.os.Looper
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.documentfile.provider.DocumentFile
-import com.gosu.cloudtune.core.AppThemeMode
+import com.gosu.cloudtune.core.AppearanceMode
 import com.gosu.cloudtune.core.CloudTuneException
 import com.gosu.cloudtune.core.RepresentativeFixture
 import com.gosu.cloudtune.core.SnapshotScene
@@ -49,13 +50,14 @@ class CloudTuneSnapshotTest {
         val outBase = File("build/outputs/snapshots/$formFactor")
 
         for ((themeFolder, themeMode, expectDark) in listOf(
-            Triple("light", AppThemeMode.LIGHT, false),
-            Triple("dark", AppThemeMode.DARK, true)
+            Triple("light", AppearanceMode.LIGHT, false),
+            Triple("dark", AppearanceMode.DARK, true)
         )) {
             val targetDir = File(outBase, themeFolder).apply { mkdirs() }
             for (scene in SnapshotScene.entries) {
                 val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
                 val activity = controller.get()
+                activity.enableEdgeToEdge()
                 val vm = CloudTuneViewModel.fixture(scene, fixture).apply {
                     this.themeMode = themeMode
                 }

@@ -192,7 +192,9 @@ class PlaybackService : MediaSessionService() {
         mediaSession = MediaSession.Builder(this, forwardingPlayer)
             .setSessionActivity(sessionPendingIntent)
             .build()
-        CloudTuneAppRuntime.getOrCreate(applicationContext).bindSkipBridge()
+        val runtime = CloudTuneAppRuntime.getOrCreate(applicationContext)
+        runtime.bindSkipBridge()
+        runtime.bootstrap()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession

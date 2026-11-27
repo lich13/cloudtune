@@ -203,9 +203,9 @@ class AccountStore(val rootDir: File) {
         }
     }
 
-    fun loadSettings(accountId: String): AccountSettings {
+    fun loadSettingsOrNull(accountId: String): AccountSettings? {
         val raw = runCatching { readAtomicTextOrNull(paths(accountId).settingsFile) }.getOrNull()
-            ?: return AccountSettings()
+            ?: return null
         return runCatching {
             val o = JSONObject(raw)
             val mf = o.optJSONObject("musicFolder")?.let {
@@ -222,8 +222,11 @@ class AccountStore(val rootDir: File) {
                 appearanceMode = AppearanceMode.fromWire(o.optString("appearanceMode")),
                 dynamicColorEnabled = o.optBoolean("dynamicColorEnabled", false)
             )
-        }.getOrDefault(AccountSettings())
+        }.getOrNull()
     }
+
+    fun loadSettings(accountId: String): AccountSettings =
+        loadSettingsOrNull(accountId) ?: AccountSettings()
 
     fun saveSettings(accountId: String, settings: AccountSettings) {
         val f = paths(accountId).settingsFile

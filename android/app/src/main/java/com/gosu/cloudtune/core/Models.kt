@@ -63,7 +63,15 @@ enum class SnapshotScene(val fileStem: String) {
     MUSIC("03-music"),
     VIDEO("04-video"),
     DOWNLOAD("05-download"),
-    ERROR_BANNER("06-error-banner")
+    ERROR_BANNER("06-error-banner"),
+    CLOUD("07-cloud"),
+    SETTINGS("08-settings"),
+    NOW_PLAYING("09-now-playing")
+}
+
+enum class BrowserScope {
+    CLOUD,
+    VIDEO
 }
 
 /** Active online session holding non-empty signing keys for the current process run. */
@@ -159,6 +167,11 @@ data class FolderBrowsePayload(
     val audioFiles: List<TrackSummary>,
     val videoFiles: List<TrackSummary>,
     val otherFiles: List<TrackSummary>
+)
+
+data class BrowserPaneState(
+    val breadcrumbs: List<BreadcrumbItem> = listOf(BreadcrumbItem.ROOT),
+    val payload: FolderBrowsePayload? = null
 )
 
 data class AccountSettings(

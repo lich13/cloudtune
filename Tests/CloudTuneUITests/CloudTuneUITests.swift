@@ -226,6 +226,112 @@ struct CloudTuneUITests {
         #expect(kc.current?.refreshToken != "rt_old_legacy")
     }
 
+    @Test("Cloud/Video browser decoupling, activeTrack survival across folder navigation, checked settings write failure, and paired observer lifecycle")
+    @MainActor
+    func verifyDecoupledBrowsersActiveTrackSurvivalAndCheckedSettings() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-vm-s1a-\(UUID().uuidString)")
+        let suiteName = "com.gosu.cloudtune.test.\(UUID().uuidString)"
+        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            isolatedDefaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        actor FolderMockTransport: CloudHTTPTransport {
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                let path = url.path
+                let query = url.query ?? ""
+                if path.contains("getSessionForPC.action") {
+                    let body = #"{"res_code":0,"loginName":"listener@example.invalid","accessToken":"at","refreshToken":"rt","sessionKey":"sk","sessionSecret":"ss"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if path.contains("listFiles.action") {
+                    if query.contains("folderId=jazz") {
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"cloud-jazz-1","name":"Waltz.flac","size":2048}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    if query.contains("folderId=concerts") {
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"vid-live-1","name":"Live4K.mp4","size":8192}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    let b = #"{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"jazz","name":"Jazz"},{"id":"concerts","name":"Concerts"}],"fileList":[]}}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                if path.contains("getFileDownloadUrl.action") {
+                    let b = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/asset.bin"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let store = try AccountScopedStore(rootDirectory: root)
+        let vm = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: FolderMockTransport()),
+            accountStore: store,
+            userDefaults: isolatedDefaults,
+            enableLiveObservers: true
+        )
+        defer { vm.teardownPlayerAndRemoteCommands() }
+        #expect(vm.hasActivePlayerObservers == true)
+
+        await vm.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=ok")!,
+            cookies: []
+        )
+        #expect(vm.isAuthenticated == true)
+
+        // 1) Browse cloudBrowser to Jazz, play ad-hoc cloud track (library `tracks` is empty!), then switch cloudBrowser to Concerts
+        await vm.browseTo(scope: .cloud, folderId: "jazz", nextBreadcrumbs: [.root, BreadcrumbItem(id: "jazz", name: "Jazz")])
+        await vm.browseTo(scope: .video, folderId: "concerts", nextBreadcrumbs: [.root, BreadcrumbItem(id: "concerts", name: "Concerts")])
+        #expect(vm.cloudBrowser.payload?.currentFolderId == "jazz")
+        #expect(vm.videoBrowser.payload?.currentFolderId == "concerts")
+
+        let jazzTrack = try #require(vm.cloudBrowser.payload?.audioFiles.first)
+        await vm.updatePlaybackMode(.streamCache)
+        await vm.playTrack(jazzTrack)
+        #expect(vm.currentTrack?.id == "cloud-jazz-1")
+
+        // Navigating cloudBrowser away MUST NOT drop activeTrack / currentTrack
+        await vm.browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root])
+        #expect(vm.cloudBrowser.payload?.audioFiles.isEmpty == true)
+        #expect(vm.currentTrack?.id == "cloud-jazz-1")
+        #expect(vm.videoBrowser.payload?.currentFolderId == "concerts")
+
+        // 2) Uncached external video request NEVER returns raw https:// URL; sets pendingExternalVideoChoice with loopback proxy URL
+        let concertVideo = try #require(vm.videoBrowser.payload?.videoFiles.first)
+        let directURL = await vm.requestExternalVideoPlayback(concertVideo)
+        #expect(directURL == nil)
+        let choice = try #require(vm.pendingExternalVideoChoice)
+        #expect(choice.video.id == "vid-live-1")
+        #expect(choice.streamURL.host == "127.0.0.1")
+
+        // 3) Logout tears down observers; re-login re-registers idempotently
+        await vm.logout()
+        #expect(vm.hasActivePlayerObservers == false)
+        await vm.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=ok2")!,
+            cookies: []
+        )
+        #expect(vm.hasActivePlayerObservers == true)
+
+        // 4) Disk write failure on settings.json MUST NOT claim "已更新" or overwrite committedSettings, and MUST keep draft for retry
+        let acctKey = try #require(vm.accountStorageKey)
+        let acctPaths = try await store.paths(for: acctKey)
+        try? FileManager.default.removeItem(at: acctPaths.settingsURL)
+        try FileManager.default.createDirectory(at: acctPaths.settingsURL, withIntermediateDirectories: true)
+
+        vm.cacheLimitDraft = "4096"
+        let saved = await vm.commitCacheLimitDraft()
+        #expect(saved == false)
+        #expect(vm.committedSettings.cacheLimitMb == 1024)
+        #expect(vm.cacheLimitDraft == "4096")
+        #expect(vm.statusMessage?.contains("保存设置失败") == true)
+    }
+
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")
     func verifyQRCodeRendering() throws {
         let png = try #require(QRCodeGenerator.generatePNGData(content: "https://open.e.189.cn/qr/test", dimension: 320))

@@ -1,18 +1,9 @@
+import CloudTuneCore
 import SwiftUI
 
-public enum AppAppearancePreference: String, Codable, CaseIterable, Sendable {
-    case system
-    case light
-    case dark
+public typealias AppAppearancePreference = AppearanceMode
 
-    public var title: String {
-        switch self {
-        case .system: return "跟随系统"
-        case .light: return "暖羊皮浅色"
-        case .dark: return "松林暗夜"
-        }
-    }
-
+extension AppearanceMode {
     public var preferredColorScheme: ColorScheme? {
         switch self {
         case .system: return nil
@@ -22,8 +13,15 @@ public enum AppAppearancePreference: String, Codable, CaseIterable, Sendable {
     }
 }
 
+/// Pure airy neutral palette paired with low-saturation pine-teal accent (`#2A6F5B` / `#58A88F`)
+/// and fixed high-contrast QR substrate (`#F6F1E8` / `#13271F`).
 public struct CloudTunePalette: Sendable {
     public let isDark: Bool
+    public let canvasBackground: Color
+    public let sidebarBackground: Color
+    public let surfacePrimary: Color
+    public let surfaceSecondary: Color
+    public let surfaceElevated: Color
     public let bgTop: Color
     public let bgBottom: Color
     public let warmGlow: Color
@@ -31,10 +29,14 @@ public struct CloudTunePalette: Sendable {
     public let cardSurface: Color
     public let cardStrong: Color
     public let rowSurface: Color
+    public let rowHoverSurface: Color
     public let rowActiveSurface: Color
     public let rowActiveBorder: Color
     public let inputSurface: Color
+    public let separator: Color
     public let cardBorder: Color
+    public let accent: Color
+    public let accentSoft: Color
     public let accentBorder: Color
     public let inkPrimary: Color
     public let inkSecondary: Color
@@ -45,6 +47,7 @@ public struct CloudTunePalette: Sendable {
     public let onlineStart: Color
     public let onlineEnd: Color
     public let warmGold: Color
+    public let destructive: Color
     public let noticeBackground: Color
     public let busyBackground: Color
     public let busyForeground: Color
@@ -56,56 +59,90 @@ public struct CloudTunePalette: Sendable {
         self.isDark = isDark
         self.qrSubstrate = Color(red: 0xF6 / 255.0, green: 0xF1 / 255.0, blue: 0xE8 / 255.0)
         self.qrForeground = Color(red: 0x13 / 255.0, green: 0x27 / 255.0, blue: 0x1F / 255.0)
-        self.warmGold = Color(red: 0xE6 / 255.0, green: 0xAA / 255.0, blue: 0x5A / 255.0)
 
         if isDark {
-            self.bgTop = Color(red: 0x0E / 255.0, green: 0x17 / 255.0, blue: 0x14 / 255.0)
-            self.bgBottom = Color(red: 0x0A / 255.0, green: 0x11 / 255.0, blue: 0x0E / 255.0)
-            self.warmGlow = Color(red: 0xE6 / 255.0, green: 0xAA / 255.0, blue: 0x5A / 255.0).opacity(0.14)
-            self.pineGlow = Color(red: 0x2F / 255.0, green: 0x7D / 255.0, blue: 0x60 / 255.0).opacity(0.20)
-            self.cardSurface = Color(red: 22.0 / 255.0, green: 36.0 / 255.0, blue: 30.0 / 255.0).opacity(0.90)
-            self.cardStrong = Color(red: 28.0 / 255.0, green: 45.0 / 255.0, blue: 38.0 / 255.0)
-            self.rowSurface = Color(red: 26.0 / 255.0, green: 42.0 / 255.0, blue: 35.0 / 255.0).opacity(0.86)
-            self.rowActiveSurface = Color(red: 47.0 / 255.0, green: 125.0 / 255.0, blue: 96.0 / 255.0).opacity(0.26)
-            self.rowActiveBorder = Color(red: 67.0 / 255.0, green: 158.0 / 255.0, blue: 124.0 / 255.0).opacity(0.55)
-            self.inputSurface = Color(red: 18.0 / 255.0, green: 30.0 / 255.0, blue: 25.0 / 255.0)
-            self.cardBorder = Color.white.opacity(0.10)
-            self.accentBorder = Color(red: 67.0 / 255.0, green: 158.0 / 255.0, blue: 124.0 / 255.0).opacity(0.32)
-            self.inkPrimary = Color(red: 0xEC / 255.0, green: 0xF5 / 255.0, blue: 0xF0 / 255.0)
-            self.inkSecondary = Color(red: 0xB4 / 255.0, green: 0xC8 / 255.0, blue: 0xBD / 255.0)
-            self.inkTertiary = Color(red: 0x82 / 255.0, green: 0xA3 / 255.0, blue: 0x93 / 255.0)
-            self.primaryStart = Color(red: 0x22 / 255.0, green: 0x64 / 255.0, blue: 0x4C / 255.0)
-            self.primaryEnd = Color(red: 0x2F / 255.0, green: 0x7D / 255.0, blue: 0x60 / 255.0)
-            self.primaryForeground = Color(red: 0xF5 / 255.0, green: 0xFB / 255.0, blue: 0xF8 / 255.0)
-            self.onlineStart = Color(red: 0x1F / 255.0, green: 0x66 / 255.0, blue: 0x4C / 255.0)
-            self.onlineEnd = Color(red: 0x2F / 255.0, green: 0x7D / 255.0, blue: 0x60 / 255.0)
-            self.noticeBackground = Color(red: 47.0 / 255.0, green: 125.0 / 255.0, blue: 96.0 / 255.0).opacity(0.20)
-            self.busyBackground = Color(red: 0xE6 / 255.0, green: 0xAA / 255.0, blue: 0x5A / 255.0).opacity(0.20)
-            self.busyForeground = Color(red: 0xF7 / 255.0, green: 0xCB / 255.0, blue: 0x88 / 255.0)
+            // Neutral charcoal #111315 / #181B1F + low-saturation pine-mint #58A88F
+            let canvas = Color(red: 0x11 / 255.0, green: 0x13 / 255.0, blue: 0x15 / 255.0)
+            let surface = Color(red: 0x18 / 255.0, green: 0x1B / 255.0, blue: 0x1F / 255.0)
+            let secondary = Color(red: 0x20 / 255.0, green: 0x24 / 255.0, blue: 0x2A / 255.0)
+            let elevated = Color(red: 0x24 / 255.0, green: 0x29 / 255.0, blue: 0x30 / 255.0)
+            let pine = Color(red: 0x58 / 255.0, green: 0xA8 / 255.0, blue: 0x8F / 255.0)
+
+            self.canvasBackground = canvas
+            self.sidebarBackground = Color(red: 0x14 / 255.0, green: 0x17 / 255.0, blue: 0x1A / 255.0)
+            self.surfacePrimary = surface
+            self.surfaceSecondary = secondary
+            self.surfaceElevated = elevated
+            self.bgTop = canvas
+            self.bgBottom = canvas
+            self.warmGlow = .clear
+            self.pineGlow = .clear
+            self.cardSurface = surface
+            self.cardStrong = elevated
+            self.rowSurface = surface
+            self.rowHoverSurface = Color.white.opacity(0.04)
+            self.rowActiveSurface = pine.opacity(0.18)
+            self.rowActiveBorder = pine.opacity(0.42)
+            self.inputSurface = secondary
+            self.separator = Color.white.opacity(0.08)
+            self.cardBorder = Color.white.opacity(0.08)
+            self.accent = pine
+            self.accentSoft = pine.opacity(0.16)
+            self.accentBorder = Color.white.opacity(0.11)
+            self.inkPrimary = Color(red: 0xF1 / 255.0, green: 0xF3 / 255.0, blue: 0xF5 / 255.0)
+            self.inkSecondary = Color(red: 0xAA / 255.0, green: 0xB2 / 255.0, blue: 0xBD / 255.0)
+            self.inkTertiary = Color(red: 0x78 / 255.0, green: 0x81 / 255.0, blue: 0x8E / 255.0)
+            self.primaryStart = Color(red: 0x2D / 255.0, green: 0x7A / 255.0, blue: 0x64 / 255.0)
+            self.primaryEnd = Color(red: 0x3A / 255.0, green: 0x8D / 255.0, blue: 0x75 / 255.0)
+            self.primaryForeground = Color(red: 0xF8 / 255.0, green: 0xFA / 255.0, blue: 0xF9 / 255.0)
+            self.onlineStart = self.primaryStart
+            self.onlineEnd = pine
+            self.warmGold = pine
+            self.destructive = Color(red: 0xE5 / 255.0, green: 0x6B / 255.0, blue: 0x6F / 255.0)
+            self.noticeBackground = pine.opacity(0.14)
+            self.busyBackground = secondary
+            self.busyForeground = self.inkSecondary
         } else {
-            self.bgTop = Color(red: 0xF7 / 255.0, green: 0xF2 / 255.0, blue: 0xE9 / 255.0)
-            self.bgBottom = Color(red: 0xEF / 255.0, green: 0xE7 / 255.0, blue: 0xDA / 255.0)
-            self.warmGlow = Color(red: 0xE6 / 255.0, green: 0xAA / 255.0, blue: 0x5A / 255.0).opacity(0.28)
-            self.pineGlow = Color(red: 0x18 / 255.0, green: 0x4F / 255.0, blue: 0x3C / 255.0).opacity(0.16)
-            self.cardSurface = Color(red: 1.0, green: 251.0 / 255.0, blue: 244.0 / 255.0).opacity(0.90)
-            self.cardStrong = Color(red: 1.0, green: 248.0 / 255.0, blue: 236.0 / 255.0)
-            self.rowSurface = Color.white.opacity(0.74)
-            self.rowActiveSurface = Color(red: 24.0 / 255.0, green: 79.0 / 255.0, blue: 60.0 / 255.0).opacity(0.14)
-            self.rowActiveBorder = Color(red: 24.0 / 255.0, green: 79.0 / 255.0, blue: 60.0 / 255.0).opacity(0.28)
-            self.inputSurface = Color.white.opacity(0.80)
-            self.cardBorder = Color(red: 19.0 / 255.0, green: 39.0 / 255.0, blue: 31.0 / 255.0).opacity(0.10)
-            self.accentBorder = Color(red: 24.0 / 255.0, green: 79.0 / 255.0, blue: 60.0 / 255.0).opacity(0.18)
-            self.inkPrimary = Color(red: 0x13 / 255.0, green: 0x27 / 255.0, blue: 0x1F / 255.0)
-            self.inkSecondary = Color(red: 0x48 / 255.0, green: 0x61 / 255.0, blue: 0x52 / 255.0)
-            self.inkTertiary = Color(red: 0x6F / 255.0, green: 0x7F / 255.0, blue: 0x75 / 255.0)
-            self.primaryStart = Color(red: 0x16 / 255.0, green: 0x3F / 255.0, blue: 0x31 / 255.0)
-            self.primaryEnd = Color(red: 0x26 / 255.0, green: 0x5F / 255.0, blue: 0x4A / 255.0)
-            self.primaryForeground = Color(red: 0xF7 / 255.0, green: 0xF5 / 255.0, blue: 0xEF / 255.0)
-            self.onlineStart = Color(red: 0x1A / 255.0, green: 0x59 / 255.0, blue: 0x43 / 255.0)
-            self.onlineEnd = Color(red: 0x2F / 255.0, green: 0x7D / 255.0, blue: 0x60 / 255.0)
-            self.noticeBackground = Color(red: 24.0 / 255.0, green: 79.0 / 255.0, blue: 60.0 / 255.0).opacity(0.09)
-            self.busyBackground = Color(red: 230.0 / 255.0, green: 170.0 / 255.0, blue: 90.0 / 255.0).opacity(0.18)
-            self.busyForeground = Color(red: 0x6D / 255.0, green: 0x4C / 255.0, blue: 0x18 / 255.0)
+            // Pure neutral #F7F8FA / #FFFFFF + low-saturation pine-teal #2A6F5B
+            let canvas = Color(red: 0xF7 / 255.0, green: 0xF8 / 255.0, blue: 0xFA / 255.0)
+            let surface = Color.white
+            let secondary = Color(red: 0xF0 / 255.0, green: 0xF2 / 255.0, blue: 0xF5 / 255.0)
+            let pine = Color(red: 0x2A / 255.0, green: 0x6F / 255.0, blue: 0x5B / 255.0)
+
+            self.canvasBackground = canvas
+            self.sidebarBackground = Color(red: 0xF2 / 255.0, green: 0xF4 / 255.0, blue: 0xF7 / 255.0)
+            self.surfacePrimary = surface
+            self.surfaceSecondary = secondary
+            self.surfaceElevated = surface
+            self.bgTop = canvas
+            self.bgBottom = canvas
+            self.warmGlow = .clear
+            self.pineGlow = .clear
+            self.cardSurface = surface
+            self.cardStrong = surface
+            self.rowSurface = surface
+            self.rowHoverSurface = Color.black.opacity(0.03)
+            self.rowActiveSurface = pine.opacity(0.10)
+            self.rowActiveBorder = pine.opacity(0.28)
+            self.inputSurface = secondary
+            self.separator = Color(red: 0xE3 / 255.0, green: 0xE7 / 255.0, blue: 0xED / 255.0)
+            self.cardBorder = Color(red: 0xE4 / 255.0, green: 0xE7 / 255.0, blue: 0xEC / 255.0)
+            self.accent = pine
+            self.accentSoft = pine.opacity(0.10)
+            self.accentBorder = Color(red: 0xDC / 255.0, green: 0xE1 / 255.0, blue: 0xE8 / 255.0)
+            self.inkPrimary = Color(red: 0x16 / 255.0, green: 0x19 / 255.0, blue: 0x1D / 255.0)
+            self.inkSecondary = Color(red: 0x4E / 255.0, green: 0x56 / 255.0, blue: 0x61 / 255.0)
+            self.inkTertiary = Color(red: 0x7B / 255.0, green: 0x84 / 255.0, blue: 0x91 / 255.0)
+            self.primaryStart = pine
+            self.primaryEnd = Color(red: 0x33 / 255.0, green: 0x80 / 255.0, blue: 0x69 / 255.0)
+            self.primaryForeground = Color.white
+            self.onlineStart = pine
+            self.onlineEnd = Color(red: 0x33 / 255.0, green: 0x80 / 255.0, blue: 0x69 / 255.0)
+            self.warmGold = pine
+            self.destructive = Color(red: 0xC9 / 255.0, green: 0x3B / 255.0, blue: 0x3B / 255.0)
+            self.noticeBackground = pine.opacity(0.08)
+            self.busyBackground = secondary
+            self.busyForeground = self.inkSecondary
         }
     }
 
@@ -125,4 +162,7 @@ public enum SnapshotScene: String, CaseIterable, Sendable {
     case video = "04-video"
     case download = "05-download"
     case errorBanner = "06-error-banner"
+    case cloud = "07-cloud"
+    case settings = "08-settings"
+    case nowPlaying = "09-now-playing"
 }

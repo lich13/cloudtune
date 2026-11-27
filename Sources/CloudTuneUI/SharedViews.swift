@@ -1,3 +1,4 @@
+import AVKit
 import CloudTuneCore
 import SwiftUI
 #if os(macOS)
@@ -14,26 +15,8 @@ public struct CloudTuneBackground: View {
     }
 
     public var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [palette.bgTop, palette.bgBottom],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            RadialGradient(
-                colors: [palette.warmGlow, .clear],
-                center: .topLeading,
-                startRadius: 10,
-                endRadius: 420
-            )
-            RadialGradient(
-                colors: [palette.pineGlow, .clear],
-                center: .topTrailing,
-                startRadius: 10,
-                endRadius: 380
-            )
-        }
-        .ignoresSafeArea()
+        palette.canvasBackground
+            .ignoresSafeArea()
     }
 }
 
@@ -53,14 +36,283 @@ public struct GlassCard<Content: View>: View {
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(palette.cardSurface)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(palette.surfacePrimary)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .strokeBorder(palette.cardBorder, lineWidth: 1)
             )
-            .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.08), radius: 18, x: 0, y: 8)
+    }
+}
+
+public struct SubtleStatusBanner: View {
+    public let message: String
+    public let isError: Bool
+    public let busyLabel: String?
+    public let palette: CloudTunePalette
+    public let onDismiss: (() -> Void)?
+
+    public init(
+        message: String,
+        isError: Bool = false,
+        busyLabel: String? = nil,
+        palette: CloudTunePalette,
+        onDismiss: (() -> Void)? = nil
+    ) {
+        self.message = message
+        self.isError = isError
+        self.busyLabel = busyLabel
+        self.palette = palette
+        self.onDismiss = onDismiss
+    }
+
+    public var body: some View {
+        let tint = isError ? palette.destructive : palette.accent
+        HStack(spacing: 8) {
+            if busyLabel != nil {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+            }
+            Text(busyLabel ?? message)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(palette.inkPrimary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(palette.inkTertiary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isError ? palette.destructive.opacity(palette.isDark ? 0.16 : 0.09) : palette.noticeBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(isError ? palette.destructive.opacity(0.32) : palette.rowActiveBorder.opacity(0.45), lineWidth: 1)
+        )
+    }
+}
+
+public struct ArtworkView: View {
+    public let artworkData: Data?
+    public let seedText: String
+    public let size: CGFloat
+    public let cornerRadius: CGFloat
+    public let palette: CloudTunePalette
+
+    public init(
+        artworkData: Data?,
+        seedText: String,
+        size: CGFloat,
+        cornerRadius: CGFloat = 10,
+        palette: CloudTunePalette
+    ) {
+        self.artworkData = artworkData
+        self.seedText = seedText
+        self.size = size
+        self.cornerRadius = cornerRadius
+        self.palette = palette
+    }
+
+    private var mineralTones: (Color, Color) {
+        var hash: UInt64 = 1469598103934665603
+        for byte in seedText.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        let bucket = Int(hash % 4)
+        if palette.isDark {
+            switch bucket {
+            case 0: return (Color(red: 0.16, green: 0.27, blue: 0.24), Color(red: 0.12, green: 0.18, blue: 0.19))
+            case 1: return (Color(red: 0.18, green: 0.23, blue: 0.28), Color(red: 0.12, green: 0.15, blue: 0.20))
+            case 2: return (Color(red: 0.22, green: 0.24, blue: 0.22), Color(red: 0.14, green: 0.16, blue: 0.16))
+            default: return (Color(red: 0.19, green: 0.26, blue: 0.25), Color(red: 0.13, green: 0.17, blue: 0.18))
+            }
+        } else {
+            switch bucket {
+            case 0: return (Color(red: 0.86, green: 0.92, blue: 0.90), Color(red: 0.80, green: 0.88, blue: 0.86))
+            case 1: return (Color(red: 0.87, green: 0.90, blue: 0.94), Color(red: 0.82, green: 0.86, blue: 0.91))
+            case 2: return (Color(red: 0.90, green: 0.91, blue: 0.89), Color(red: 0.84, green: 0.86, blue: 0.84))
+            default: return (Color(red: 0.85, green: 0.91, blue: 0.90), Color(red: 0.79, green: 0.86, blue: 0.85))
+            }
+        }
+    }
+
+    public var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if let artworkData, let decoded = decodePlatformImage(artworkData) {
+            decoded
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(shape)
+                .overlay(shape.strokeBorder(palette.separator, lineWidth: 0.5))
+        } else {
+            let tones = mineralTones
+            ZStack {
+                LinearGradient(colors: [tones.0, tones.1], startPoint: .topLeading, endPoint: .bottomTrailing)
+                Circle()
+                    .strokeBorder(palette.accent.opacity(palette.isDark ? 0.28 : 0.22), lineWidth: max(1, size * 0.03))
+                    .frame(width: size * 0.64, height: size * 0.64)
+                Circle()
+                    .strokeBorder(palette.accent.opacity(palette.isDark ? 0.18 : 0.14), lineWidth: 1)
+                    .frame(width: size * 0.40, height: size * 0.40)
+                Image(systemName: "waveform")
+                    .font(.system(size: max(12, size * 0.28), weight: .semibold))
+                    .foregroundStyle(palette.accent)
+            }
+            .frame(width: size, height: size)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(palette.separator, lineWidth: 0.5))
+        }
+    }
+
+    private func decodePlatformImage(_ data: Data) -> Image? {
+        #if os(macOS)
+        guard let nsImage = NSImage(data: data) else { return nil }
+        return Image(nsImage: nsImage)
+        #elseif os(iOS)
+        guard let uiImage = UIImage(data: data) else { return nil }
+        return Image(uiImage: uiImage)
+        #else
+        return nil
+        #endif
+    }
+}
+
+public struct LosslessBadge: View {
+    public let track: TrackSummary
+    public let palette: CloudTunePalette
+
+    public init(track: TrackSummary, palette: CloudTunePalette) {
+        self.track = track
+        self.palette = palette
+    }
+
+    public var body: some View {
+        if track.isLosslessAudio {
+            let label = track.fileExtensionUpper
+            Text(label)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(palette.accent)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(palette.accentSoft)
+                )
+        }
+    }
+}
+
+public struct InteractiveScrubSlider: View {
+    public let value: Double
+    public let total: Double
+    public let palette: CloudTunePalette
+    public let onPreviewChange: ((Double?) -> Void)?
+    public let onSeek: (Double) -> Void
+
+    @State private var dragFraction: Double?
+
+    public init(
+        value: Double,
+        total: Double,
+        palette: CloudTunePalette,
+        onPreviewChange: ((Double?) -> Void)? = nil,
+        onSeek: @escaping (Double) -> Void
+    ) {
+        self.value = value
+        self.total = total
+        self.palette = palette
+        self.onPreviewChange = onPreviewChange
+        self.onSeek = onSeek
+    }
+
+    private var committedFraction: Double {
+        guard total > 0, value.isFinite, total.isFinite else { return 0 }
+        return min(1.0, max(0.0, value / total))
+    }
+
+    private var activeFraction: Double {
+        dragFraction ?? committedFraction
+    }
+
+    public var body: some View {
+        GeometryReader { geo in
+            let width = max(1, geo.size.width)
+            let isDragging = dragFraction != nil
+            let barHeight: CGFloat = isDragging ? 6 : 4
+            let thumbSize: CGFloat = isDragging ? 13 : 10
+            let fillWidth = width * CGFloat(activeFraction)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(palette.inkPrimary.opacity(palette.isDark ? 0.14 : 0.10))
+                    .frame(height: barHeight)
+                Capsule()
+                    .fill(palette.accent)
+                    .frame(width: max(barHeight, fillWidth), height: barHeight)
+                if total > 0 {
+                    Circle()
+                        .fill(palette.accent)
+                        .frame(width: thumbSize, height: thumbSize)
+                        .overlay(Circle().strokeBorder(palette.surfacePrimary, lineWidth: 1.5))
+                        .offset(x: min(max(0, fillWidth - thumbSize / 2), max(0, width - thumbSize)))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        guard total > 0 else { return }
+                        let pct = min(1.0, max(0.0, Double(gesture.location.x / width)))
+                        dragFraction = pct
+                        onPreviewChange?(pct * total)
+                    }
+                    .onEnded { gesture in
+                        guard total > 0 else {
+                            dragFraction = nil
+                            onPreviewChange?(nil)
+                            return
+                        }
+                        let pct = min(1.0, max(0.0, Double(gesture.location.x / width)))
+                        dragFraction = nil
+                        onPreviewChange?(nil)
+                        onSeek(pct * total)
+                    }
+            )
+        }
+        .frame(height: 20)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("播放进度")
+        .accessibilityValue("\(CloudTuneFormatters.formatClock(activeFraction * max(0, total))) / \(CloudTuneFormatters.formatClock(total))")
+        .accessibilityAdjustableAction { direction in
+            guard total > 0 else { return }
+            let step = max(5.0, total * 0.05)
+            switch direction {
+            case .increment:
+                onSeek(min(total, value + step))
+            case .decrement:
+                onSeek(max(0, value - step))
+            @unknown default:
+                break
+            }
+        }
     }
 }
 
@@ -624,3 +876,230 @@ public struct QrCodeArtworkView: View {
         #endif
     }
 }
+
+#if os(macOS)
+public struct AirPlayRoutePicker: NSViewRepresentable {
+    public init() {}
+
+    public func makeNSView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView(frame: NSRect(x: 0, y: 0, width: 28, height: 28))
+        picker.isRoutePickerButtonBordered = false
+        return picker
+    }
+
+    public func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+}
+
+public enum MacMenuEntry {
+    case item(
+        title: String,
+        systemImage: String? = nil,
+        isChecked: Bool = false,
+        isEnabled: Bool = true,
+        action: @MainActor () -> Void
+    )
+    case separator
+}
+
+/// Native AppKit `NSView` + `NSMenu.popUp` trigger with full rectangular hit area (never uses SwiftUI `Menu`).
+public struct MacPopUpMenuButton: NSViewRepresentable {
+    public let title: String?
+    public let systemImage: String
+    public let accessibilityTitle: String
+    public let entries: () -> [MacMenuEntry]
+
+    public init(
+        title: String? = nil,
+        systemImage: String,
+        accessibilityTitle: String,
+        entries: @escaping () -> [MacMenuEntry]
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        self.accessibilityTitle = accessibilityTitle
+        self.entries = entries
+    }
+
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(entries: entries)
+    }
+
+    public func makeNSView(context: Context) -> PopUpTriggerNSView {
+        let view = PopUpTriggerNSView()
+        view.configure(title: title, systemImage: systemImage, accessibilityTitle: accessibilityTitle)
+        view.onTrigger = { [weak coordinator = context.coordinator] anchor in
+            coordinator?.presentMenu(from: anchor)
+        }
+        return view
+    }
+
+    public func updateNSView(_ nsView: PopUpTriggerNSView, context: Context) {
+        context.coordinator.entries = entries
+        nsView.configure(title: title, systemImage: systemImage, accessibilityTitle: accessibilityTitle)
+    }
+
+    @MainActor
+    public final class Coordinator: NSObject {
+        var entries: () -> [MacMenuEntry]
+        private var handlers: [Int: @MainActor () -> Void] = [:]
+
+        init(entries: @escaping () -> [MacMenuEntry]) {
+            self.entries = entries
+        }
+
+        func presentMenu(from view: NSView) {
+            handlers.removeAll()
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            var nextTag = 1
+            for entry in entries() {
+                switch entry {
+                case .separator:
+                    menu.addItem(.separator())
+                case let .item(title, systemImage, isChecked, isEnabled, action):
+                    let item = NSMenuItem(title: title, action: #selector(handleMenuItem(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.tag = nextTag
+                    item.isEnabled = isEnabled
+                    item.state = isChecked ? .on : .off
+                    if let systemImage, let img = NSImage(systemSymbolName: systemImage, accessibilityDescription: nil) {
+                        item.image = img
+                    }
+                    handlers[nextTag] = action
+                    nextTag += 1
+                    menu.addItem(item)
+                }
+            }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
+        }
+
+        @objc private func handleMenuItem(_ sender: NSMenuItem) {
+            handlers[sender.tag]?()
+        }
+    }
+
+    public final class PopUpTriggerNSView: NSView {
+        var onTrigger: ((NSView) -> Void)?
+        private var titleText: String?
+        private var symbolName: String = "ellipsis.circle"
+        private var isHovered = false {
+            didSet { needsDisplay = true }
+        }
+        private var trackingRef: NSTrackingArea?
+
+        override public var intrinsicContentSize: NSSize {
+            if let titleText, !titleText.isEmpty {
+                let textWidth = (titleText as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12.5, weight: .medium)]).width
+                return NSSize(width: ceil(textWidth) + 34, height: 28)
+            }
+            return NSSize(width: 28, height: 28)
+        }
+
+        func configure(title: String?, systemImage: String, accessibilityTitle: String) {
+            self.titleText = title
+            self.symbolName = systemImage
+            setAccessibilityLabel(accessibilityTitle)
+            setAccessibilityRole(.popUpButton)
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
+
+        override public func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingRef {
+                removeTrackingArea(trackingRef)
+            }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+            addTrackingArea(area)
+            trackingRef = area
+        }
+
+        override public func mouseEntered(with event: NSEvent) {
+            isHovered = true
+        }
+
+        override public func mouseExited(with event: NSEvent) {
+            isHovered = false
+        }
+
+        override public func mouseDown(with event: NSEvent) {
+            onTrigger?(self)
+        }
+
+        override public func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            if isHovered {
+                let radius = min(bounds.width, bounds.height) * 0.25
+                let path = NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius)
+                NSColor.labelColor.withAlphaComponent(0.08).setFill()
+                path.fill()
+            }
+            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+            symbol?.isTemplate = true
+
+            if let titleText, !titleText.isEmpty {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+                    .foregroundColor: NSColor.labelColor
+                ]
+                let textSize = (titleText as NSString).size(withAttributes: attrs)
+                var cursorX: CGFloat = 8
+                if let symbol {
+                    let sSize = symbol.size
+                    let iconRect = NSRect(
+                        x: cursorX,
+                        y: (bounds.height - sSize.height) / 2.0,
+                        width: sSize.width,
+                        height: sSize.height
+                    )
+                    symbol.draw(in: iconRect)
+                    cursorX += sSize.width + 5
+                }
+                let textRect = NSRect(
+                    x: cursorX,
+                    y: (bounds.height - textSize.height) / 2.0,
+                    width: textSize.width,
+                    height: textSize.height
+                )
+                (titleText as NSString).draw(in: textRect, withAttributes: attrs)
+            } else if let symbol {
+                let sSize = symbol.size
+                let iconRect = NSRect(
+                    x: (bounds.width - sSize.width) / 2.0,
+                    y: (bounds.height - sSize.height) / 2.0,
+                    width: sSize.width,
+                    height: sSize.height
+                )
+                symbol.draw(in: iconRect)
+            }
+        }
+    }
+}
+#elseif os(iOS)
+public struct AirPlayRoutePicker: UIViewRepresentable {
+    public let tint: UIColor
+
+    public init(tint: UIColor = .label) {
+        self.tint = tint
+    }
+
+    public func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView(frame: CGRect(x: 0, y: 0, width: 34, height: 34))
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = tint
+        picker.activeTintColor = tint
+        return picker
+    }
+
+    public func updateUIView(_ uiView: AVRoutePickerView, context: Context) {
+        uiView.tintColor = tint
+        uiView.activeTintColor = tint
+    }
+}
+#endif

@@ -49,6 +49,31 @@ public actor AccountScopedStore {
         try fm.createDirectory(at: self.rootDirectory, withIntermediateDirectories: true)
     }
 
+    private init(uncheckedDirectory: URL) {
+        self.rootDirectory = uncheckedDirectory
+        do {
+            try fm.createDirectory(at: uncheckedDirectory, withIntermediateDirectories: true)
+        } catch {
+            // Directory creation error will surface on subsequent read/write calls
+        }
+    }
+
+    public static func resolveOrFallback(_ explicit: AccountScopedStore?) -> (store: AccountScopedStore, warning: String?) {
+        if let explicit {
+            return (explicit, nil)
+        }
+        do {
+            return (try AccountScopedStore(), nil)
+        } catch {
+            let fallbackURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("com.gosu.cloudtune.fallback", isDirectory: true)
+            return (
+                AccountScopedStore(uncheckedDirectory: fallbackURL),
+                "应用支持目录不可用，已回退临时存储：\(error.localizedDescription)"
+            )
+        }
+    }
+
     public func paths(for accountId: String) throws -> AccountPaths {
         let resolved = AccountPaths(baseRoot: rootDirectory, accountId: accountId)
         for dir in [resolved.accountDir, resolved.cacheDir, resolved.stagingDir, resolved.artworkDir] {

@@ -1,6 +1,11 @@
 import CloudTuneCore
 import SwiftUI
 import WebKit
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
 
 public struct TianyiWebLoginSheet: View {
     @Bindable public var viewModel: CloudTuneViewModel
@@ -17,15 +22,15 @@ public struct TianyiWebLoginSheet: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("天翼云盘官方网页登录")
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 14.5, weight: .semibold))
                         .foregroundStyle(palette.inkPrimary)
                     Text(currentPageTitle)
                         .font(.system(size: 12))
                         .foregroundStyle(palette.inkTertiary)
                         .lineLimit(1)
                 }
-                Spacer()
-                SecondaryActionButton("改用二维码扫码", systemImage: "qrcode", palette: palette) {
+                Spacer(minLength: 8)
+                SecondaryActionButton("切换二维码", systemImage: "qrcode", palette: palette) {
                     viewModel.isShowingWebLoginSheet = false
                     Task { await viewModel.beginQrLogin() }
                 }
@@ -34,10 +39,10 @@ public struct TianyiWebLoginSheet: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(palette.cardStrong)
+            .padding(.vertical, 11)
+            .background(palette.surfacePrimary)
 
-            Divider()
+            Divider().overlay(palette.separator)
 
             IsolatedTianyiWebView(
                 entryURL: Cloud189Protocol.webLoginEntryURL(),
@@ -70,6 +75,17 @@ final class TianyiWebCoordinator: NSObject, WKNavigationDelegate {
     ) {
         self.onTitleChange = onTitleChange
         self.onCallbackIntercepted = onCallbackIntercepted
+    }
+
+    static func makeWebView(entryURL: URL, delegate: TianyiWebCoordinator) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = delegate
+        var req = URLRequest(url: entryURL)
+        req.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
+        webView.load(req)
+        return webView
     }
 
     func webView(
@@ -111,21 +127,12 @@ struct IsolatedTianyiWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        var req = URLRequest(url: entryURL)
-        req.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
-        webView.load(req)
-        return webView
+        TianyiWebCoordinator.makeWebView(entryURL: entryURL, delegate: context.coordinator)
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
 }
 #elseif os(iOS)
-import UIKit
-
 struct IsolatedTianyiWebView: UIViewRepresentable {
     let entryURL: URL
     let onTitleChange: (String) -> Void
@@ -136,14 +143,7 @@ struct IsolatedTianyiWebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        var req = URLRequest(url: entryURL)
-        req.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
-        webView.load(req)
-        return webView
+        TianyiWebCoordinator.makeWebView(entryURL: entryURL, delegate: context.coordinator)
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}

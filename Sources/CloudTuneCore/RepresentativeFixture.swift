@@ -13,6 +13,8 @@ public struct RepresentativeFixture: Codable, Equatable, Sendable {
         public var cacheThreads: Int
         public var playbackMode: PlaybackMode
         public var cacheUsageBytes: UInt64
+        public var appearanceMode: AppearanceMode?
+        public var dynamicColorEnabled: Bool?
     }
 
     public struct NowPlayingFixture: Codable, Equatable, Sendable {

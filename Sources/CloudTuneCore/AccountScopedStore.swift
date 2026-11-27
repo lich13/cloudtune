@@ -329,6 +329,10 @@ public actor AccountScopedStore {
                    let mode = PlaybackMode(rawValue: modeRaw) {
                     migrated.playbackMode = mode
                 }
+                if let appRaw = Cloud189Protocol.stringValue(json["appearanceMode"]),
+                   let appMode = AppearanceMode(rawValue: appRaw.lowercased()) {
+                    migrated.appearanceMode = appMode
+                }
                 try? saveSettings(migrated, for: targetAccount)
             }
             let legacyLib = candidate.appendingPathComponent("library.json")

@@ -99,6 +99,7 @@ class LocalStreamServer(
     private val opener: UpstreamStreamOpener = HttpUrlConnectionStreamOpener(),
     private val onStreamStatusUpdate: ((String, TransferStatus?) -> Unit)? = null,
     private val onAccountStreamStatusUpdate: ((String, String, TransferStatus?) -> Unit)? = null,
+    private val onWriteThroughCompleted: ((String, String, File) -> Unit)? = null,
     private val urlRefresher: (suspend (String) -> String)? = null
 ) : AutoCloseable {
     private class ActiveClientSession(
@@ -486,12 +487,25 @@ class LocalStreamServer(
                                         false
                                     }
                                     if (promoted) {
-                                        cacheManager.recordCompletedFile(
-                                            trackId = source.trackId,
-                                            file = source.cacheDestination,
-                                            sizeBytes = delivered,
-                                            limitBytes = source.cacheLimitBytes
-                                        )
+                                        val recorded = runCatching {
+                                            cacheManager.recordCompletedFile(
+                                                trackId = source.trackId,
+                                                file = source.cacheDestination,
+                                                sizeBytes = delivered,
+                                                limitBytes = source.cacheLimitBytes
+                                            )
+                                        }.isSuccess
+                                        if (recorded) {
+                                            if (!session.revoked.get() && isSourceStillRegistered(source.token, source.accountHash)) {
+                                                onWriteThroughCompleted?.invoke(
+                                                    source.accountHash,
+                                                    source.trackId,
+                                                    source.cacheDestination
+                                                )
+                                            }
+                                        } else {
+                                            source.cacheDestination.delete()
+                                        }
                                     } else {
                                         partFile.delete()
                                     }

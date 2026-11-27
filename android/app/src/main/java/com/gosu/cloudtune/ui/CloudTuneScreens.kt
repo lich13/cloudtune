@@ -297,7 +297,8 @@ private fun PhoneWorkspaceScaffold(viewModel: CloudTuneViewModel) {
                         val icon = when (tab) {
                             ModuleTab.MUSIC -> AppIcons.Music
                             ModuleTab.VIDEO -> AppIcons.Video
-                            ModuleTab.DOWNLOAD -> AppIcons.Download
+                            ModuleTab.CLOUD -> AppIcons.Folder
+                            ModuleTab.TRANSFERS -> AppIcons.Download
                             ModuleTab.SETTINGS -> AppIcons.Settings
                         }
                         NavigationBarItem(
@@ -327,7 +328,8 @@ private fun TabletWorkspaceScaffold(viewModel: CloudTuneViewModel) {
                 val icon = when (tab) {
                     ModuleTab.MUSIC -> AppIcons.Music
                     ModuleTab.VIDEO -> AppIcons.Video
-                    ModuleTab.DOWNLOAD -> AppIcons.Download
+                    ModuleTab.CLOUD -> AppIcons.Folder
+                    ModuleTab.TRANSFERS -> AppIcons.Download
                     ModuleTab.SETTINGS -> AppIcons.Settings
                 }
                 NavigationRailItem(
@@ -350,9 +352,9 @@ private fun TabletWorkspaceScaffold(viewModel: CloudTuneViewModel) {
 @Composable
 private fun ActiveModuleContent(viewModel: CloudTuneViewModel) {
     when (viewModel.activeModule) {
-        ModuleTab.MUSIC -> MusicWorkspaceContent(viewModel)
+        ModuleTab.MUSIC, ModuleTab.CLOUD -> MusicWorkspaceContent(viewModel)
         ModuleTab.VIDEO -> VideoWorkspaceContent(viewModel)
-        ModuleTab.DOWNLOAD -> DownloadWorkspaceContent(viewModel)
+        ModuleTab.TRANSFERS -> DownloadWorkspaceContent(viewModel)
         ModuleTab.SETTINGS -> SettingsWorkspaceContent(viewModel)
     }
 }

@@ -44,6 +44,7 @@ data class StagedDownloadManifest(
 class TransferEngine(
     private val limiter: GlobalTransferLimiter,
     private val opener: UpstreamStreamOpener = HttpUrlConnectionStreamOpener(),
+    private val onActivityChangeInitial: ((TransferSnapshotPayload, Boolean) -> Unit)? = null,
     private val urlResolver: suspend (String) -> String
 ) {
     private class InFlightCacheDownload(
@@ -58,12 +59,40 @@ class TransferEngine(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val persistLock = Any()
     private val cacheDownloadLock = Any()
+    private val notifyLock = Any()
     private val statuses = ConcurrentHashMap<String, TransferStatus>()
     private val statusAccountHashes = ConcurrentHashMap<String, String>()
     private val manifests = ConcurrentHashMap<String, StagedDownloadManifest>()
     private val manifestAccountKeys = ConcurrentHashMap<String, String>()
     private val jobs = ConcurrentHashMap<String, Job>()
     private val inFlightCacheDownloads = HashMap<String, InFlightCacheDownload>()
+    @Volatile private var onActivityChange: ((TransferSnapshotPayload, Boolean) -> Unit)? = onActivityChangeInitial
+    private var lastNotifiedHasActive: Boolean = false
+
+    fun setOnActivityChange(listener: ((TransferSnapshotPayload, Boolean) -> Unit)?) {
+        val snap = snapshot()
+        synchronized(notifyLock) {
+            onActivityChange = listener
+            lastNotifiedHasActive = snap.hasActiveItems
+        }
+    }
+
+    fun hasActiveTransfers(): Boolean =
+        statuses.values.any { it.state == "running" || it.state == "streaming" }
+
+    private fun notifyActivityChanged(force: Boolean = false) {
+        val listener = onActivityChange ?: return
+        val snap = snapshot()
+        val active = snap.hasActiveItems
+        val shouldDispatch = synchronized(notifyLock) {
+            val transitioned = active != lastNotifiedHasActive
+            lastNotifiedHasActive = active
+            force || transitioned
+        }
+        if (shouldDispatch) {
+            listener.invoke(snap, active)
+        }
+    }
 
     fun snapshot(): TransferSnapshotPayload {
         val list = statuses.values.sortedBy { it.id }
@@ -73,14 +102,19 @@ class TransferEngine(
     }
 
     fun updateExternalTransferStatus(id: String, status: TransferStatus?, accountHash: String? = null) {
+        val prev = statuses[id]
         if (status != null) {
             statuses[id] = status
             if (accountHash != null) {
                 statusAccountHashes[id] = accountHash
             }
+            notifyActivityChanged(force = (prev == null || prev.state != status.state))
         } else {
-            statuses.remove(id)
+            val removed = statuses.remove(id) != null
             statusAccountHashes.remove(id)
+            if (removed) {
+                notifyActivityChanged(force = true)
+            }
         }
     }
 
@@ -131,6 +165,7 @@ class TransferEngine(
                 )
             }
         }
+        notifyActivityChanged(force = true)
     }
 
     fun cancelAll(accountId: String) {
@@ -176,6 +211,7 @@ class TransferEngine(
                 }
             }
         }
+        notifyActivityChanged(force = true)
     }
 
     suspend fun downloadTrackToCache(
@@ -238,6 +274,7 @@ class TransferEngine(
                 created
             }
         }
+        notifyActivityChanged(force = true)
 
         try {
             sharedDeferred.await()
@@ -261,6 +298,7 @@ class TransferEngine(
             statuses.remove(it.statusId)
             statusAccountHashes.remove(it.statusId)
             it.deferred.cancel()
+            notifyActivityChanged(force = true)
         }
     }
 
@@ -306,6 +344,7 @@ class TransferEngine(
             statusAccountHashes.remove(statusId)
             partsDir.deleteRecursively()
             mergedTmp.delete()
+            notifyActivityChanged(force = true)
         }
     }
 
@@ -346,6 +385,7 @@ class TransferEngine(
             totalBytes = track.sizeBytes.takeIf { it > 0L }
         )
         persistManifests(accountHash, manifestsFile)
+        notifyActivityChanged(force = true)
         spawnExportJob(manifest, accountId, stagingRootDir, manifestsFile, exporter)
         return taskId
     }
@@ -359,6 +399,7 @@ class TransferEngine(
             statuses[id] = it.copy(state = "paused", canPause = false, canResume = true, bytesPerSecond = 0L)
         }
         persistManifests(m.accountHash, manifestsFile)
+        notifyActivityChanged(force = true)
     }
 
     fun resumeTransfer(
@@ -375,6 +416,7 @@ class TransferEngine(
             statuses[id] = it.copy(state = "running", canPause = true, canResume = false)
         }
         persistManifests(m.accountHash, manifestsFile)
+        notifyActivityChanged(force = true)
         spawnExportJob(m, accountKey, stagingRootDir, manifestsFile, exporter)
     }
 
@@ -390,6 +432,7 @@ class TransferEngine(
         if (removedManifest != null) {
             persistManifests(removedManifest.accountHash, manifestsFile)
         }
+        notifyActivityChanged(force = true)
     }
 
     private fun spawnExportJob(
@@ -447,6 +490,7 @@ class TransferEngine(
                     totalBytes = totalSize.takeIf { it > 0L }
                 )
                 persistManifests(manifest.accountHash, manifestsFile)
+                notifyActivityChanged(force = true)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (err: Exception) {
@@ -463,6 +507,7 @@ class TransferEngine(
                         bytesPerSecond = 0L
                     )
                 }
+                notifyActivityChanged(force = true)
             }
         }
     }

@@ -281,16 +281,10 @@ public struct MacWorkspaceView: View {
     @ViewBuilder
     private func moduleTabRow(palette: CloudTunePalette) -> some View {
         HStack(spacing: 8) {
-            ForEach([ModuleTab.music, .video, .download]) { tab in
-                let icon: String = switch tab {
-                case .music: "music.note.list"
-                case .video: "film"
-                case .download: "arrow.down.circle"
-                case .settings: "gearshape"
-                }
+            ForEach([ModuleTab.music, .video, .transfers]) { tab in
                 ToggleChipButton(
                     tab.title,
-                    systemImage: icon,
+                    systemImage: tab.systemImage,
                     isActive: viewModel.activeModule == tab,
                     palette: palette
                 ) {
@@ -435,14 +429,14 @@ public struct MacWorkspaceView: View {
     @ViewBuilder
     private func mainColumn(palette: CloudTunePalette) -> some View {
         switch viewModel.activeModule {
-        case .music, .settings:
+        case .music, .cloud, .settings:
             VStack(spacing: 13) {
                 playerCard(palette: palette)
                 musicLibraryCard(palette: palette)
             }
         case .video:
             videoLibraryCard(palette: palette)
-        case .download:
+        case .transfers:
             VStack(spacing: 13) {
                 transferQueueCard(palette: palette)
                 downloadFilesCard(palette: palette)

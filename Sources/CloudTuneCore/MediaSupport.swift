@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import CryptoKit
 import Foundation
 #if canImport(MediaPlayer)
 import MediaPlayer
@@ -90,6 +91,9 @@ public struct RemoteCommandCallbacks: Sendable {
     public var onPreviousTrack: @Sendable () -> Void
     public var onSeekDelta: @Sendable (TimeInterval) -> Void
     public var onSeekToPosition: @Sendable (TimeInterval) -> Void
+    public var onInterruptionBegan: @Sendable () -> Void
+    public var onInterruptionEndedShouldResume: @Sendable () -> Void
+    public var onOldAudioDeviceUnavailable: @Sendable () -> Void
 
     public init(
         onPlay: @escaping @Sendable () -> Void,
@@ -98,7 +102,10 @@ public struct RemoteCommandCallbacks: Sendable {
         onNextTrack: @escaping @Sendable () -> Void,
         onPreviousTrack: @escaping @Sendable () -> Void,
         onSeekDelta: @escaping @Sendable (TimeInterval) -> Void,
-        onSeekToPosition: @escaping @Sendable (TimeInterval) -> Void
+        onSeekToPosition: @escaping @Sendable (TimeInterval) -> Void,
+        onInterruptionBegan: @escaping @Sendable () -> Void = {},
+        onInterruptionEndedShouldResume: @escaping @Sendable () -> Void = {},
+        onOldAudioDeviceUnavailable: @escaping @Sendable () -> Void = {}
     ) {
         self.onPlay = onPlay
         self.onPause = onPause
@@ -107,6 +114,9 @@ public struct RemoteCommandCallbacks: Sendable {
         self.onPreviousTrack = onPreviousTrack
         self.onSeekDelta = onSeekDelta
         self.onSeekToPosition = onSeekToPosition
+        self.onInterruptionBegan = onInterruptionBegan
+        self.onInterruptionEndedShouldResume = onInterruptionEndedShouldResume
+        self.onOldAudioDeviceUnavailable = onOldAudioDeviceUnavailable
     }
 }
 
@@ -114,15 +124,41 @@ public struct RemoteCommandCallbacks: Sendable {
 /// and iOS/iPadOS (Lock Screen / Dynamic Island).
 @MainActor
 public final class NowPlayingCoordinator {
+    private struct PublishedNowPlayingKey: Equatable {
+        let title: String
+        let artist: String?
+        let album: String?
+        let artworkDigest: SHA256Digest?
+        let isPlaying: Bool
+        let roundedDurationTenths: Int
+    }
+
     private var registeredTargets: [(MPRemoteCommand, Any)] = []
+    private var notificationObservers: [NSObjectProtocol] = []
+    private var cachedArtworkDigest: SHA256Digest?
+    #if canImport(MediaPlayer)
+    private var cachedArtwork: MPMediaItemArtwork?
+    #endif
+    private var lastPublishedKey: PublishedNowPlayingKey?
+    private var lastPublishedElapsed: TimeInterval = 0
+    private var lastPublishedUptime: TimeInterval = 0
+    private var lastCommandAvailability: (next: Bool, prev: Bool, seek: Bool)?
 
     public init() {}
 
-    public func configureAudioSessionIfNeeded() {
+    @discardableResult
+    public func configureAudioSessionIfNeeded() -> String? {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, options: [])
-        try? session.setActive(true)
+        do {
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+            return nil
+        } catch {
+            return "音频会话配置失败：\(error.localizedDescription)"
+        }
+        #else
+        return nil
         #endif
     }
 
@@ -181,6 +217,42 @@ public final class NowPlayingCoordinator {
             (center.skipBackwardCommand, skipBackTarget),
             (center.changePlaybackPositionCommand, seekTarget)
         ]
+
+        #if os(iOS)
+        let nc = NotificationCenter.default
+        let interruptionToken = nc.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            guard let typeRaw, let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+            switch type {
+            case .began:
+                callbacks.onInterruptionBegan()
+            case .ended:
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+                if options.contains(.shouldResume) {
+                    callbacks.onInterruptionEndedShouldResume()
+                }
+            @unknown default:
+                break
+            }
+        }
+        let routeToken = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { note in
+            guard let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
+            if reason == .oldDeviceUnavailable {
+                callbacks.onOldAudioDeviceUnavailable()
+            }
+        }
+        notificationObservers = [interruptionToken, routeToken]
+        #endif
         #endif
     }
 
@@ -191,27 +263,77 @@ public final class NowPlayingCoordinator {
         }
         registeredTargets.removeAll()
         #endif
+        for obs in notificationObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        notificationObservers.removeAll()
+        lastCommandAvailability = nil
+    }
+
+    public func updateCommandAvailability(canSkipNext: Bool, canSkipPrevious: Bool, hasActiveTrack: Bool) {
+        #if canImport(MediaPlayer)
+        let nextTuple = (next: canSkipNext, prev: canSkipPrevious, seek: hasActiveTrack)
+        if let prev = lastCommandAvailability,
+           prev.next == nextTuple.next,
+           prev.prev == nextTuple.prev,
+           prev.seek == nextTuple.seek {
+            return
+        }
+        lastCommandAvailability = nextTuple
+        let center = MPRemoteCommandCenter.shared()
+        center.nextTrackCommand.isEnabled = canSkipNext
+        center.previousTrackCommand.isEnabled = canSkipPrevious
+        center.changePlaybackPositionCommand.isEnabled = hasActiveTrack
+        center.skipForwardCommand.isEnabled = hasActiveTrack
+        center.skipBackwardCommand.isEnabled = hasActiveTrack
+        #endif
     }
 
     public func updateNowPlaying(
         metadata: NowPlayingMetadata?,
         isPlaying: Bool,
         elapsedSeconds: TimeInterval,
-        durationSeconds: TimeInterval
+        durationSeconds: TimeInterval,
+        forceUpdate: Bool = false
     ) {
         #if canImport(MediaPlayer)
         let center = MPNowPlayingInfoCenter.default()
         guard let metadata else {
-            center.nowPlayingInfo = nil
-            #if os(macOS)
-            center.playbackState = .stopped
-            #endif
+            if lastPublishedKey != nil || center.nowPlayingInfo != nil {
+                center.nowPlayingInfo = nil
+                lastPublishedKey = nil
+                lastPublishedElapsed = 0
+                lastPublishedUptime = 0
+                #if os(macOS)
+                center.playbackState = .stopped
+                #endif
+            }
             return
+        }
+
+        let digest = metadata.artworkData.map { SHA256.hash(data: $0) }
+        let safeDuration = (durationSeconds > 0 && durationSeconds.isFinite) ? durationSeconds : 0
+        let safeElapsed = max(0, elapsedSeconds.isFinite ? elapsedSeconds : 0)
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let key = PublishedNowPlayingKey(
+            title: metadata.title,
+            artist: metadata.artist,
+            album: metadata.album,
+            artworkDigest: digest,
+            isPlaying: isPlaying,
+            roundedDurationTenths: Int((safeDuration * 10).rounded())
+        )
+
+        if !forceUpdate, let prevKey = lastPublishedKey, prevKey == key {
+            let expectedElapsed = lastPublishedElapsed + (isPlaying ? max(0, nowUptime - lastPublishedUptime) : 0)
+            if abs(safeElapsed - expectedElapsed) < 1.5 {
+                return
+            }
         }
 
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: metadata.title,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: max(0, elapsedSeconds),
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: safeElapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
         ]
         if let artist = metadata.artist, !artist.isEmpty {
@@ -220,13 +342,18 @@ public final class NowPlayingCoordinator {
         if let album = metadata.album, !album.isEmpty {
             info[MPMediaItemPropertyAlbumTitle] = album
         }
-        if durationSeconds > 0, durationSeconds.isFinite {
-            info[MPMediaItemPropertyPlaybackDuration] = durationSeconds
+        if safeDuration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = safeDuration
         }
-        if let artworkData = metadata.artworkData, let artwork = makeMediaArtwork(from: artworkData) {
+        if let artworkData = metadata.artworkData,
+           let digest,
+           let artwork = resolvedArtwork(from: artworkData, digest: digest) {
             info[MPMediaItemPropertyArtwork] = artwork
         }
         center.nowPlayingInfo = info
+        lastPublishedKey = key
+        lastPublishedElapsed = safeElapsed
+        lastPublishedUptime = nowUptime
         #if os(macOS)
         center.playbackState = isPlaying ? .playing : .paused
         #endif
@@ -234,6 +361,16 @@ public final class NowPlayingCoordinator {
     }
 
     #if canImport(MediaPlayer)
+    private func resolvedArtwork(from data: Data, digest: SHA256Digest) -> MPMediaItemArtwork? {
+        if cachedArtworkDigest == digest, let cachedArtwork {
+            return cachedArtwork
+        }
+        let created = makeMediaArtwork(from: data)
+        cachedArtworkDigest = digest
+        cachedArtwork = created
+        return created
+    }
+
     private func makeMediaArtwork(from data: Data) -> MPMediaItemArtwork? {
         #if os(macOS)
         guard let img = NSImage(data: data) else { return nil }

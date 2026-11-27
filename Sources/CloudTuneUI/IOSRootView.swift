@@ -164,9 +164,9 @@ public struct IOSRootView: View {
                 NavigationStack {
                     Group {
                         switch viewModel.activeModule {
-                        case .music: iosMusicTab(palette: palette)
+                        case .music, .cloud: iosMusicTab(palette: palette)
                         case .video: iosVideoTab(palette: palette)
-                        case .download: iosDownloadTab(palette: palette)
+                        case .transfers: iosDownloadTab(palette: palette)
                         case .settings: iosSettingsTab(palette: palette)
                         }
                     }
@@ -188,12 +188,7 @@ public struct IOSRootView: View {
         HStack(spacing: 6) {
             ForEach(ModuleTab.allCases) { tab in
                 let isSelected = viewModel.activeModule == tab
-                let icon: String = switch tab {
-                case .music: "music.note.list"
-                case .video: "film"
-                case .download: "arrow.down.circle"
-                case .settings: "gearshape"
-                }
+                let icon = tab.systemImage
                 Button {
                     viewModel.activeModule = tab
                 } label: {
@@ -237,12 +232,7 @@ public struct IOSRootView: View {
                         .foregroundStyle(palette.inkPrimary)
                         .padding(.horizontal, 12)
                     ForEach(ModuleTab.allCases) { tab in
-                        let icon: String = switch tab {
-                        case .music: "music.note.list"
-                        case .video: "film"
-                        case .download: "arrow.down.circle"
-                        case .settings: "gearshape"
-                        }
+                        let icon = tab.systemImage
                         Button {
                             viewModel.activeModule = tab
                         } label: {
@@ -273,9 +263,9 @@ public struct IOSRootView: View {
                 VStack(spacing: 0) {
                     Group {
                         switch viewModel.activeModule {
-                        case .music: iosMusicTab(palette: palette)
+                        case .music, .cloud: iosMusicTab(palette: palette)
                         case .video: iosVideoTab(palette: palette)
-                        case .download: iosDownloadTab(palette: palette)
+                        case .transfers: iosDownloadTab(palette: palette)
                         case .settings: iosSettingsTab(palette: palette)
                         }
                     }

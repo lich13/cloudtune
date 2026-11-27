@@ -921,6 +921,170 @@ struct CloudTuneCoreTests {
         let picked = try #require(await store3.migrateLegacyTauriDataIfPresent(candidateRoots: [root3, portable3]))
         #expect(picked.refreshToken == "rt_legacy_gosu")
     }
+
+    @Test("Slice 0: AccountSettings appearance backward compatibility, PlaybackQueueResolver, write-through callback, and on-demand TransferEngine notifications")
+    func verifyQueueResolverAppearanceCompatWriteThroughCallbackAndTransferActivity() async throws {
+        // 1) Legacy settings JSON without appearanceMode/dynamicColorEnabled decodes cleanly; ModuleTab maps legacy "download" -> .transfers
+        let legacyJSON = Data(#"{"cacheLimitMb":2048,"downloadThreads":6,"cacheThreads":3,"playbackMode":"stream_cache"}"#.utf8)
+        let decodedLegacy = try JSONDecoder().decode(AccountSettings.self, from: legacyJSON)
+        #expect(decodedLegacy.appearanceMode == .system)
+        #expect(decodedLegacy.dynamicColorEnabled == false)
+        #expect(decodedLegacy.cacheLimitMb == 2048)
+
+        let updatedSettings = AccountSettings(
+            cacheLimitMb: 4096,
+            downloadThreads: 8,
+            cacheThreads: 4,
+            playbackMode: .streamCache,
+            appearanceMode: .dark,
+            dynamicColorEnabled: true
+        )
+        let encodedUpdated = try JSONEncoder().encode(updatedSettings)
+        let roundTripped = try JSONDecoder().decode(AccountSettings.self, from: encodedUpdated)
+        #expect(roundTripped.appearanceMode == .dark)
+        #expect(roundTripped.dynamicColorEnabled == true)
+
+        let legacyTab = try JSONDecoder().decode(ModuleTab.self, from: Data(#""download""#.utf8))
+        #expect(legacyTab == .transfers)
+
+        // 2) PlaybackQueueResolver: Play Next FIFO priority, LoopMode.off boundaries, LoopMode.all wrap, and ad-hoc cloud track
+        let t1 = TrackSummary(id: "t1", name: "01.flac", folderPath: "A", sizeBytes: 100)
+        let t2 = TrackSummary(id: "t2", name: "02.wav", folderPath: "A", sizeBytes: 100)
+        let t3 = TrackSummary(id: "t3", name: "03.mp3", folderPath: "A", sizeBytes: 100)
+        let cloudOnly = TrackSummary(id: "cloud-x", name: "Preview.flac", folderPath: "Cloud", sizeBytes: 100)
+        #expect(t1.isLosslessAudio == true)
+        #expect(t2.isLosslessAudio == true)
+        #expect(t3.isLosslessAudio == false)
+
+        let lib = [t1, t2, t3]
+        var upNext = PlaybackQueueResolver.insertPlayNext(upNext: [], track: t3)
+        upNext = PlaybackQueueResolver.insertPlayNext(upNext: upNext, track: t2)
+        #expect(upNext.map(\.id) == ["t2", "t3"])
+
+        let step1 = PlaybackQueueResolver.resolveNext(
+            currentTrack: t1,
+            libraryTracks: lib,
+            upNextQueue: upNext,
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .off
+        )
+        #expect(step1.track?.id == "t2")
+        #expect(step1.remainingUpNext.map(\.id) == ["t3"])
+
+        // At end of list: LoopMode.off disables skip next; LoopMode.all wraps to t1
+        #expect(PlaybackQueueResolver.canSkipNext(
+            currentTrack: t3,
+            libraryTracks: lib,
+            upNextQueue: [],
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .off
+        ) == false)
+        #expect(PlaybackQueueResolver.canSkipPrevious(
+            currentTrack: t1,
+            libraryTracks: lib,
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .off
+        ) == false)
+        #expect(PlaybackQueueResolver.resolveNext(
+            currentTrack: t3,
+            libraryTracks: lib,
+            upNextQueue: [],
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .all
+        ).track?.id == "t1")
+
+        // Ad-hoc cloud track not in libraryTracks still steps cleanly into libraryTracks
+        #expect(PlaybackQueueResolver.resolveNext(
+            currentTrack: cloudOnly,
+            libraryTracks: lib,
+            upNextQueue: [],
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .off
+        ).track?.id == "t1")
+
+        // 3) StreamProxyServer onWriteThroughCompleted fires ONLY on full write-through, never on bytes=0-1 probe
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-wt-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cacheStore = try CacheStore(cacheDirectory: tempDir.appendingPathComponent("cache"))
+        let payload = Data((0..<8192).map { UInt8($0 & 0xFF) })
+        let completedEvents = LockedBox<[(String, String, URL)]>([])
+        let semaphore = GlobalTransferSemaphore(maxPermits: 8)
+        let proxy = try StreamProxyServer(
+            semaphore: semaphore,
+            fetcher: MockUpstreamFetcher { _, range in
+                if range == "bytes=0-1" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-1/\(payload.count)", "content-length": "2"],
+                        AsyncThrowingStream { c in c.yield(payload.prefix(2)); c.finish() }
+                    )
+                }
+                return (
+                    200,
+                    ["content-length": "\(payload.count)"],
+                    AsyncThrowingStream { c in c.yield(payload); c.finish() }
+                )
+            },
+            onWriteThroughCompleted: { acctHash, tid, url in
+                completedEvents.withValue { $0.append((acctHash, tid, url)) }
+            }
+        )
+        let destURL = await cacheStore.cacheFileURL(trackId: "wt-1", originalFileName: "Song.flac")
+        let streamURL = await proxy.registerSource(
+            StreamSourceRegistration(
+                accountHash: "hashA",
+                trackId: "wt-1",
+                remoteURL: URL(string: "https://media.example.invalid/wt-1.flac")!,
+                cacheDestinationURL: destURL,
+                expectedSize: UInt64(payload.count),
+                fileName: "Song.flac",
+                cacheLimitBytes: 64 * 1024 * 1024
+            ),
+            cacheStore: cacheStore
+        )
+
+        var probeReq = URLRequest(url: streamURL)
+        probeReq.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        let (_, _) = try await URLSession.shared.data(for: probeReq)
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(completedEvents.withValue { $0.isEmpty })
+
+        let (fullBytes, _) = try await URLSession.shared.data(from: streamURL)
+        #expect(fullBytes == payload)
+        for _ in 0..<20 {
+            if completedEvents.withValue({ !$0.isEmpty }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let recordedEvents = completedEvents.withValue { $0 }
+        #expect(recordedEvents.count == 1)
+        #expect(recordedEvents.first?.0 == "hashA")
+        #expect(recordedEvents.first?.1 == "wt-1")
+        await proxy.shutdown()
+
+        // 4) TransferEngine onActivityChange transitions active -> idle cleanly
+        let activityTransitions = LockedBox<[Bool]>([])
+        let engine = TransferEngine(
+            semaphore: semaphore,
+            onActivityChange: { _, active in
+                activityTransitions.withValue { $0.append(active) }
+            },
+            urlResolver: { _ in URL(string: "https://media.example.invalid/x")! }
+        )
+        await engine.updateExternalTransferStatus(
+            id: "stream:t1",
+            accountHash: "hashA",
+            status: TransferStatus(id: "stream:t1", label: "01.flac", kind: "stream", state: "running", bytesPerSecond: 1024)
+        )
+        #expect(await engine.hasActiveTransfers() == true)
+        await engine.updateExternalTransferStatus(id: "stream:t1", accountHash: "hashA", status: nil)
+        #expect(await engine.hasActiveTransfers() == false)
+        #expect(activityTransitions.withValue { $0 } == [true, false])
+    }
 }
 
 private final class LockedBox<T>: @unchecked Sendable {

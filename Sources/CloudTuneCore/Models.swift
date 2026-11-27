@@ -6,6 +6,28 @@ public enum LoopMode: String, Codable, CaseIterable, Sendable {
     case one
 }
 
+public enum AppearanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case system
+    case light
+    case dark
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .system: return "跟随系统"
+        case .light: return "浅色"
+        case .dark: return "深色"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "system"
+        self = AppearanceMode(rawValue: raw) ?? .system
+    }
+}
+
 public enum PlaybackMode: String, Codable, CaseIterable, Sendable {
     case downloadFirst = "download_first"
     case streamCache = "stream_cache"
@@ -21,17 +43,41 @@ public enum PlaybackMode: String, Codable, CaseIterable, Sendable {
 public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
     case music
     case video
-    case download
+    case cloud
+    case transfers
     case settings
+
+    public static let download: ModuleTab = .transfers
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .music: return "音乐"
+        case .music: return "曲库"
         case .video: return "视频"
-        case .download: return "下载"
+        case .cloud: return "云盘"
+        case .transfers: return "传输"
         case .settings: return "设置"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .music: return "music.note.list"
+        case .video: return "film"
+        case .cloud: return "icloud"
+        case .transfers: return "arrow.up.arrow.down.circle"
+        case .settings: return "gearshape"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "music"
+        if raw == "download" {
+            self = .transfers
+        } else {
+            self = ModuleTab(rawValue: raw) ?? .music
         }
     }
 }
@@ -174,6 +220,20 @@ public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable
         self.sizeBytes = try c.decodeIfPresent(UInt64.self, forKey: .sizeBytes) ?? 0
         self.modifiedAt = try c.decodeIfPresent(String.self, forKey: .modifiedAt)
     }
+
+    public var fileExtensionUpper: String {
+        let ext = (name as NSString).pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ext.uppercased()
+    }
+
+    public var isLosslessAudio: Bool {
+        switch fileExtensionUpper {
+        case "FLAC", "WAV", "ALAC", "APE", "AIFF", "AIF", "DSF", "DFF":
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 public struct FolderBrowsePayload: Codable, Equatable, Sendable {
@@ -230,6 +290,8 @@ public struct AccountSettings: Codable, Equatable, Sendable {
     public var cacheThreads: Int
     public var playbackMode: PlaybackMode
     public var exportFolderDisplayName: String?
+    public var appearanceMode: AppearanceMode
+    public var dynamicColorEnabled: Bool
 
     public init(
         musicFolder: FolderSelection? = nil,
@@ -237,7 +299,9 @@ public struct AccountSettings: Codable, Equatable, Sendable {
         downloadThreads: Int = 8,
         cacheThreads: Int = 4,
         playbackMode: PlaybackMode = .downloadFirst,
-        exportFolderDisplayName: String? = nil
+        exportFolderDisplayName: String? = nil,
+        appearanceMode: AppearanceMode = .system,
+        dynamicColorEnabled: Bool = false
     ) {
         self.musicFolder = musicFolder
         self.cacheLimitMb = max(Self.minCacheLimitMB, cacheLimitMb)
@@ -245,6 +309,8 @@ public struct AccountSettings: Codable, Equatable, Sendable {
         self.cacheThreads = min(max(1, cacheThreads), Self.maxCacheThreads)
         self.playbackMode = playbackMode
         self.exportFolderDisplayName = exportFolderDisplayName
+        self.appearanceMode = appearanceMode
+        self.dynamicColorEnabled = dynamicColorEnabled
     }
 
     public var cacheLimitBytes: UInt64 {
@@ -262,6 +328,8 @@ public struct AccountSettings: Codable, Equatable, Sendable {
         self.cacheThreads = min(max(1, rawCache), Self.maxCacheThreads)
         self.playbackMode = try c.decodeIfPresent(PlaybackMode.self, forKey: .playbackMode) ?? .downloadFirst
         self.exportFolderDisplayName = try c.decodeIfPresent(String.self, forKey: .exportFolderDisplayName)
+        self.appearanceMode = (try? c.decodeIfPresent(AppearanceMode.self, forKey: .appearanceMode)) ?? .system
+        self.dynamicColorEnabled = try c.decodeIfPresent(Bool.self, forKey: .dynamicColorEnabled) ?? false
     }
 }
 
@@ -349,6 +417,252 @@ public struct TransferSnapshotPayload: Codable, Equatable, Sendable {
     public init(totalSpeedBytesPerSecond: UInt64 = 0, items: [TransferStatus] = []) {
         self.totalSpeedBytesPerSecond = totalSpeedBytesPerSecond
         self.items = items
+    }
+
+    public var hasActiveItems: Bool {
+        items.contains { $0.state == "running" || $0.state == "streaming" }
+    }
+}
+
+public struct QueueStepResult: Equatable, Sendable {
+    public let track: TrackSummary?
+    public let remainingUpNext: [TrackSummary]
+
+    public init(track: TrackSummary?, remainingUpNext: [TrackSummary]) {
+        self.track = track
+        self.remainingUpNext = remainingUpNext
+    }
+}
+
+public enum PlaybackQueueResolver {
+    public static func buildShuffleOrder(tracks: [TrackSummary], anchorTrackId: String?) -> [String] {
+        guard !tracks.isEmpty else { return [] }
+        var rest = tracks.map(\.id)
+        if let anchorTrackId, let idx = rest.firstIndex(of: anchorTrackId) {
+            rest.remove(at: idx)
+            rest.shuffle()
+            return [anchorTrackId] + rest
+        }
+        rest.shuffle()
+        return rest
+    }
+
+    public static func orderedBaseTracks(
+        libraryTracks: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String]
+    ) -> [TrackSummary] {
+        guard shuffle, libraryTracks.count > 1 else {
+            return libraryTracks
+        }
+        var byId: [String: TrackSummary] = [:]
+        byId.reserveCapacity(libraryTracks.count)
+        for track in libraryTracks where byId[track.id] == nil {
+            byId[track.id] = track
+        }
+        var result: [TrackSummary] = []
+        result.reserveCapacity(libraryTracks.count)
+        var seen = Set<String>()
+        for id in shuffleOrderIds {
+            if let track = byId[id], seen.insert(id).inserted {
+                result.append(track)
+            }
+        }
+        for track in libraryTracks where seen.insert(track.id).inserted {
+            result.append(track)
+        }
+        return result
+    }
+
+    public static func insertPlayNext(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
+        [track] + upNext.filter { $0.id != track.id }
+    }
+
+    public static func appendToQueue(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
+        if upNext.contains(where: { $0.id == track.id }) {
+            return upNext
+        }
+        return upNext + [track]
+    }
+
+    public static func removeFromQueue(upNext: [TrackSummary], trackId: String) -> [TrackSummary] {
+        upNext.filter { $0.id != trackId }
+    }
+
+    public static func canSkipNext(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        upNextQueue: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode
+    ) -> Bool {
+        if !upNextQueue.isEmpty {
+            return true
+        }
+        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        guard !ordered.isEmpty else {
+            return currentTrack != nil && loopMode == .one
+        }
+        guard let currentId = currentTrack?.id,
+              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+            return true
+        }
+        if idx + 1 < ordered.count {
+            return true
+        }
+        return loopMode != .off
+    }
+
+    public static func canSkipPrevious(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode
+    ) -> Bool {
+        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        guard !ordered.isEmpty else {
+            return currentTrack != nil && loopMode == .one
+        }
+        guard let currentId = currentTrack?.id,
+              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+            return true
+        }
+        if idx > 0 {
+            return true
+        }
+        return loopMode != .off
+    }
+
+    public static func resolveNext(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        upNextQueue: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode,
+        autoAdvanceAtEnd: Bool = false
+    ) -> QueueStepResult {
+        if autoAdvanceAtEnd && loopMode == .one {
+            return QueueStepResult(track: currentTrack, remainingUpNext: upNextQueue)
+        }
+        if let firstUpNext = upNextQueue.first {
+            return QueueStepResult(track: firstUpNext, remainingUpNext: Array(upNextQueue.dropFirst()))
+        }
+        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        guard !ordered.isEmpty else {
+            let fallback = loopMode == .one ? currentTrack : nil
+            return QueueStepResult(track: fallback, remainingUpNext: upNextQueue)
+        }
+        guard let currentId = currentTrack?.id,
+              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+            return QueueStepResult(track: ordered.first, remainingUpNext: upNextQueue)
+        }
+        if idx + 1 < ordered.count {
+            return QueueStepResult(track: ordered[idx + 1], remainingUpNext: upNextQueue)
+        }
+        switch loopMode {
+        case .all:
+            return QueueStepResult(track: ordered.first, remainingUpNext: upNextQueue)
+        case .one:
+            return QueueStepResult(track: currentTrack ?? ordered.first, remainingUpNext: upNextQueue)
+        case .off:
+            return QueueStepResult(track: nil, remainingUpNext: upNextQueue)
+        }
+    }
+
+    public static func resolvePrevious(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        upNextQueue: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode
+    ) -> QueueStepResult {
+        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        guard !ordered.isEmpty else {
+            let fallback = loopMode == .one ? currentTrack : nil
+            return QueueStepResult(track: fallback, remainingUpNext: upNextQueue)
+        }
+        guard let currentId = currentTrack?.id,
+              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+            return QueueStepResult(track: ordered.last ?? ordered.first, remainingUpNext: upNextQueue)
+        }
+        if idx > 0 {
+            return QueueStepResult(track: ordered[idx - 1], remainingUpNext: upNextQueue)
+        }
+        switch loopMode {
+        case .all:
+            return QueueStepResult(track: ordered.last, remainingUpNext: upNextQueue)
+        case .one:
+            return QueueStepResult(track: currentTrack ?? ordered.first, remainingUpNext: upNextQueue)
+        case .off:
+            return QueueStepResult(track: nil, remainingUpNext: upNextQueue)
+        }
+    }
+
+    public static func peekPrefetchCandidate(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        upNextQueue: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode
+    ) -> TrackSummary? {
+        guard loopMode != .one else { return nil }
+        return resolveNext(
+            currentTrack: currentTrack,
+            libraryTracks: libraryTracks,
+            upNextQueue: upNextQueue,
+            shuffle: shuffle,
+            shuffleOrderIds: shuffleOrderIds,
+            loopMode: loopMode,
+            autoAdvanceAtEnd: true
+        ).track
+    }
+
+    public static func upcomingPreview(
+        currentTrack: TrackSummary?,
+        libraryTracks: [TrackSummary],
+        upNextQueue: [TrackSummary],
+        shuffle: Bool,
+        shuffleOrderIds: [String],
+        loopMode: LoopMode,
+        limit: Int = 20
+    ) -> [TrackSummary] {
+        guard limit > 0 else { return [] }
+        var out: [TrackSummary] = Array(upNextQueue.prefix(limit))
+        if out.count >= limit { return out }
+
+        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        guard !ordered.isEmpty else { return out }
+
+        var queuedIds = Set(out.map(\.id))
+        if let currentId = currentTrack?.id {
+            queuedIds.insert(currentId)
+        }
+
+        let startIndex: Int
+        if let currentId = currentTrack?.id, let idx = ordered.firstIndex(where: { $0.id == currentId }) {
+            startIndex = idx + 1
+        } else {
+            startIndex = 0
+        }
+
+        if startIndex < ordered.count {
+            for item in ordered[startIndex...] where queuedIds.insert(item.id).inserted {
+                out.append(item)
+                if out.count >= limit { return out }
+            }
+        }
+        if loopMode == .all && startIndex > 0 {
+            for item in ordered[..<min(startIndex, ordered.count)] where queuedIds.insert(item.id).inserted {
+                out.append(item)
+                if out.count >= limit { return out }
+            }
+        }
+        return out
     }
 }
 

@@ -24,18 +24,38 @@ enum class PlaybackMode(val wireValue: String, val displayTitle: String) {
     }
 }
 
-enum class ModuleTab(val title: String) {
-    MUSIC("音乐"),
-    VIDEO("视频"),
-    DOWNLOAD("下载"),
-    SETTINGS("设置")
+enum class ModuleTab(val wireValue: String, val title: String) {
+    MUSIC("music", "曲库"),
+    VIDEO("video", "视频"),
+    CLOUD("cloud", "云盘"),
+    TRANSFERS("transfers", "传输"),
+    SETTINGS("settings", "设置");
+
+    companion object {
+        val DOWNLOAD: ModuleTab = TRANSFERS
+
+        fun fromWire(raw: String?): ModuleTab {
+            val clean = raw?.trim()?.lowercase(Locale.ROOT)
+            if (clean == "download") return TRANSFERS
+            return entries.firstOrNull { it.wireValue == clean } ?: MUSIC
+        }
+    }
 }
 
-enum class AppThemeMode(val title: String) {
-    SYSTEM("跟随系统"),
-    LIGHT("暖羊皮纸"),
-    DARK("松林暗夜")
+enum class AppearanceMode(val wireValue: String, val title: String) {
+    SYSTEM("system", "跟随系统"),
+    LIGHT("light", "浅色"),
+    DARK("dark", "深色");
+
+    companion object {
+        fun fromWire(raw: String?): AppearanceMode {
+            val clean = raw?.trim()?.lowercase(Locale.ROOT)
+            return entries.firstOrNull { it.wireValue == clean } ?: SYSTEM
+        }
+    }
 }
+
+typealias AppThemeMode = AppearanceMode
 
 enum class SnapshotScene(val fileStem: String) {
     AUTH_IDLE("01-auth-idle"),
@@ -117,7 +137,18 @@ data class TrackSummary(
     val folderPath: String,
     val sizeBytes: Long,
     val modifiedAt: String? = null
-)
+) {
+    val fileExtensionUpper: String
+        get() {
+            val dot = name.lastIndexOf('.')
+            return if (dot in 0 until name.lastIndex) {
+                name.substring(dot + 1).trim().uppercase(Locale.ROOT)
+            } else ""
+        }
+
+    val isLosslessAudio: Boolean
+        get() = fileExtensionUpper in setOf("FLAC", "WAV", "ALAC", "APE", "AIFF", "AIF", "DSF", "DFF")
+}
 
 data class FolderBrowsePayload(
     val currentFolderId: String,
@@ -137,7 +168,9 @@ data class AccountSettings(
     val cacheThreads: Int = 4,
     val playbackMode: PlaybackMode = PlaybackMode.DOWNLOAD_FIRST,
     val exportTreeUri: String? = null,
-    val exportFolderDisplayName: String? = null
+    val exportFolderDisplayName: String? = null,
+    val appearanceMode: AppearanceMode = AppearanceMode.SYSTEM,
+    val dynamicColorEnabled: Boolean = false
 ) {
     val cacheLimitBytes: Long get() = cacheLimitMb.coerceAtLeast(MIN_CACHE_LIMIT_MB) * 1024L * 1024L
 
@@ -165,7 +198,222 @@ data class TransferStatus(
 data class TransferSnapshotPayload(
     val totalSpeedBytesPerSecond: Long = 0L,
     val items: List<TransferStatus> = emptyList()
+) {
+    val hasActiveItems: Boolean
+        get() = items.any { it.state == "running" || it.state == "streaming" }
+}
+
+data class QueueStepResult(
+    val track: TrackSummary?,
+    val remainingUpNext: List<TrackSummary>
 )
+
+object PlaybackQueueResolver {
+    fun buildShuffleOrder(tracks: List<TrackSummary>, anchorTrackId: String?): List<String> {
+        if (tracks.isEmpty()) return emptyList()
+        val ids = tracks.map { it.id }.toMutableList()
+        if (anchorTrackId != null && ids.remove(anchorTrackId)) {
+            ids.shuffle()
+            return listOf(anchorTrackId) + ids
+        }
+        ids.shuffle()
+        return ids
+    }
+
+    fun orderedBaseTracks(
+        libraryTracks: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>
+    ): List<TrackSummary> {
+        if (!shuffle || libraryTracks.size <= 1) return libraryTracks
+        val byId = LinkedHashMap<String, TrackSummary>(libraryTracks.size)
+        for (track in libraryTracks) {
+            byId.putIfAbsent(track.id, track)
+        }
+        val result = ArrayList<TrackSummary>(libraryTracks.size)
+        val seen = HashSet<String>(libraryTracks.size)
+        for (id in shuffleOrderIds) {
+            val found = byId[id]
+            if (found != null && seen.add(id)) {
+                result.add(found)
+            }
+        }
+        for (track in libraryTracks) {
+            if (seen.add(track.id)) {
+                result.add(track)
+            }
+        }
+        return result
+    }
+
+    fun insertPlayNext(upNext: List<TrackSummary>, track: TrackSummary): List<TrackSummary> =
+        listOf(track) + upNext.filterNot { it.id == track.id }
+
+    fun appendToQueue(upNext: List<TrackSummary>, track: TrackSummary): List<TrackSummary> =
+        if (upNext.any { it.id == track.id }) upNext else (upNext + track)
+
+    fun removeFromQueue(upNext: List<TrackSummary>, trackId: String): List<TrackSummary> =
+        upNext.filterNot { it.id == trackId }
+
+    fun canSkipNext(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        upNextQueue: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode
+    ): Boolean {
+        if (upNextQueue.isNotEmpty()) return true
+        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        if (ordered.isEmpty()) return currentTrack != null && loopMode == LoopMode.ONE
+        val currentId = currentTrack?.id ?: return true
+        val idx = ordered.indexOfFirst { it.id == currentId }
+        if (idx < 0) return true
+        if (idx + 1 < ordered.size) return true
+        return loopMode != LoopMode.OFF
+    }
+
+    fun canSkipPrevious(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode
+    ): Boolean {
+        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        if (ordered.isEmpty()) return currentTrack != null && loopMode == LoopMode.ONE
+        val currentId = currentTrack?.id ?: return true
+        val idx = ordered.indexOfFirst { it.id == currentId }
+        if (idx < 0) return true
+        if (idx > 0) return true
+        return loopMode != LoopMode.OFF
+    }
+
+    fun resolveNext(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        upNextQueue: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode,
+        autoAdvanceAtEnd: Boolean = false
+    ): QueueStepResult {
+        if (autoAdvanceAtEnd && loopMode == LoopMode.ONE) {
+            return QueueStepResult(currentTrack, upNextQueue)
+        }
+        if (upNextQueue.isNotEmpty()) {
+            return QueueStepResult(upNextQueue.first(), upNextQueue.drop(1))
+        }
+        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        if (ordered.isEmpty()) {
+            return QueueStepResult(if (loopMode == LoopMode.ONE) currentTrack else null, upNextQueue)
+        }
+        val currentId = currentTrack?.id
+        val idx = if (currentId != null) ordered.indexOfFirst { it.id == currentId } else -1
+        if (idx < 0) {
+            return QueueStepResult(ordered.firstOrNull(), upNextQueue)
+        }
+        if (idx + 1 < ordered.size) {
+            return QueueStepResult(ordered[idx + 1], upNextQueue)
+        }
+        return when (loopMode) {
+            LoopMode.ALL -> QueueStepResult(ordered.firstOrNull(), upNextQueue)
+            LoopMode.ONE -> QueueStepResult(currentTrack ?: ordered.firstOrNull(), upNextQueue)
+            LoopMode.OFF -> QueueStepResult(null, upNextQueue)
+        }
+    }
+
+    fun resolvePrevious(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        upNextQueue: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode
+    ): QueueStepResult {
+        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        if (ordered.isEmpty()) {
+            return QueueStepResult(if (loopMode == LoopMode.ONE) currentTrack else null, upNextQueue)
+        }
+        val currentId = currentTrack?.id
+        val idx = if (currentId != null) ordered.indexOfFirst { it.id == currentId } else -1
+        if (idx < 0) {
+            return QueueStepResult(ordered.lastOrNull() ?: ordered.firstOrNull(), upNextQueue)
+        }
+        if (idx > 0) {
+            return QueueStepResult(ordered[idx - 1], upNextQueue)
+        }
+        return when (loopMode) {
+            LoopMode.ALL -> QueueStepResult(ordered.lastOrNull(), upNextQueue)
+            LoopMode.ONE -> QueueStepResult(currentTrack ?: ordered.firstOrNull(), upNextQueue)
+            LoopMode.OFF -> QueueStepResult(null, upNextQueue)
+        }
+    }
+
+    fun peekPrefetchCandidate(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        upNextQueue: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode
+    ): TrackSummary? {
+        if (loopMode == LoopMode.ONE) return null
+        return resolveNext(
+            currentTrack = currentTrack,
+            libraryTracks = libraryTracks,
+            upNextQueue = upNextQueue,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            loopMode = loopMode,
+            autoAdvanceAtEnd = true
+        ).track
+    }
+
+    fun upcomingPreview(
+        currentTrack: TrackSummary?,
+        libraryTracks: List<TrackSummary>,
+        upNextQueue: List<TrackSummary>,
+        shuffle: Boolean,
+        shuffleOrderIds: List<String>,
+        loopMode: LoopMode,
+        limit: Int = 20
+    ): List<TrackSummary> {
+        if (limit <= 0) return emptyList()
+        val out = ArrayList<TrackSummary>(minOf(limit, upNextQueue.size + libraryTracks.size))
+        out.addAll(upNextQueue.take(limit))
+        if (out.size >= limit) return out
+
+        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        if (ordered.isEmpty()) return out
+
+        val seen = out.mapTo(HashSet()) { it.id }
+        currentTrack?.id?.let { seen.add(it) }
+
+        val startIndex = currentTrack?.id?.let { id ->
+            val idx = ordered.indexOfFirst { it.id == id }
+            if (idx >= 0) idx + 1 else 0
+        } ?: 0
+
+        for (i in startIndex until ordered.size) {
+            val item = ordered[i]
+            if (seen.add(item.id)) {
+                out.add(item)
+                if (out.size >= limit) return out
+            }
+        }
+        if (loopMode == LoopMode.ALL && startIndex > 0) {
+            for (i in 0 until minOf(startIndex, ordered.size)) {
+                val item = ordered[i]
+                if (seen.add(item.id)) {
+                    out.add(item)
+                    if (out.size >= limit) return out
+                }
+            }
+        }
+        return out
+    }
+}
 
 data class QrLoginStart(val qrContent: String, val message: String)
 
@@ -191,6 +439,8 @@ data class RepresentativeFixture(
     val cacheThreads: Int,
     val playbackMode: PlaybackMode,
     val cacheUsageBytes: Long,
+    val appearanceMode: AppearanceMode = AppearanceMode.SYSTEM,
+    val dynamicColorEnabled: Boolean = false,
     val qrContent: String,
     val qrMessage: String,
     val qrHost: String,
@@ -277,6 +527,8 @@ data class RepresentativeFixture(
                 cacheThreads = settings.getInt("cacheThreads"),
                 playbackMode = PlaybackMode.fromWire(settings.optString("playbackMode")),
                 cacheUsageBytes = settings.getLong("cacheUsageBytes"),
+                appearanceMode = AppearanceMode.fromWire(settings.optString("appearanceMode")),
+                dynamicColorEnabled = settings.optBoolean("dynamicColorEnabled", false),
                 qrContent = qr.getString("qrContent"),
                 qrMessage = qr.getString("message"),
                 qrHost = qr.getString("host"),

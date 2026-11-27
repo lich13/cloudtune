@@ -9,6 +9,7 @@ import android.util.AtomicFile
 import android.util.Base64
 import androidx.documentfile.provider.DocumentFile
 import com.gosu.cloudtune.core.AccountSettings
+import com.gosu.cloudtune.core.AppearanceMode
 import com.gosu.cloudtune.core.Cloud189Protocol
 import com.gosu.cloudtune.core.CloudTuneException
 import com.gosu.cloudtune.core.FolderSelection
@@ -17,7 +18,11 @@ import com.gosu.cloudtune.core.PlaybackMode
 import com.gosu.cloudtune.core.TrackSummary
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.OutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.KeyStore
 import java.util.UUID
 import javax.crypto.Cipher
@@ -124,6 +129,8 @@ data class AccountPaths(
 )
 
 class AccountStore(val rootDir: File) {
+    private val ioLock = Any()
+
     init {
         rootDir.mkdirs()
     }
@@ -147,11 +154,60 @@ class AccountStore(val rootDir: File) {
         )
     }
 
+    private fun readAtomicTextOrNull(target: File): String? = synchronized(ioLock) {
+        val af = AtomicFile(target)
+        val base = af.baseFile
+        if (base != null) {
+            if (!base.isFile) return null
+            return af.openRead().use { it.readBytes().toString(Charsets.UTF_8) }
+        }
+        if (!target.isFile) return null
+        return target.readText(Charsets.UTF_8)
+    }
+
+    private fun writeAtomicText(target: File, content: String) = synchronized(ioLock) {
+        target.parentFile?.mkdirs()
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        val af = AtomicFile(target)
+        if (af.baseFile != null) {
+            val stream = af.startWrite()
+            try {
+                stream.write(bytes)
+                af.finishWrite(stream)
+                return
+            } catch (e: Exception) {
+                af.failWrite(stream)
+                throw e
+            }
+        }
+        val tmp = File(target.parentFile ?: File("."), ".${target.name}.${UUID.randomUUID()}.tmp")
+        try {
+            FileOutputStream(tmp).use { out ->
+                out.write(bytes)
+                out.fd.sync()
+            }
+            try {
+                Files.move(
+                    tmp.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            if (tmp.exists()) {
+                tmp.delete()
+            }
+        }
+    }
+
     fun loadSettings(accountId: String): AccountSettings {
-        val f = paths(accountId).settingsFile
-        if (!f.isFile) return AccountSettings()
+        val raw = runCatching { readAtomicTextOrNull(paths(accountId).settingsFile) }.getOrNull()
+            ?: return AccountSettings()
         return runCatching {
-            val o = JSONObject(f.readText(Charsets.UTF_8))
+            val o = JSONObject(raw)
             val mf = o.optJSONObject("musicFolder")?.let {
                 FolderSelection(it.getString("id"), it.getString("name"))
             }
@@ -162,7 +218,9 @@ class AccountStore(val rootDir: File) {
                 cacheThreads = o.optInt("cacheThreads", 4).coerceIn(1, AccountSettings.MAX_CACHE_THREADS),
                 playbackMode = PlaybackMode.fromWire(o.optString("playbackMode")),
                 exportTreeUri = o.optString("exportTreeUri").takeIf { it.isNotEmpty() },
-                exportFolderDisplayName = o.optString("exportFolderDisplayName").takeIf { it.isNotEmpty() }
+                exportFolderDisplayName = o.optString("exportFolderDisplayName").takeIf { it.isNotEmpty() },
+                appearanceMode = AppearanceMode.fromWire(o.optString("appearanceMode")),
+                dynamicColorEnabled = o.optBoolean("dynamicColorEnabled", false)
             )
         }.getOrDefault(AccountSettings())
     }
@@ -174,19 +232,21 @@ class AccountStore(val rootDir: File) {
             .put("downloadThreads", settings.downloadThreads)
             .put("cacheThreads", settings.cacheThreads)
             .put("playbackMode", settings.playbackMode.wireValue)
+            .put("appearanceMode", settings.appearanceMode.wireValue)
+            .put("dynamicColorEnabled", settings.dynamicColorEnabled)
         settings.musicFolder?.let {
             o.put("musicFolder", JSONObject().put("id", it.id).put("name", it.name))
         }
         settings.exportTreeUri?.let { o.put("exportTreeUri", it) }
         settings.exportFolderDisplayName?.let { o.put("exportFolderDisplayName", it) }
-        f.writeText(o.toString(), Charsets.UTF_8)
+        writeAtomicText(f, o.toString())
     }
 
     fun loadLibrary(accountId: String): List<TrackSummary> {
-        val f = paths(accountId).libraryFile
-        if (!f.isFile) return emptyList()
+        val raw = runCatching { readAtomicTextOrNull(paths(accountId).libraryFile) }.getOrNull()
+            ?: return emptyList()
         return runCatching {
-            val arr = JSONArray(f.readText(Charsets.UTF_8))
+            val arr = JSONArray(raw)
             (0 until arr.length()).map { i ->
                 val o = arr.getJSONObject(i)
                 TrackSummary(
@@ -213,7 +273,7 @@ class AccountStore(val rootDir: File) {
                     .put("modifiedAt", t.modifiedAt ?: JSONObject.NULL)
             )
         }
-        f.writeText(arr.toString(), Charsets.UTF_8)
+        writeAtomicText(f, arr.toString())
     }
 }
 

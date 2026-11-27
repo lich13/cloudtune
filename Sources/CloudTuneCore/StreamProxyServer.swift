@@ -194,6 +194,7 @@ public actor StreamProxyServer {
     private nonisolated let urlRefresher: (@Sendable (String) async throws -> URL)?
     private nonisolated let onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)?
     private nonisolated let onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)?
+    private nonisolated let onWriteThroughCompleted: (@Sendable (String, String, URL) async -> Void)?
     private var sourcesByToken: [String: StreamSourceRegistration] = [:]
     private var cacheStoresByAccount: [String: CacheStore] = [:]
     private var activeConnectionsByID: [UUID: ActiveStreamConnection] = [:]
@@ -203,6 +204,7 @@ public actor StreamProxyServer {
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)? = nil,
         onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)? = nil,
+        onWriteThroughCompleted: (@Sendable (String, String, URL) async -> Void)? = nil,
         urlRefresher: (@Sendable (String) async throws -> URL)? = nil
     ) throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
@@ -245,6 +247,7 @@ public actor StreamProxyServer {
         self.fetcher = fetcher
         self.onStreamStatusUpdate = onStreamStatusUpdate
         self.onAccountStreamStatusUpdate = onAccountStreamStatusUpdate
+        self.onWriteThroughCompleted = onWriteThroughCompleted
         self.urlRefresher = urlRefresher
 
         let acceptQ = DispatchQueue(label: "com.gosu.cloudtune.proxy.accept.\(self.port)", qos: .userInitiated)
@@ -615,12 +618,22 @@ public actor StreamProxyServer {
                         promoted = (try? FileManager.default.moveItem(at: partURL, to: source.cacheDestinationURL)) != nil
                     }
                     if promoted {
-                        _ = try? await cacheStore.recordCompletedFile(
-                            trackId: source.trackId,
-                            fileURL: source.cacheDestinationURL,
-                            sizeBytes: delivered,
-                            limitBytes: source.cacheLimitBytes
-                        )
+                        do {
+                            _ = try await cacheStore.recordCompletedFile(
+                                trackId: source.trackId,
+                                fileURL: source.cacheDestinationURL,
+                                sizeBytes: delivered,
+                                limitBytes: source.cacheLimitBytes
+                            )
+                            if let onWriteThroughCompleted,
+                               !conn.isRevoked,
+                               !Task.isCancelled,
+                               await isSourceStillRegistered(token: source.token, accountHash: source.accountHash) {
+                                await onWriteThroughCompleted(source.accountHash, source.trackId, source.cacheDestinationURL)
+                            }
+                        } catch {
+                            try? FileManager.default.removeItem(at: source.cacheDestinationURL)
+                        }
                     } else {
                         try? FileManager.default.removeItem(at: partURL)
                     }

@@ -1,10 +1,14 @@
 package com.gosu.cloudtune.media
 
+import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -13,23 +17,38 @@ import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import com.gosu.cloudtune.MainActivity
+import com.gosu.cloudtune.R
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import java.io.File
+import java.util.concurrent.CopyOnWriteArraySet
 
 object PlaybackSessionBridge {
     @Volatile var onSkipNext: (() -> Unit)? = null
     @Volatile var onSkipPrevious: (() -> Unit)? = null
+    @Volatile var canSkipNext: Boolean = false
+    @Volatile var canSkipPrevious: Boolean = false
+    @Volatile var onQueueAvailabilityChanged: (() -> Unit)? = null
+
+    fun updateAvailability(canNext: Boolean, canPrev: Boolean) {
+        if (canSkipNext != canNext || canSkipPrevious != canPrev) {
+            canSkipNext = canNext
+            canSkipPrevious = canPrev
+            onQueueAvailabilityChanged?.invoke()
+        }
+    }
 }
 
 data class ExtractedAudioMetadata(
     val title: String,
-    val artist: String,
+    val artist: String?,
     val album: String,
     val artworkBytes: ByteArray?
 )
@@ -38,7 +57,7 @@ object AudioMetadataHelper {
     fun extract(
         localFile: File?,
         fallbackTitle: String,
-        fallbackArtist: String,
+        fallbackArtist: String? = null,
         fallbackAlbum: String
     ): ExtractedAudioMetadata {
         if (localFile == null || !localFile.isFile || localFile.length() <= 0L) {
@@ -67,9 +86,19 @@ object AudioMetadataHelper {
 class PlaybackService : MediaSessionService() {
     private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSession? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val registeredListeners = CopyOnWriteArraySet<Player.Listener>()
 
     override fun onCreate() {
         super.onCreate()
+        setMediaNotificationProvider(
+            DefaultMediaNotificationProvider.Builder(applicationContext)
+                .build()
+                .apply {
+                    setSmallIcon(R.drawable.ic_stat_cloudtune)
+                }
+        )
+
         val audioAttrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -81,29 +110,48 @@ class PlaybackService : MediaSessionService() {
         exoPlayer = rawPlayer
 
         val forwardingPlayer = object : ForwardingPlayer(rawPlayer) {
+            override fun addListener(listener: Player.Listener) {
+                registeredListeners.add(listener)
+                super.addListener(listener)
+            }
+
+            override fun removeListener(listener: Player.Listener) {
+                registeredListeners.remove(listener)
+                super.removeListener(listener)
+            }
+
             override fun getAvailableCommands(): Player.Commands {
-                return super.getAvailableCommands()
-                    .buildUpon()
-                    .add(Player.COMMAND_SEEK_TO_NEXT)
-                    .add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
-                    .add(Player.COMMAND_SEEK_TO_PREVIOUS)
-                    .add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-                    .build()
+                val builder = super.getAvailableCommands().buildUpon()
+                if (PlaybackSessionBridge.canSkipNext) {
+                    builder.add(Player.COMMAND_SEEK_TO_NEXT)
+                    builder.add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                } else {
+                    builder.remove(Player.COMMAND_SEEK_TO_NEXT)
+                    builder.remove(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                }
+                if (PlaybackSessionBridge.canSkipPrevious) {
+                    builder.add(Player.COMMAND_SEEK_TO_PREVIOUS)
+                    builder.add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                } else {
+                    builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS)
+                    builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                }
+                return builder.build()
             }
 
             override fun isCommandAvailable(command: Int): Boolean {
                 return when (command) {
                     Player.COMMAND_SEEK_TO_NEXT,
-                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> PlaybackSessionBridge.canSkipNext
                     Player.COMMAND_SEEK_TO_PREVIOUS,
-                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> true
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> PlaybackSessionBridge.canSkipPrevious
                     else -> super.isCommandAvailable(command)
                 }
             }
 
-            override fun hasNextMediaItem(): Boolean = true
+            override fun hasNextMediaItem(): Boolean = PlaybackSessionBridge.canSkipNext
 
-            override fun hasPreviousMediaItem(): Boolean = true
+            override fun hasPreviousMediaItem(): Boolean = PlaybackSessionBridge.canSkipPrevious
 
             override fun seekToNext() {
                 PlaybackSessionBridge.onSkipNext?.invoke() ?: super.seekToNext()
@@ -121,15 +169,46 @@ class PlaybackService : MediaSessionService() {
                 PlaybackSessionBridge.onSkipPrevious?.invoke() ?: super.seekToPreviousMediaItem()
             }
         }
-        mediaSession = MediaSession.Builder(this, forwardingPlayer).build()
+
+        PlaybackSessionBridge.onQueueAvailabilityChanged = {
+            mainHandler.post {
+                val cmds = forwardingPlayer.availableCommands
+                for (listener in registeredListeners) {
+                    listener.onAvailableCommandsChanged(cmds)
+                }
+            }
+        }
+
+        val sessionActivityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val sessionPendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            sessionActivityIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        mediaSession = MediaSession.Builder(this, forwardingPlayer)
+            .setSessionActivity(sessionPendingIntent)
+            .build()
         CloudTuneAppRuntime.getOrCreate(applicationContext).bindSkipBridge()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val player = mediaSession?.player
+        if (player == null || !player.playWhenReady || player.mediaItemCount == 0 || player.playbackState == Player.STATE_ENDED) {
+            stopSelf()
+        }
+    }
+
     override fun onDestroy() {
+        PlaybackSessionBridge.onQueueAvailabilityChanged = null
         PlaybackSessionBridge.onSkipNext = null
         PlaybackSessionBridge.onSkipPrevious = null
+        registeredListeners.clear()
         mediaSession?.release()
         mediaSession = null
         exoPlayer?.release()
@@ -165,21 +244,34 @@ object QrCodeHelper {
         }.getOrNull()
     }
 
-    fun saveQrBitmapToGallery(context: Context, bitmap: Bitmap): Boolean = runCatching {
+    fun saveQrBitmapToGallery(context: Context, bitmap: Bitmap): Boolean {
+        val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "CloudTune_Tianyi_QR_${System.currentTimeMillis()}.png")
             put(MediaStore.Images.Media.MIME_TYPE, "image/png")
             put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CloudTune")
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
-        val resolver = context.contentResolver
-        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-        resolver.openOutputStream(uri)?.use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-        } ?: return false
-        values.clear()
-        values.put(MediaStore.Images.Media.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        true
-    }.getOrDefault(false)
+        val uri = runCatching {
+            resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        }.getOrNull() ?: return false
+        var published = false
+        return try {
+            val compressed = resolver.openOutputStream(uri)?.use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            } ?: false
+            if (!compressed) return false
+            val publishValues = ContentValues().apply {
+                put(MediaStore.Images.Media.IS_PENDING, 0)
+            }
+            published = resolver.update(uri, publishValues, null, null) > 0
+            published
+        } catch (_: Throwable) {
+            false
+        } finally {
+            if (!published) {
+                runCatching { resolver.delete(uri, null, null) }
+            }
+        }
+    }
 }

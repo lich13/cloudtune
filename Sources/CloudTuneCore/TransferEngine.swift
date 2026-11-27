@@ -111,16 +111,42 @@ public actor TransferEngine {
     private var manifestAccountKeys: [String: String] = [:]
     private var runningTasks: [String: Task<Void, Error>] = [:]
     private var inFlightCacheDownloads: [String: InFlightCacheDownload] = [:]
+    private var onActivityChange: (@Sendable (TransferSnapshotPayload, Bool) -> Void)?
+    private var lastNotifiedHasActive: Bool = false
     private let fm = FileManager.default
 
     public init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
+        onActivityChange: (@Sendable (TransferSnapshotPayload, Bool) -> Void)? = nil,
         urlResolver: @escaping @Sendable (String) async throws -> URL
     ) {
         self.semaphore = semaphore
         self.fetcher = fetcher
+        self.onActivityChange = onActivityChange
         self.urlResolver = urlResolver
+    }
+
+    public func setOnActivityChange(_ callback: (@Sendable (TransferSnapshotPayload, Bool) -> Void)?) {
+        self.onActivityChange = callback
+        let snap = snapshot()
+        let active = snap.hasActiveItems
+        self.lastNotifiedHasActive = active
+    }
+
+    public func hasActiveTransfers() -> Bool {
+        statuses.values.contains { $0.state == "running" || $0.state == "streaming" }
+    }
+
+    private func notifyActivityChanged(force: Bool = false) {
+        guard let onActivityChange else { return }
+        let snap = snapshot()
+        let active = snap.hasActiveItems
+        let transitioned = (active != lastNotifiedHasActive)
+        lastNotifiedHasActive = active
+        if force || transitioned {
+            onActivityChange(snap, active)
+        }
     }
 
     public func restorePersistedDownloads(for accountId: String, accountStore: AccountScopedStore) async {
@@ -156,6 +182,7 @@ public actor TransferEngine {
                 totalBytes: item.totalSize > 0 ? item.totalSize : nil
             )
         }
+        notifyActivityChanged(force: true)
     }
 
     public func snapshot() -> TransferSnapshotPayload {
@@ -167,14 +194,20 @@ public actor TransferEngine {
     }
 
     public func updateExternalTransferStatus(id: String, accountHash: String? = nil, status: TransferStatus?) {
+        let previous = statuses[id]
         if let status {
             statuses[id] = status
             if let accountHash {
                 statusAccountHashes[id] = accountHash
             }
+            let forceNotify = (previous == nil) || (previous?.state != status.state)
+            notifyActivityChanged(force: forceNotify)
         } else {
-            statuses.removeValue(forKey: id)
+            let removed = statuses.removeValue(forKey: id) != nil
             statusAccountHashes.removeValue(forKey: id)
+            if removed {
+                notifyActivityChanged(force: true)
+            }
         }
     }
 
@@ -206,6 +239,7 @@ public actor TransferEngine {
                 statusAccountHashes.removeValue(forKey: key)
             }
         }
+        notifyActivityChanged(force: true)
     }
 
     /// Downloads a track directly into private cache (`download_first` or background `prefetch`) using the shared 8-permit limiter.
@@ -264,6 +298,7 @@ public actor TransferEngine {
         if let accountHash {
             statusAccountHashes[statusId] = accountHash
         }
+        notifyActivityChanged(force: true)
 
         let worker = Task<URL, Error> {
             try await self.performCacheDownload(
@@ -303,6 +338,7 @@ public actor TransferEngine {
             statuses.removeValue(forKey: inFlight.statusId)
             statusAccountHashes.removeValue(forKey: inFlight.statusId)
             inFlight.task.cancel()
+            notifyActivityChanged(force: true)
         } else {
             inFlightCacheDownloads[cacheKey] = inFlight
         }
@@ -335,6 +371,7 @@ public actor TransferEngine {
             statusAccountHashes.removeValue(forKey: statusId)
             try? fm.removeItem(at: partsDir)
             try? fm.removeItem(at: tempMerged)
+            notifyActivityChanged(force: true)
         }
 
         let remoteURL = try await urlResolver(track.id)
@@ -409,6 +446,7 @@ public actor TransferEngine {
             totalBytes: track.sizeBytes > 0 ? track.sizeBytes : nil
         )
         await persistManifests(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
+        notifyActivityChanged(force: true)
         spawnExportTask(manifest: manifest, accountKey: accountId, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
         return taskId
     }
@@ -429,6 +467,7 @@ public actor TransferEngine {
             if let accountKey = manifestAccountKeys[id] {
                 await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
             }
+            notifyActivityChanged(force: true)
         }
     }
 
@@ -444,6 +483,7 @@ public actor TransferEngine {
             statuses[id] = s
         }
         await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
+        notifyActivityChanged(force: true)
         spawnExportTask(manifest: m, accountKey: accountKey, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
     }
 
@@ -460,6 +500,7 @@ public actor TransferEngine {
             try? fm.removeItem(at: paths.stagingDir.appendingPathComponent("\(safeKey).merged"))
             await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
         }
+        notifyActivityChanged(force: true)
     }
 
     private func spawnExportTask(
@@ -550,6 +591,7 @@ public actor TransferEngine {
                 totalBytes: totalSize > 0 ? totalSize : nil
             )
             await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
+            notifyActivityChanged(force: true)
         } catch is CancellationError {
             return
         } catch {
@@ -566,6 +608,7 @@ public actor TransferEngine {
                 statuses[id] = s
                 statusAccountHashes[id] = manifest.accountHash
             }
+            notifyActivityChanged(force: true)
         }
     }
 

@@ -94,6 +94,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
 
 public actor TransferEngine {
     private struct InFlightCacheDownload {
+        let workerID: UUID
         let cacheKey: String
         let statusId: String
         let accountHash: String?
@@ -246,7 +247,8 @@ public actor TransferEngine {
             return existingAfterAwait
         }
 
-        let statusId = "\(kind):\(track.id)"
+        let workerID = UUID()
+        let statusId = "\(kind):\(track.id):\(workerID.uuidString.lowercased())"
         statuses[statusId] = TransferStatus(
             id: statusId,
             label: track.name,
@@ -265,6 +267,7 @@ public actor TransferEngine {
 
         let worker = Task<URL, Error> {
             try await self.performCacheDownload(
+                workerID: workerID,
                 cacheKey: cacheKey,
                 statusId: statusId,
                 track: track,
@@ -275,6 +278,7 @@ public actor TransferEngine {
             )
         }
         inFlightCacheDownloads[cacheKey] = InFlightCacheDownload(
+            workerID: workerID,
             cacheKey: cacheKey,
             statusId: statusId,
             accountHash: accountHash,
@@ -305,6 +309,7 @@ public actor TransferEngine {
     }
 
     private func performCacheDownload(
+        workerID: UUID,
         cacheKey: String,
         statusId: String,
         track: TrackSummary,
@@ -313,10 +318,19 @@ public actor TransferEngine {
         parallelThreads: Int,
         cacheLimitBytes: UInt64
     ) async throws -> URL {
-        let partsDir = destination.appendingPathExtension("parts")
-        let tempMerged = destination.appendingPathExtension("merged.part")
+        let parentDir = destination.deletingLastPathComponent()
+        let partsDir = parentDir.appendingPathComponent(
+            ".\(destination.lastPathComponent).\(workerID.uuidString.lowercased()).parts",
+            isDirectory: true
+        )
+        let tempMerged = parentDir.appendingPathComponent(
+            ".\(destination.lastPathComponent).\(workerID.uuidString.lowercased()).merged.part",
+            isDirectory: false
+        )
         defer {
-            inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            if inFlightCacheDownloads[cacheKey]?.workerID == workerID {
+                inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            }
             statuses.removeValue(forKey: statusId)
             statusAccountHashes.removeValue(forKey: statusId)
             try? fm.removeItem(at: partsDir)

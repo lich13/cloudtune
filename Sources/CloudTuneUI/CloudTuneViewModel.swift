@@ -316,15 +316,17 @@ public final class CloudTuneViewModel {
             isBootstrapping = false
         }
 
-        if let migrated = await accountStore.migrateLegacyTauriDataIfPresent() {
-            try? credentialMachine.save(migrated, backend: keychainBackend)
-        }
+        let migrated = await accountStore.migrateLegacyTauriDataIfPresent()
 
-        let (storedCred, issue) = credentialMachine.load(
+        var (storedCred, issue) = credentialMachine.load(
             isInteractiveGUI: true,
             userInitiatedRetry: userInitiatedKeychainRetry,
             backend: keychainBackend
         )
+        if storedCred == nil, issue == nil, let migrated {
+            try? credentialMachine.save(migrated, backend: keychainBackend)
+            storedCred = migrated
+        }
         credentialIssue = issue
         if let issue {
             statusMessage = issue.userMessage
@@ -796,9 +798,18 @@ public final class CloudTuneViewModel {
             AVError.contentIsUnavailable.rawValue
         ].contains(nsError.code)) || [-12847, -12848, -11828, -11829].contains(nsError.code)
         let isUnsupportedExt = lowerName.hasSuffix(".ape") || lowerName.hasSuffix(".wma")
+        let isNetworkError = (nsError.domain == NSURLErrorDomain)
+        let isCloudProtocolOrHttpError: Bool = switch error as? CloudTuneError {
+        case .httpStatus, .protocolError, .sessionExpired, .unauthenticated, .invalidRequest, .storageError, .exportPermissionRevoked:
+            true
+        case .unsupportedLocalMediaFormat, .none:
+            false
+        }
         let isDecode: Bool
         if case .unsupportedLocalMediaFormat = error as? CloudTuneError {
             isDecode = true
+        } else if isNetworkError || isCloudProtocolOrHttpError {
+            isDecode = false
         } else {
             isDecode = isAVDecodeError
                 || (!isTimeout && isUnsupportedExt)
@@ -947,6 +958,8 @@ public final class CloudTuneViewModel {
     // MARK: - Video & Downloads
 
     public func openVideoInApp(_ video: TrackSummary) async {
+        playbackGeneration += 1
+        recoveryAttempts = 0
         pauseIfPlaying()
         busyLabel = "准备视频流 \(video.name)..."
         defer { busyLabel = nil }
@@ -1118,7 +1131,7 @@ public final class CloudTuneViewModel {
             queue: .main
         ) { [weak self] note in
             let itemObj = note.object as? AVPlayerItem
-            let err = itemObj?.error ?? CloudTuneError.protocolError("系统解码器无法播放该音频格式")
+            let err = itemObj?.error ?? CloudTuneError.unsupportedLocalMediaFormat("系统解码器无法播放该音频格式")
             Task { @MainActor [weak self] in
                 guard let self, itemObj === self._player?.currentItem, let track = self.currentTrack else { return }
                 await self.handlePlaybackPreparationFailure(

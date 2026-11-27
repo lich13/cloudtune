@@ -274,10 +274,7 @@ private fun LoginStageScreen(viewModel: CloudTuneViewModel) {
                             PineSecondaryButton(
                                 text = "保存二维码到相册",
                                 modifier = Modifier.weight(1f),
-                                onClick = {
-                                    val ok = QrCodeHelper.saveQrBitmapToGallery(context, viewModel.qrBitmap!!)
-                                    viewModel.statusMessage = if (ok) "二维码已保存到系统相册" else "保存二维码失败"
-                                }
+                                onClick = { viewModel.saveQrToGallery(context) }
                             )
                         }
                     }

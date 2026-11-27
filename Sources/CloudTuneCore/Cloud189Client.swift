@@ -322,6 +322,9 @@ public actor Cloud189Client {
         ])
 
         let resp = try await transport.send(req)
+        guard (200..<300).contains(resp.statusCode) else {
+            throw CloudTuneError.httpStatus(resp.statusCode, "二维码轮询请求失败")
+        }
         var parsed = try Cloud189Protocol.parseQrPollPayload(resp.text, statusCode: resp.statusCode)
         switch parsed.state {
         case .authenticated:
@@ -411,8 +414,13 @@ public actor Cloud189Client {
             guard let block = json["fileListAO"] as? [String: Any] else {
                 throw CloudTuneError.protocolError("云盘目录响应缺少 fileListAO 字段")
             }
+            guard block["count"] != nil || block["folderList"] != nil || block["fileList"] != nil else {
+                throw CloudTuneError.protocolError("云盘目录 fileListAO 结构无效")
+            }
             let count = Cloud189Protocol.intValue(block["count"]) ?? 0
-            if count == 0 { break }
+            if count == 0 && (block["folderList"] as? [[String: Any]] ?? []).isEmpty && (block["fileList"] as? [[String: Any]] ?? []).isEmpty {
+                break
+            }
 
             let rawFolders = (block["folderList"] as? [[String: Any]]) ?? []
             let rawFiles = (block["fileList"] as? [[String: Any]]) ?? []
@@ -431,7 +439,7 @@ public actor Cloud189Client {
             for item in rawFiles {
                 if let id = Cloud189Protocol.stringValue(item["id"]),
                    let name = Cloud189Protocol.stringValue(item["name"]) {
-                    let size = UInt64(Cloud189Protocol.intValue(item["size"]) ?? 0)
+                    let size = UInt64(max(0, Cloud189Protocol.intValue(item["size"]) ?? 0))
                     let summary = TrackSummary(
                         id: id,
                         name: name,

@@ -243,7 +243,10 @@ object SafExporter {
             ?.takeIf { it.canWrite() }
             ?: throw CloudTuneException("导出目录授权已失效，请重新选择下载文件夹。")
 
-        val parts = relativeSubpath.split('/').map { Cloud189Protocol.sanitizeFileName(it) }.filter { it.isNotEmpty() }
+        val parts = relativeSubpath
+            .split('/')
+            .map { Cloud189Protocol.sanitizeFileName(it) }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
         if (parts.isEmpty()) throw CloudTuneException("导出文件名为空")
 
         for (dirSegment in parts.dropLast(1)) {
@@ -281,8 +284,8 @@ object SafExporter {
             throw CloudTuneException("导出目标路径已存在同名文件夹：$targetName")
         }
 
-        val tempName = ".${targetName}.cloudtune-${UUID.randomUUID()}.tmp"
-        val tempDoc = dir.createFile(mimeType, tempName)
+        val tempName = "${targetName}.cloudtune-${UUID.randomUUID()}.tmp"
+        val tempDoc = (dir.createFile("application/octet-stream", tempName) ?: dir.createFile(mimeType, tempName))
             ?: throw CloudTuneException("无法创建导出临时文件 $targetName")
 
         var tempPromoted = false
@@ -317,11 +320,15 @@ object SafExporter {
             val fallbackDest = dir.createFile(mimeType, targetName)
                 ?: throw CloudTuneException("无法创建导出文件 $targetName")
             try {
+                var fallbackWritten = 0L
                 openOutputStream(fallbackDest)?.use { out ->
                     FileInputStream(stagedFile).use { input ->
-                        input.copyTo(out, bufferSize = 262_144)
+                        fallbackWritten = input.copyTo(out, bufferSize = 262_144)
                     }
                 } ?: throw CloudTuneException("无法写入导出文件流")
+                if (expectedBytes > 0L && fallbackWritten != expectedBytes) {
+                    throw CloudTuneException("导出文件写入长度不完整：$fallbackWritten != $expectedBytes")
+                }
                 return fallbackDest.uri.toString()
             } catch (e: Exception) {
                 runCatching { fallbackDest.delete() }

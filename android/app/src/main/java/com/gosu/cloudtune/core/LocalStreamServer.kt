@@ -11,6 +11,9 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -425,7 +428,14 @@ class LocalStreamServer(
                                     }
                                     runCatching { opened.bodyStream.close(); opened.onClose() }
                                     val resumeRange = ParsedByteRange(resumeOffset, reqEnd).headerValue
-                                    val nextOpened = runCatching { openWithRefreshIfNeeded(source, resumeRange) }.getOrNull() ?: run {
+                                    val nextOpened = try {
+                                        openWithRefreshIfNeeded(source, resumeRange)
+                                    } catch (ce: CancellationException) {
+                                        completedCleanly = false
+                                        throw ce
+                                    } catch (_: Throwable) {
+                                        null
+                                    } ?: run {
                                         completedCleanly = false
                                         break@streamLoop
                                     }
@@ -456,8 +466,26 @@ class LocalStreamServer(
                                 val stillAuthorized = !session.revoked.get() &&
                                     isSourceStillRegistered(source.token, source.accountHash)
                                 if (stillAuthorized && completedCleanly && partOut != null && expectedTotal > 0L && delivered == expectedTotal && matchesExpected) {
-                                    source.cacheDestination.delete()
-                                    if (partFile.renameTo(source.cacheDestination)) {
+                                    val promoted = try {
+                                        Files.move(
+                                            partFile.toPath(),
+                                            source.cacheDestination.toPath(),
+                                            StandardCopyOption.REPLACE_EXISTING,
+                                            StandardCopyOption.ATOMIC_MOVE
+                                        )
+                                        true
+                                    } catch (_: AtomicMoveNotSupportedException) {
+                                        runCatching {
+                                            Files.move(
+                                                partFile.toPath(),
+                                                source.cacheDestination.toPath(),
+                                                StandardCopyOption.REPLACE_EXISTING
+                                            )
+                                        }.isSuccess
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                    if (promoted) {
                                         cacheManager.recordCompletedFile(
                                             trackId = source.trackId,
                                             file = source.cacheDestination,

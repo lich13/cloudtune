@@ -559,6 +559,25 @@ class Cloud189ProtocolAndProxyTest {
             assertArrayEquals(payload, f1.readBytes())
             assertEquals(1, probeCalls.get())
 
+            // Cancelling prefetch right before starting playback MUST NOT delete active .parts shards
+            val cancelRaceTrack = TrackSummary("t-cancel-race", "CancelRace.flac", "Music", payload.size.toLong())
+            val isolatedScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+            val cancelledPrefetch = isolatedScope.async {
+                engine.downloadTrackToCache(cancelRaceTrack, cm, 2, 256L * 1024L * 1024L, "prefetch", alicePaths.bucketHash)
+            }
+            delay(15L)
+            cancelledPrefetch.cancel()
+            val freshPlaybackFile = engine.downloadTrackToCache(
+                cancelRaceTrack,
+                cm,
+                4,
+                256L * 1024L * 1024L,
+                "playback",
+                alicePaths.bucketHash
+            )
+            runCatching { cancelledPrefetch.await() }
+            assertArrayEquals(payload, freshPlaybackFile.readBytes())
+
             // 3) LocalStreamServer accept-loop isolation on opener error + immediate active stream teardown on revokeAllSources
             val failNextOpen = AtomicBoolean(true)
             val firstChunkRead = AtomicBoolean(false)
@@ -742,7 +761,14 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(1 + PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS, downloadUrlCalls.get())
             assertTrue("Expected retry stop status, got: ${vm.statusMessage}", vm.statusMessage?.contains("已停止自动重试") == true)
 
-            // 4) ViewModel.onCleared() MUST keep LocalStreamServer and PlaybackSessionBridge alive
+            // ExoPlayer network "Source error" MUST NOT be misclassified as unsupported local codec
+            vm.handlePlaybackError(TrackSummary("t-src", "Network.flac", "CD 1", 1024L), "Source error", wasLoopback = false)
+            assertFalse("Source error must not claim codec unsupported: ${vm.statusMessage}", vm.statusMessage?.contains("不受系统解码器支持") == true)
+            vm.openVideoInApp(TrackSummary("v-1", "Clip.mp4", "CD 1", 2048L))
+
+            // 4) Multi-ViewModel attach/detach ref-counting + ViewModel.onCleared() survival
+            val vmSecondary = CloudTuneViewModel(runtime = runtime)
+            vmSecondary.clearViewModelForTest()
             failDownloadUrl.set(false)
             val q1 = TrackSummary("q1", "Queue1.mp3", "CD 1", 1024L)
             val q2 = TrackSummary("q2", "Queue2.mp3", "CD 1", 1024L)

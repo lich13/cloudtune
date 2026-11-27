@@ -608,8 +608,13 @@ public actor StreamProxyServer {
                 let sourceRegistered = await isSourceStillRegistered(token: source.token, accountHash: source.accountHash)
                 let stillRegistered = !conn.isRevoked && !Task.isCancelled && sourceRegistered
                 if stillRegistered && streamCompletedCleanly && fileHandle != nil && targetTotal > 0 && delivered == targetTotal && matchesExpected {
-                    try? FileManager.default.removeItem(at: source.cacheDestinationURL)
-                    if (try? FileManager.default.moveItem(at: partURL, to: source.cacheDestinationURL)) != nil {
+                    let promoted: Bool
+                    if FileManager.default.fileExists(atPath: source.cacheDestinationURL.path) {
+                        promoted = (try? FileManager.default.replaceItemAt(source.cacheDestinationURL, withItemAt: partURL)) != nil
+                    } else {
+                        promoted = (try? FileManager.default.moveItem(at: partURL, to: source.cacheDestinationURL)) != nil
+                    }
+                    if promoted {
                         _ = try? await cacheStore.recordCompletedFile(
                             trackId: source.trackId,
                             fileURL: source.cacheDestinationURL,

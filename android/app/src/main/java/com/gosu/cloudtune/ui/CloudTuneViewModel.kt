@@ -166,6 +166,7 @@ class CloudTuneAppRuntime(
     private var playbackGeneration: Int = 0
     private var recoveryAttempts = 0
     private var currentPlaybackIsLoopback = false
+    private var attachedUiCount = 0
 
     init {
         syncDraftsFromCommitted()
@@ -184,6 +185,7 @@ class CloudTuneAppRuntime(
     }
 
     internal fun onUiAttached() {
+        attachedUiCount += 1
         if (enableLiveLoops) {
             bindSkipBridge()
             if (isAuthenticated && (transferPollJob == null || transferPollJob?.isActive != true)) {
@@ -195,6 +197,8 @@ class CloudTuneAppRuntime(
     internal fun onUiDetached() {
         // Keep LocalStreamServer, MediaController, and PlaybackSessionBridge alive so background
         // PlaybackService loopback streaming and lockscreen Next/Previous survive Activity finish!
+        attachedUiCount = (attachedUiCount - 1).coerceAtLeast(0)
+        if (attachedUiCount > 0) return
         qrPollJob?.cancel()
         qrPollJob = null
         if (!isPlaying) {
@@ -264,8 +268,19 @@ class CloudTuneAppRuntime(
         val next = committedSettings.copy(cacheLimitMb = parsed)
         committedSettings = next
         syncDraftsFromCommitted()
-        activeAccountKey?.let { accountStore.saveSettings(it, next) }
-        cacheManager?.let { cacheUsageBytes = it.pruneToLimit(next.cacheLimitBytes) }
+        val acct = activeAccountKey
+        val cm = cacheManager
+        if (acct != null || cm != null) {
+            scope.launch {
+                val prunedUsage = withContext(Dispatchers.IO) {
+                    acct?.let { accountStore.saveSettings(it, next) }
+                    cm?.pruneToLimit(next.cacheLimitBytes)
+                }
+                if (prunedUsage != null && cm === cacheManager) {
+                    cacheUsageBytes = prunedUsage
+                }
+            }
+        }
         statusMessage = "缓存限制已更新"
         return true
     }
@@ -288,7 +303,11 @@ class CloudTuneAppRuntime(
         val next = committedSettings.copy(downloadThreads = dl, cacheThreads = ct)
         committedSettings = next
         syncDraftsFromCommitted()
-        activeAccountKey?.let { accountStore.saveSettings(it, next) }
+        activeAccountKey?.let { acct ->
+            scope.launch(Dispatchers.IO) {
+                accountStore.saveSettings(acct, next)
+            }
+        }
         statusMessage = "传输参数已更新"
         return true
     }
@@ -296,7 +315,11 @@ class CloudTuneAppRuntime(
     fun updatePlaybackMode(mode: PlaybackMode) {
         val next = committedSettings.copy(playbackMode = mode)
         committedSettings = next
-        activeAccountKey?.let { accountStore.saveSettings(it, next) }
+        activeAccountKey?.let { acct ->
+            scope.launch(Dispatchers.IO) {
+                accountStore.saveSettings(acct, next)
+            }
+        }
         statusMessage = if (mode == PlaybackMode.DOWNLOAD_FIRST) "已切到优先缓存播放" else "已切到边播边缓存"
     }
 
@@ -745,17 +768,23 @@ class CloudTuneAppRuntime(
         statusMessage = if (isLoopback) "边播边缓存《${track.name}》" else "正在播放《${track.name}》"
     }
 
-    fun handlePlaybackError(track: TrackSummary, message: String, wasLoopback: Boolean) {
+    fun handlePlaybackError(
+        track: TrackSummary,
+        message: String,
+        wasLoopback: Boolean,
+        explicitIsDecode: Boolean? = null
+    ) {
         val failedGeneration = playbackGeneration
         val lower = message.lowercase()
         val lowerName = track.name.lowercase()
         val isTimeout = lower.contains("timeout") || lower.contains("timed out")
         val isUnsupportedExt = lowerName.endsWith(".ape") || lowerName.endsWith(".wma")
-        val isDecode = (!isTimeout && isUnsupportedExt) ||
+        val isDecode = explicitIsDecode ?: (
             lower.contains("decode") ||
-            lower.contains("format") ||
-            lower.contains("source") ||
-            lower.contains("unrecognized")
+                lower.contains("unrecognized") ||
+                lower.contains("unsupported") ||
+                (wasLoopback && !isTimeout && isUnsupportedExt)
+            )
         val action = PlaybackDecisionPolicy.classifyPlaybackFailure(
             fileName = track.name,
             wasLoopbackStream = wasLoopback,
@@ -861,6 +890,8 @@ class CloudTuneAppRuntime(
     }
 
     fun openVideoInApp(video: TrackSummary) {
+        playbackGeneration += 1
+        recoveryAttempts = 0
         mediaController?.pause()
         isPlaying = false
         scope.launch {
@@ -875,6 +906,17 @@ class CloudTuneAppRuntime(
             } finally {
                 busyLabel = null
             }
+        }
+    }
+
+    fun saveQrToGallery(context: Context) {
+        val bmp = qrBitmap ?: return
+        val appCtx = context.applicationContext
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                QrCodeHelper.saveQrBitmapToGallery(appCtx, bmp)
+            }
+            statusMessage = if (ok) "二维码已保存到系统相册" else "保存二维码失败"
         }
     }
 
@@ -902,40 +944,60 @@ class CloudTuneAppRuntime(
 
     fun onSafTreeSelected(context: Context, treeUri: Uri) {
         val acct = activeAccountKey ?: return
-        val name = SafExporter.persistTreePermission(context, treeUri)
-        val next = committedSettings.copy(
+        val appCtx = context.applicationContext
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { appCtx.contentResolver.takePersistableUriPermission(treeUri, flags) }
+        val initialName = treeUri.lastPathSegment ?: "已选文件夹"
+        val immediate = committedSettings.copy(
             exportTreeUri = treeUri.toString(),
-            exportFolderDisplayName = name
+            exportFolderDisplayName = initialName
         )
-        committedSettings = next
-        scope.launch(Dispatchers.IO) {
-            accountStore.saveSettings(acct, next)
+        committedSettings = immediate
+        statusMessage = "导出目录已设为 $initialName"
+        scope.launch {
+            val resolvedName = withContext(Dispatchers.IO) {
+                runCatching { SafExporter.persistTreePermission(appCtx, treeUri) }.getOrDefault(initialName)
+            }
+            val updated = committedSettings.copy(
+                exportTreeUri = treeUri.toString(),
+                exportFolderDisplayName = resolvedName
+            )
+            committedSettings = updated
+            statusMessage = "导出目录已设为 $resolvedName"
+            withContext(Dispatchers.IO) {
+                accountStore.saveSettings(acct, updated)
+            }
         }
-        statusMessage = "导出目录已设为 $name"
     }
 
     fun enqueueDownload(context: Context, track: TrackSummary) {
         val appCtx = context.applicationContext
         val acct = activeAccountKey ?: return
-        val paths = accountStore.paths(acct)
-        val taskId = transferEngine.enqueueExportDownload(
-            accountId = acct,
-            track = track,
-            relativeSubpath = track.name,
-            parallelThreads = committedSettings.downloadThreads,
-            stagingRootDir = paths.stagingDir,
-            manifestsFile = paths.transfersFile
-        ) { staged, rel, _ ->
-            SafExporter.exportToSafTree(
-                context = appCtx,
-                treeUriString = committedSettings.exportTreeUri,
-                stagedFile = staged,
-                relativeSubpath = rel,
-                mimeType = PlaybackDecisionPolicy.guessMimeType(track.name)
-            )
+        val threads = committedSettings.downloadThreads
+        scope.launch {
+            val (taskId, snap) = withContext(Dispatchers.IO) {
+                val paths = accountStore.paths(acct)
+                val id = transferEngine.enqueueExportDownload(
+                    accountId = acct,
+                    track = track,
+                    relativeSubpath = track.name,
+                    parallelThreads = threads,
+                    stagingRootDir = paths.stagingDir,
+                    manifestsFile = paths.transfersFile
+                ) { staged, rel, _ ->
+                    SafExporter.exportToSafTree(
+                        context = appCtx,
+                        treeUriString = committedSettings.exportTreeUri,
+                        stagedFile = staged,
+                        relativeSubpath = rel,
+                        mimeType = PlaybackDecisionPolicy.guessMimeType(track.name)
+                    )
+                }
+                id to transferEngine.snapshot()
+            }
+            transferSnapshot = snap
+            statusMessage = "已添加下载任务 $taskId"
         }
-        transferSnapshot = transferEngine.snapshot()
-        statusMessage = "已添加下载任务 $taskId"
     }
 
     fun enqueueCurrentFolderDownload(context: Context) {
@@ -954,7 +1016,6 @@ class CloudTuneAppRuntime(
     internal fun enqueueCurrentFolderDownloadWithExporter(exporter: StagedFileExporter) {
         val b = browser ?: return
         val acct = activeAccountKey ?: return
-        val paths = accountStore.paths(acct)
         val nonRootCrumbs = breadcrumbs.filter { it.id != null && it.id != Cloud189Constants.ROOT_FOLDER_ID }
         val crumbPath = if (!b.isRoot && nonRootCrumbs.lastOrNull()?.id == b.currentFolderId) {
             nonRootCrumbs.map { it.name }.filter { it.isNotEmpty() }.joinToString("/").takeIf { it.isNotEmpty() }
@@ -965,23 +1026,27 @@ class CloudTuneAppRuntime(
             busyLabel = "扫描文件夹 ${b.currentFolderName}..."
             try {
                 val allFiles = cloudClient.scanAllFiles(b.currentFolderId, rootExportFolder)
-                for (item in allFiles) {
-                    val rel = if (item.folderPath.startsWith(rootExportFolder)) {
-                        "${item.folderPath}/${item.name}"
-                    } else {
-                        "$rootExportFolder/${item.name}"
+                val snap = withContext(Dispatchers.IO) {
+                    val paths = accountStore.paths(acct)
+                    for (item in allFiles) {
+                        val rel = if (item.folderPath.startsWith(rootExportFolder)) {
+                            "${item.folderPath}/${item.name}"
+                        } else {
+                            "$rootExportFolder/${item.name}"
+                        }
+                        transferEngine.enqueueExportDownload(
+                            accountId = acct,
+                            track = item,
+                            relativeSubpath = rel,
+                            parallelThreads = committedSettings.downloadThreads,
+                            stagingRootDir = paths.stagingDir,
+                            manifestsFile = paths.transfersFile,
+                            exporter = exporter
+                        )
                     }
-                    transferEngine.enqueueExportDownload(
-                        accountId = acct,
-                        track = item,
-                        relativeSubpath = rel,
-                        parallelThreads = committedSettings.downloadThreads,
-                        stagingRootDir = paths.stagingDir,
-                        manifestsFile = paths.transfersFile,
-                        exporter = exporter
-                    )
+                    transferEngine.snapshot()
                 }
-                transferSnapshot = transferEngine.snapshot()
+                transferSnapshot = snap
                 statusMessage = "目录下载已入队（共 ${allFiles.size} 个文件）"
             } catch (ce: CancellationException) {
                 throw ce
@@ -995,31 +1060,46 @@ class CloudTuneAppRuntime(
 
     fun pauseTransfer(id: String) {
         val acct = activeAccountKey ?: return
-        transferEngine.pauseTransfer(id, accountStore.paths(acct).transfersFile)
-        transferSnapshot = transferEngine.snapshot()
+        scope.launch {
+            val snap = withContext(Dispatchers.IO) {
+                transferEngine.pauseTransfer(id, accountStore.paths(acct).transfersFile)
+                transferEngine.snapshot()
+            }
+            transferSnapshot = snap
+        }
     }
 
     fun resumeTransfer(context: Context, id: String) {
         val appCtx = context.applicationContext
         val acct = activeAccountKey ?: return
-        val paths = accountStore.paths(acct)
-        transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _ ->
-            SafExporter.exportToSafTree(
-                context = appCtx,
-                treeUriString = committedSettings.exportTreeUri,
-                stagedFile = staged,
-                relativeSubpath = rel,
-                mimeType = PlaybackDecisionPolicy.guessMimeType(rel)
-            )
+        scope.launch {
+            val snap = withContext(Dispatchers.IO) {
+                val paths = accountStore.paths(acct)
+                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _ ->
+                    SafExporter.exportToSafTree(
+                        context = appCtx,
+                        treeUriString = committedSettings.exportTreeUri,
+                        stagedFile = staged,
+                        relativeSubpath = rel,
+                        mimeType = PlaybackDecisionPolicy.guessMimeType(rel)
+                    )
+                }
+                transferEngine.snapshot()
+            }
+            transferSnapshot = snap
         }
-        transferSnapshot = transferEngine.snapshot()
     }
 
     fun deleteTransfer(id: String) {
         val acct = activeAccountKey ?: return
-        val paths = accountStore.paths(acct)
-        transferEngine.deleteTransfer(id, paths.stagingDir, paths.transfersFile)
-        transferSnapshot = transferEngine.snapshot()
+        scope.launch {
+            val snap = withContext(Dispatchers.IO) {
+                val paths = accountStore.paths(acct)
+                transferEngine.deleteTransfer(id, paths.stagingDir, paths.transfersFile)
+                transferEngine.snapshot()
+            }
+            transferSnapshot = snap
+        }
     }
 
     private fun startTransferPolling() {
@@ -1106,6 +1186,13 @@ class CloudTuneAppRuntime(
                 val controller = future.get()
                 mediaController = controller
                 controller.addListener(object : Player.Listener {
+                    override fun onIsPlayingChanged(playing: Boolean) {
+                        isPlaying = playing
+                        if (playing && enableLiveLoops && isAuthenticated && (transferPollJob == null || transferPollJob?.isActive != true)) {
+                            startTransferPolling()
+                        }
+                    }
+
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
                             recoveryAttempts = 0
@@ -1119,8 +1206,30 @@ class CloudTuneAppRuntime(
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
+                        val isDecodeError = error.errorCode in setOf(
+                            PlaybackException.ERROR_CODE_DECODING_FAILED,
+                            PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
+                            PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
+                            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+                            PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
+                            PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+                            PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+                            PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED,
+                            PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED
+                        )
+                        val isIoTimeout = error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+                        val errMsg = when {
+                            isIoTimeout -> "network connection timeout"
+                            !error.message.isNullOrBlank() -> error.message!!
+                            else -> "playback error (${error.errorCodeName})"
+                        }
                         currentTrack?.let {
-                            handlePlaybackError(it, error.message ?: "decode error", currentPlaybackIsLoopback)
+                            handlePlaybackError(
+                                track = it,
+                                message = errMsg,
+                                wasLoopback = currentPlaybackIsLoopback,
+                                explicitIsDecode = isDecodeError
+                            )
                         }
                     }
                 })
@@ -1345,12 +1454,17 @@ class CloudTuneViewModel(
         forceStreamProxy: Boolean = false,
         isRecoveryRetry: Boolean = false
     ) = runtime.playTrack(track, modeOverride, forceStreamProxy, isRecoveryRetry)
-    fun handlePlaybackError(track: TrackSummary, message: String, wasLoopback: Boolean) =
-        runtime.handlePlaybackError(track, message, wasLoopback)
+    fun handlePlaybackError(
+        track: TrackSummary,
+        message: String,
+        wasLoopback: Boolean,
+        explicitIsDecode: Boolean? = null
+    ) = runtime.handlePlaybackError(track, message, wasLoopback, explicitIsDecode)
     fun togglePlayback() = runtime.togglePlayback()
     fun playAdjacent(direction: Int) = runtime.playAdjacent(direction)
     fun seekTo(seconds: Double) = runtime.seekTo(seconds)
     fun openVideoInApp(video: TrackSummary) = runtime.openVideoInApp(video)
+    fun saveQrToGallery(context: Context) = runtime.saveQrToGallery(context)
     fun openVideoExternally(context: Context, video: TrackSummary) = runtime.openVideoExternally(context, video)
     fun onSafTreeSelected(context: Context, treeUri: Uri) = runtime.onSafTreeSelected(context, treeUri)
     fun enqueueDownload(context: Context, track: TrackSummary) = runtime.enqueueDownload(context, track)

@@ -401,4 +401,12 @@ extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
+
+    var nilIfNotDefaultDisplayName: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != Cloud189Constants.defaultAccountDisplayName else {
+            return nil
+        }
+        return trimmed
+    }
 }

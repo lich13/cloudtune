@@ -47,6 +47,7 @@ class TransferEngine(
     private val urlResolver: suspend (String) -> String
 ) {
     private class InFlightCacheDownload(
+        val workerId: UUID,
         val cacheKey: String,
         val statusId: String,
         val accountHash: String?,
@@ -202,7 +203,8 @@ class TransferEngine(
                 }
                 existing.deferred
             } else {
-                val statusId = "$kind:${track.id}"
+                val workerId = UUID.randomUUID()
+                val statusId = "$kind:${track.id}:$workerId"
                 statuses[statusId] = TransferStatus(
                     id = statusId,
                     label = track.name,
@@ -215,6 +217,7 @@ class TransferEngine(
                 }
                 val created = scope.async(Dispatchers.IO) {
                     performCacheDownload(
+                        workerId = workerId,
                         cacheKey = cacheKey,
                         statusId = statusId,
                         track = track,
@@ -225,6 +228,7 @@ class TransferEngine(
                     )
                 }
                 inFlightCacheDownloads[cacheKey] = InFlightCacheDownload(
+                    workerId = workerId,
                     cacheKey = cacheKey,
                     statusId = statusId,
                     accountHash = accountHash,
@@ -261,6 +265,7 @@ class TransferEngine(
     }
 
     private suspend fun performCacheDownload(
+        workerId: UUID,
         cacheKey: String,
         statusId: String,
         track: TrackSummary,
@@ -269,8 +274,8 @@ class TransferEngine(
         parallelThreads: Int,
         cacheLimitBytes: Long
     ): File = withContext(Dispatchers.IO) {
-        val partsDir = File(dest.parentFile, "${dest.name}.parts")
-        val mergedTmp = File(dest.parentFile, "${dest.name}.merged.part")
+        val partsDir = File(dest.parentFile, ".${dest.name}.$workerId.parts")
+        val mergedTmp = File(dest.parentFile, ".${dest.name}.$workerId.merged.part")
         try {
             val remoteUrl = urlResolver(track.id)
             val probe = probeTarget(remoteUrl, track.sizeBytes)
@@ -293,7 +298,9 @@ class TransferEngine(
             dest
         } finally {
             synchronized(cacheDownloadLock) {
-                inFlightCacheDownloads.remove(cacheKey)
+                if (inFlightCacheDownloads[cacheKey]?.workerId == workerId) {
+                    inFlightCacheDownloads.remove(cacheKey)
+                }
             }
             statuses.remove(statusId)
             statusAccountHashes.remove(statusId)

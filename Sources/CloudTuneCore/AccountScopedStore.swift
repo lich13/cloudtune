@@ -168,17 +168,30 @@ public actor AccountScopedStore {
         let components = relativeSubpath
             .split(separator: "/")
             .map { Cloud189Protocol.sanitizeFileName(String($0)) }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && $0 != "." && $0 != ".." }
         guard !components.isEmpty else {
             throw CloudTuneError.invalidRequest("导出文件名为空")
         }
 
+        let baseStandardPath = folderURL.standardizedFileURL.path
+        let basePrefix = baseStandardPath.hasSuffix("/") ? baseStandardPath : (baseStandardPath + "/")
         var targetURL = folderURL
         for part in components.dropLast() {
             targetURL.appendPathComponent(part, isDirectory: true)
+            if let vals = try? targetURL.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey]) {
+                if vals.isSymbolicLink == true {
+                    throw CloudTuneError.storageError("拒绝穿过符号链接目录导出：\(part)")
+                }
+                if vals.isDirectory == false {
+                    throw CloudTuneError.storageError("导出路径已存在同名文件：\(part)")
+                }
+            }
         }
         let parentDir = targetURL
         targetURL.appendPathComponent(components.last!, isDirectory: false)
+        guard targetURL.standardizedFileURL.path.hasPrefix(basePrefix) else {
+            throw CloudTuneError.invalidRequest("导出路径越界")
+        }
 
         var coordinatorError: NSError?
         var writeError: Error?
@@ -187,6 +200,10 @@ public actor AccountScopedStore {
         coordinator.coordinate(writingItemAt: targetURL, options: .forReplacing, error: &coordinatorError) { coordinatedURL in
             do {
                 try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+                if let linkVals = try? coordinatedURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                   linkVals.isSymbolicLink == true {
+                    throw CloudTuneError.storageError("导出目标路径不允许覆盖符号链接：\(targetLeafName)")
+                }
                 var isDir: ObjCBool = false
                 if FileManager.default.fileExists(atPath: coordinatedURL.path, isDirectory: &isDir), isDir.boolValue {
                     throw CloudTuneError.storageError("导出目标路径已存在同名文件夹：\(targetLeafName)")
@@ -251,15 +268,25 @@ public actor AccountScopedStore {
         var seenPaths = Set<String>()
         var matchedCandidate: URL?
         var parsedSettings: [String: Any]?
+        var bestScore = -1
         for dir in rawCandidates {
             let stdPath = dir.standardizedFileURL.path
             guard seenPaths.insert(stdPath).inserted else { continue }
             let settingsURL = dir.appendingPathComponent("settings.json")
-            if let settingsData = try? Data(contentsOf: settingsURL),
-               let json = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any] {
+            guard let settingsData = try? Data(contentsOf: settingsURL),
+                  let json = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any] else {
+                continue
+            }
+            let hasToken = (Cloud189Protocol.stringValue(json["refreshToken"]) != nil)
+            let hasAccount = (Cloud189Protocol.stringValue(json["accountName"]) != nil)
+            let hasFolder = (Cloud189Protocol.stringValue(json["musicFolderId"]) != nil)
+            let hasLibrary = fm.fileExists(atPath: dir.appendingPathComponent("library.json").path)
+            let score = (hasToken ? 8 : 0) + (hasAccount ? 4 : 0) + (hasFolder ? 2 : 0) + (hasLibrary ? 1 : 0)
+            if score > bestScore {
+                bestScore = score
                 matchedCandidate = dir
                 parsedSettings = json
-                break
+                if hasToken { break }
             }
         }
 

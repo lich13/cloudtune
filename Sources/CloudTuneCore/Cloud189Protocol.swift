@@ -197,6 +197,7 @@ public enum Cloud189Protocol {
             let loginName = extractXMLTag("loginName", in: cleaned)
                 ?? extractXMLTag("userAccount", in: cleaned)
                 ?? fallbackAccountName
+            let userId = extractXMLTag("userId", in: cleaned)
             let sessionKey = extractXMLTag("sessionKey", in: cleaned) ?? ""
             let sessionSecret = extractXMLTag("sessionSecret", in: cleaned) ?? ""
             guard let active = ActiveCloudSession(
@@ -207,9 +208,11 @@ public enum Cloud189Protocol {
             ) else {
                 throw CloudTuneError.protocolError("189CloudPC XML 会话初始化失败，sessionKey 为空")
             }
-            let storageKey = active.loginName
-                ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let explicitLogin = active.loginName?.nilIfNotDefaultDisplayName
+            let storageKey = explicitLogin
+                ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty?.nilIfNotDefaultDisplayName
                 ?? deriveFallbackAccountKey(
+                    userId: userId,
                     refreshToken: fallbackRefreshToken,
                     accessToken: active.accessToken,
                     sessionKey: active.sessionKey
@@ -236,6 +239,7 @@ public enum Cloud189Protocol {
         let loginName = stringValue(json["loginName"])
             ?? stringValue(json["userAccount"])
             ?? fallbackAccountName
+        let userId = stringValue(json["userId"])
         let sessionKey = stringValue(json["sessionKey"]) ?? ""
         let sessionSecret = stringValue(json["sessionSecret"]) ?? ""
 
@@ -247,9 +251,11 @@ public enum Cloud189Protocol {
         ) else {
             throw CloudTuneError.protocolError("189CloudPC 会话初始化失败，sessionKey 为空")
         }
-        let storageKey = active.loginName
-            ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let explicitLogin = active.loginName?.nilIfNotDefaultDisplayName
+        let storageKey = explicitLogin
+            ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty?.nilIfNotDefaultDisplayName
             ?? deriveFallbackAccountKey(
+                userId: userId,
                 refreshToken: refreshToken,
                 accessToken: active.accessToken,
                 sessionKey: active.sessionKey
@@ -304,9 +310,23 @@ public enum Cloud189Protocol {
         accessToken: String? = nil,
         sessionKey: String
     ) -> String {
-        let seed = [refreshToken, accessToken, Optional(sessionKey)]
+        deriveFallbackAccountKey(
+            userId: nil,
+            refreshToken: refreshToken,
+            accessToken: accessToken,
+            sessionKey: sessionKey
+        )
+    }
+
+    public static func deriveFallbackAccountKey(
+        userId: String?,
+        refreshToken: String? = nil,
+        accessToken: String? = nil,
+        sessionKey: String
+    ) -> String {
+        let seed = [userId, refreshToken, accessToken, Optional(sessionKey)]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? sessionKey
+            .first { !$0.isEmpty && $0 != Cloud189Constants.defaultAccountDisplayName } ?? sessionKey
         let digest = SHA256.hash(data: Data("cloudtune-anon-account:\(seed)".utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return "acct:\(hex)"
@@ -373,7 +393,13 @@ public enum Cloud189Protocol {
         let forbidden = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.controlCharacters)
         let mapped = String(raw.unicodeScalars.map { forbidden.contains($0) ? "_" : Character($0) })
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return mapped.isEmpty ? "track.bin" : mapped
+        if mapped.isEmpty {
+            return "track.bin"
+        }
+        if mapped.allSatisfy({ $0 == "." }) {
+            return "_"
+        }
+        return mapped
     }
 
     public static func isAudioFile(_ name: String) -> Bool {

@@ -163,6 +163,7 @@ object Cloud189Protocol {
             val loginName = extractXmlTag("loginName", cleaned)
                 ?: extractXmlTag("userAccount", cleaned)
                 ?: fallbackAccountName
+            val userId = extractXmlTag("userId", cleaned)
             val sessionKey = extractXmlTag("sessionKey", cleaned).orEmpty()
             val sessionSecret = extractXmlTag("sessionSecret", cleaned).orEmpty()
             val active = ActiveCloudSession.createOrNull(
@@ -171,9 +172,14 @@ object Cloud189Protocol {
                 sessionSecret = sessionSecret,
                 loginName = loginName
             ) ?: throw CloudTuneException("189CloudPC XML 会话初始化失败，sessionKey 为空")
-            val storageKey = active.loginName
-                ?: fallbackAccountKey?.trim()?.takeIf { it.isNotEmpty() }
+            val explicitLogin = active.loginName?.takeIf { it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME }
+            val validFallbackKey = fallbackAccountKey?.trim()?.takeIf {
+                it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME
+            }
+            val storageKey = explicitLogin
+                ?: validFallbackKey
                 ?: deriveFallbackAccountKey(
+                    userId = userId,
                     refreshToken = fallbackRefreshToken,
                     accessToken = active.accessToken,
                     sessionKey = active.sessionKey
@@ -195,6 +201,7 @@ object Cloud189Protocol {
         val loginName = optNonBlank(json, "loginName")
             ?: optNonBlank(json, "userAccount")
             ?: fallbackAccountName
+        val userId = optNonBlank(json, "userId")
         val sessionKey = optNonBlank(json, "sessionKey").orEmpty()
         val sessionSecret = optNonBlank(json, "sessionSecret").orEmpty()
 
@@ -204,9 +211,14 @@ object Cloud189Protocol {
             sessionSecret = sessionSecret,
             loginName = loginName
         ) ?: throw CloudTuneException("189CloudPC 会话初始化失败，sessionKey 为空")
-        val storageKey = active.loginName
-            ?: fallbackAccountKey?.trim()?.takeIf { it.isNotEmpty() }
+        val explicitLogin = active.loginName?.takeIf { it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME }
+        val validFallbackKey = fallbackAccountKey?.trim()?.takeIf {
+            it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME
+        }
+        val storageKey = explicitLogin
+            ?: validFallbackKey
             ?: deriveFallbackAccountKey(
+                userId = userId,
                 refreshToken = refreshToken,
                 accessToken = active.accessToken,
                 sessionKey = active.sessionKey
@@ -253,10 +265,22 @@ object Cloud189Protocol {
         refreshToken: String? = null,
         accessToken: String? = null,
         sessionKey: String
+    ): String = deriveFallbackAccountKey(
+        userId = null,
+        refreshToken = refreshToken,
+        accessToken = accessToken,
+        sessionKey = sessionKey
+    )
+
+    fun deriveFallbackAccountKey(
+        userId: String?,
+        refreshToken: String? = null,
+        accessToken: String? = null,
+        sessionKey: String
     ): String {
-        val seed = listOf(refreshToken, accessToken, sessionKey)
+        val seed = listOf(userId, refreshToken, accessToken, sessionKey)
             .mapNotNull { it?.trim() }
-            .firstOrNull { it.isNotEmpty() } ?: sessionKey
+            .firstOrNull { it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME } ?: sessionKey
         val digest = MessageDigest.getInstance("SHA-256")
             .digest("cloudtune-anon-account:$seed".toByteArray(Charsets.UTF_8))
         val hex = digest.joinToString("") { "%02x".format(Locale.US, it) }
@@ -330,7 +354,9 @@ object Cloud189Protocol {
                 if (ch in "/\\:*?\"<>|" || ch.isISOControl()) append('_') else append(ch)
             }
         }.trim()
-        return cleaned.ifEmpty { "track.bin" }
+        if (cleaned.isEmpty()) return "track.bin"
+        if (cleaned.all { it == '.' }) return "_"
+        return cleaned
     }
 
     fun isAudioFile(name: String): Boolean {

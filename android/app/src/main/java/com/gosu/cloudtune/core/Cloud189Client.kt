@@ -334,6 +334,9 @@ class Cloud189Client(
                 "timeStamp" to System.currentTimeMillis().toString()
             )
         )
+        if (resp.statusCode !in 200..299) {
+            throw CloudTuneException("二维码轮询请求失败 (HTTP ${resp.statusCode})")
+        }
         val parsed = Cloud189Protocol.parseQrPollPayload(resp.text, resp.statusCode)
         when (parsed.state) {
             QrLoginState.AUTHENTICATED -> {
@@ -396,9 +399,12 @@ class Cloud189Client(
             )
             val ao = json.optJSONObject("fileListAO")
                 ?: throw CloudTuneException("云盘目录响应缺少 fileListAO 字段")
-            if (ao.optInt("count", 0) == 0) break
+            if (!ao.has("count") && !ao.has("folderList") && !ao.has("fileList")) {
+                throw CloudTuneException("云盘目录 fileListAO 结构无效")
+            }
             val folderArr = ao.optJSONArray("folderList") ?: JSONArray()
             val fileArr = ao.optJSONArray("fileList") ?: JSONArray()
+            if (ao.optInt("count", 0) == 0 && folderArr.length() == 0 && fileArr.length() == 0) break
             if (folderArr.length() == 0 && fileArr.length() == 0) break
 
             for (i in 0 until folderArr.length()) {
@@ -415,7 +421,7 @@ class Cloud189Client(
                     id = id,
                     name = name,
                     folderPath = resolvedFolderPath,
-                    sizeBytes = o.optLong("size", 0L),
+                    sizeBytes = o.optLong("size", 0L).coerceAtLeast(0L),
                     modifiedAt = Cloud189Protocol.optNonBlank(o, "lastOpTime")
                 )
                 when {

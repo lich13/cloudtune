@@ -173,7 +173,25 @@ struct CloudTuneUITests {
         #expect(await transport.getDownloadUrlCalls() == 1 + PlaybackDecisionPolicy.maxRecoveryAttempts)
         #expect(vm.statusMessage?.contains("已停止自动重试") == true)
 
-        // 4) Manual logout during retry backoff cancels stale retry
+        // 4) Manual logout or opening video in-app during retry backoff cancels stale retry
+        vm.retryBaseDelayMs = 80
+        await transport.setFailDownloadUrl(true)
+        let videoInterruptTask = Task { @MainActor in
+            await vm.playTrack(smallTrack)
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        await vm.openVideoInApp(TrackSummary(id: "vid-1", name: "Concert.mp4", folderPath: "CD 2", sizeBytes: 4096))
+        await videoInterruptTask.value
+        #expect(await transport.getDownloadUrlCalls() == 1)
+
+        // Network DNS failure on .ape track MUST NOT misclassify as unsupported local codec
+        await transport.setFailDownloadUrl(true)
+        vm.retryBaseDelayMs = 2
+        let apeNetworkTrack = TrackSummary(id: "f-transient", name: "Concert.ape", folderPath: "CD 2", sizeBytes: 1024)
+        await vm.playTrack(apeNetworkTrack)
+        #expect(await transport.getDownloadUrlCalls() == 1 + PlaybackDecisionPolicy.maxRecoveryAttempts)
+        #expect(vm.statusMessage?.contains("已停止自动重试") == true)
+
         vm.retryBaseDelayMs = 80
         await transport.setFailDownloadUrl(true)
         let retryTask = Task { @MainActor in
@@ -183,6 +201,29 @@ struct CloudTuneUITests {
         await vm.logout()
         await retryTask.value
         #expect(await transport.getDownloadUrlCalls() == 1)
+
+        // 5) Bootstrap must NOT overwrite an existing native Keychain credential with legacy Tauri settings.json
+        final class PreseededKeychain: KeychainBackend, @unchecked Sendable {
+            var current: PersistedRefreshCredential?
+            init(_ cred: PersistedRefreshCredential) { self.current = cred }
+            func readCredential() -> KeychainLoadResult {
+                if let current { return .found(current) }
+                return .notFound
+            }
+            func saveCredential(_ credential: PersistedRefreshCredential) throws { current = credential }
+            func deleteCredential() { current = nil }
+        }
+        let migRoot = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-boot-mig-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: migRoot) }
+        try FileManager.default.createDirectory(at: migRoot, withIntermediateDirectories: true)
+        try Data(#"{"refreshToken":"rt_old_legacy","accountName":"old@example.invalid","cacheLimitMb":1024}"#.utf8)
+            .write(to: migRoot.appendingPathComponent("settings.json"))
+        let nativeCred = try #require(PersistedRefreshCredential(refreshToken: "rt_native_keep", accountName: "native@example.invalid"))
+        let kc = PreseededKeychain(nativeCred)
+        let migStore = try AccountScopedStore(rootDirectory: migRoot)
+        let bootVM = CloudTuneViewModel(cloudClient: client, accountStore: migStore, keychainBackend: kc, enableLiveObservers: false)
+        await bootVM.bootstrap()
+        #expect(kc.current?.refreshToken != "rt_old_legacy")
     }
 
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")

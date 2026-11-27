@@ -128,6 +128,8 @@ class PlaybackService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     override fun onDestroy() {
+        PlaybackSessionBridge.onSkipNext = null
+        PlaybackSessionBridge.onSkipPrevious = null
         mediaSession?.release()
         mediaSession = null
         exoPlayer?.release()

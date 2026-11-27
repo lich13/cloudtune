@@ -183,6 +183,10 @@ class CloudTuneSnapshotTest {
             )
             assertArrayEquals(newBytes, existingFile.readBytes())
             assertTrue(exportRoot.list().orEmpty().none { it.contains(".tmp") })
+
+            // 4) sanitizeFileName blocks "." and ".." traversal names
+            assertTrue(com.gosu.cloudtune.core.Cloud189Protocol.sanitizeFileName("..") == "_")
+            assertTrue(com.gosu.cloudtune.core.Cloud189Protocol.sanitizeFileName(".") == "_")
         } finally {
             tempRoot.deleteRecursively()
         }

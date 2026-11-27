@@ -557,6 +557,20 @@ struct CloudTuneCoreTests {
         #expect(try Data(contentsOf: replacedURL) == newContent)
         let children = try FileManager.default.contentsOfDirectory(atPath: exportDir.path)
         #expect(!children.contains { $0.contains(".tmp") })
+
+        // 4) Path traversal segments (".." / ".") are neutralized and NEVER escape exportDir
+        #expect(Cloud189Protocol.sanitizeFileName("..") == "_")
+        #expect(Cloud189Protocol.sanitizeFileName(".") == "_")
+        let parentCanary = exportDir.deletingLastPathComponent().appendingPathComponent("cloudtune-outside-\(UUID().uuidString).flac")
+        defer { try? FileManager.default.removeItem(at: parentCanary) }
+        let safeExported = try await store.exportStagedFile(
+            stagedFileURL: staged,
+            relativeSubpath: "../../\(parentCanary.lastPathComponent)",
+            explicitDirectoryURL: exportDir,
+            for: "alice@example.invalid"
+        )
+        #expect(safeExported.standardizedFileURL.path.hasPrefix(exportDir.standardizedFileURL.path + "/"))
+        #expect(!FileManager.default.fileExists(atPath: parentCanary.path))
     }
 
     @Test("Cross-origin redirect blocks auth header, cookie, and POST token leaks; API status & fileListAO validated")
@@ -720,6 +734,31 @@ struct CloudTuneCoreTests {
         #expect(u1 == u2)
         #expect(try Data(contentsOf: u1) == payload)
         #expect(probeCalls.withValue { $0 } == 1)
+
+        // 3) Cancelling prefetch right before starting playback MUST NOT delete new worker's .parts shards
+        let raceTrack = TrackSummary(id: "t-cancel-race", name: "CancelRace.flac", folderPath: "Music", sizeBytes: UInt64(payload.count))
+        let cancelledPrefetch = Task {
+            try await engine.downloadTrackToCache(
+                track: raceTrack,
+                cacheStore: cacheStore,
+                parallelThreads: 2,
+                cacheLimitBytes: 256 * 1024 * 1024,
+                kind: "prefetch",
+                accountHash: alicePaths.bucketHash
+            )
+        }
+        try await Task.sleep(for: .milliseconds(15))
+        cancelledPrefetch.cancel()
+        let immediatePlaybackURL = try await engine.downloadTrackToCache(
+            track: raceTrack,
+            cacheStore: cacheStore,
+            parallelThreads: 4,
+            cacheLimitBytes: 256 * 1024 * 1024,
+            kind: "playback",
+            accountHash: alicePaths.bucketHash
+        )
+        _ = await cancelledPrefetch.result
+        #expect(try Data(contentsOf: immediatePlaybackURL) == payload)
     }
 
     @Test("Active stream connection tears down immediately on logout without committing cache, and pull fetcher streams cleanly")
@@ -866,6 +905,21 @@ struct CloudTuneCoreTests {
         _ = await store2.migrateLegacyTauriDataIfPresent()
         #expect(try await store2.loadSettings(for: "legacy_user@example.invalid").cacheLimitMb == 8192)
         #expect(try await store2.loadLibrary(for: "legacy_user@example.invalid").first?.id == "new-1")
+
+        // Logged-out flat root settings.json MUST NOT shadow portable candidate that holds live refreshToken
+        let root3 = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-mig3-\(UUID().uuidString)")
+        let portable3 = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-port3-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root3)
+            try? FileManager.default.removeItem(at: portable3)
+        }
+        try FileManager.default.createDirectory(at: root3, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: portable3, withIntermediateDirectories: true)
+        try Data(#"{"refreshToken":null,"cacheLimitMb":1024}"#.utf8).write(to: root3.appendingPathComponent("settings.json"))
+        try Data(legacySettings.utf8).write(to: portable3.appendingPathComponent("settings.json"))
+        let store3 = try AccountScopedStore(rootDirectory: root3)
+        let picked = try #require(await store3.migrateLegacyTauriDataIfPresent(candidateRoots: [root3, portable3]))
+        #expect(picked.refreshToken == "rt_legacy_gosu")
     }
 }
 

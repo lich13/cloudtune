@@ -11,6 +11,7 @@ final class CloudTuneIOSSnapshotTests: XCTestCase {
             return
         }
         let fixture = try RepresentativeFixture.load(from: fixtureURL)
+        XCTAssertEqual(SnapshotScene.allCases.count, 9)
         let outBase = URL(
             fileURLWithPath: ProcessInfo.processInfo.environment["CLOUDTUNE_IOS_SNAPSHOT_DIR"]
                 ?? "/tmp/cloudtune-ios-snapshots"

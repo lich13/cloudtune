@@ -994,6 +994,221 @@ struct CloudTuneUITests {
         #expect(metrics.highContrastPixelCount > 400)
     }
 
+    @Test("playTrack coalesces onto in-flight prefetchTask without cancelling it, and bootstrap vs web login race preserves newer session")
+    @MainActor
+    func verifyPrefetchPlaybackCoalescingAndBootstrapEpochProtection() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-vm-coal-\(UUID().uuidString)")
+        let suiteName = "com.gosu.cloudtune.test.coal.\(UUID().uuidString)"
+        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            isolatedDefaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let mediaPayload = Data((0..<8192).map { UInt8(($0 * 3) & 0xFF) })
+
+        actor GatedUpstreamStream: UpstreamStreamFetcher {
+            let payload: Data
+            private(set) var probeCount = 0
+            private(set) var bodyStreamCount = 0
+            private(set) var cancelledBodyStreamCount = 0
+            private var enteredBody = false
+            private var isBodyReleased = false
+            private var bodyEnteredCont: CheckedContinuation<Void, Never>?
+            private var bodyReleaseCont: CheckedContinuation<Void, Never>?
+
+            init(payload: Data) {
+                self.payload = payload
+            }
+
+            func waitUntilEnteredBodyStream() async {
+                if enteredBody { return }
+                await withCheckedContinuation { cont in bodyEnteredCont = cont }
+            }
+
+            func releaseBodyStream() {
+                isBodyReleased = true
+                bodyReleaseCont?.resume()
+                bodyReleaseCont = nil
+            }
+
+            func recordCancelledBody() {
+                cancelledBodyStreamCount += 1
+            }
+
+            func openStream(url: URL, rangeHeader: String?) async throws -> (
+                statusCode: Int,
+                headers: [String: String],
+                chunks: AsyncThrowingStream<Data, Error>
+            ) {
+                if rangeHeader == "bytes=0-0" {
+                    probeCount += 1
+                    let probeData = payload.prefix(1)
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/\(payload.count)", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(probeData); $0.finish() }
+                    )
+                }
+                bodyStreamCount += 1
+                enteredBody = true
+                bodyEnteredCont?.resume()
+                bodyEnteredCont = nil
+                let fullData = payload
+                let stream = AsyncThrowingStream<Data, Error> { continuation in
+                    let producer = Task {
+                        await self.waitForBodyRelease()
+                        if Task.isCancelled {
+                            self.recordCancelledBody()
+                            continuation.finish(throwing: CancellationError())
+                            return
+                        }
+                        continuation.yield(fullData)
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { termination in
+                        if case .cancelled = termination {
+                            producer.cancel()
+                            Task { await self.recordCancelledBody() }
+                        }
+                    }
+                }
+                return (200, ["content-length": "\(payload.count)"], stream)
+            }
+
+            private func waitForBodyRelease() async {
+                if isBodyReleased { return }
+                await withCheckedContinuation { cont in bodyReleaseCont = cont }
+            }
+        }
+
+        actor CoalesceMockTransport: CloudHTTPTransport {
+            private(set) var resolveCallsByTrack: [String: Int] = [:]
+            private var enteredRefresh = false
+            private var refreshEnteredCont: CheckedContinuation<Void, Never>?
+            private var refreshReleaseCont: CheckedContinuation<Void, Never>?
+
+            func waitUntilEnteredRefresh() async {
+                if enteredRefresh { return }
+                await withCheckedContinuation { cont in refreshEnteredCont = cont }
+            }
+
+            func releaseRefresh() {
+                refreshReleaseCont?.resume()
+                refreshReleaseCont = nil
+            }
+
+            func resolveCount(for trackId: String) -> Int {
+                resolveCallsByTrack[trackId, default: 0]
+            }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                let query = url.query ?? ""
+                if url.path.contains("refreshToken.do") {
+                    enteredRefresh = true
+                    refreshEnteredCont?.resume()
+                    refreshEnteredCont = nil
+                    await withCheckedContinuation { cont in refreshReleaseCont = cont }
+                    let body = #"{"accessToken":"at_boot","refreshToken":"rt_boot_next"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if url.path.contains("getSessionForPC.action") {
+                    if query.contains("redirectURL=") {
+                        let body = #"{"res_code":0,"loginName":"fresh_web@example.invalid","accessToken":"at_web","refreshToken":"rt_web","sessionKey":"sk_web","sessionSecret":"ss_web"}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                    }
+                    let body = #"{"res_code":0,"loginName":"stale_boot@example.invalid","accessToken":"at_boot","refreshToken":"rt_boot","sessionKey":"sk_boot","sessionSecret":"ss_boot"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if url.path.contains("getFileDownloadUrl.action") {
+                    if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                       let fid = comps.queryItems?.first(where: { $0.name == "fileId" })?.value {
+                        resolveCallsByTrack[fid, default: 0] += 1
+                    }
+                    let b = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/upcoming.flac"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let gatedStream = GatedUpstreamStream(payload: mediaPayload)
+        let transport = CoalesceMockTransport()
+        let staleSeed = try #require(PersistedRefreshCredential(refreshToken: "rt_boot_seed", accountName: "stale_boot@example.invalid"))
+        let keychain = InMemoryKeychainBackend(staleSeed)
+        let store = try AccountScopedStore(rootDirectory: root)
+        let vm = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: transport),
+            accountStore: store,
+            keychainBackend: keychain,
+            upstreamFetcher: gatedStream,
+            userDefaults: isolatedDefaults,
+            enableLiveObservers: false
+        )
+
+        // 1) Logged-out saveExportDirectoryBookmark returns false
+        #expect(await vm.saveExportDirectoryBookmark(root) == false)
+
+        // 2) bootstrap() suspended in restoreSessionWithEpoch while completeEmbeddedWebLogin succeeds MUST NOT wipe web session
+        let bootTask = Task { @MainActor in
+            await vm.bootstrap()
+        }
+        await transport.waitUntilEnteredRefresh()
+        await vm.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=fresh")!,
+            cookies: []
+        )
+        #expect(vm.isAuthenticated == true)
+        #expect(vm.accountName == "fresh_web@example.invalid")
+
+        await transport.releaseRefresh()
+        await bootTask.value
+        #expect(vm.isAuthenticated == true)
+        #expect(vm.accountName == "fresh_web@example.invalid")
+        #expect(await vm.cloudClient.activeSession?.loginName == "fresh_web@example.invalid")
+
+        // 3) playTrack(t2) hitting in-flight prefetchingTrackId == t2.id coalesces onto prefetch download without cancelling it
+        await vm.updatePlaybackMode(.streamCache)
+        let t1 = TrackSummary(id: "coal-1", name: "Current.flac", folderPath: "Music", sizeBytes: UInt64(mediaPayload.count))
+        let t2 = TrackSummary(id: "coal-2", name: "Upcoming.flac", folderPath: "Music", sizeBytes: UInt64(mediaPayload.count))
+        vm.tracks = [t1, t2]
+        vm.shuffle = false
+        vm.loopMode = .all
+        vm.activeTrack = t1
+        vm.currentTrackId = t1.id
+        vm.duration = 120
+        vm.currentTime = 100
+
+        vm.triggerPrefetchIfNeeded()
+        await gatedStream.waitUntilEnteredBodyStream()
+
+        let acctKey = try #require(vm.accountStorageKey)
+        let paths = try await store.paths(for: acctKey)
+        let expectedCacheURL = paths.cacheDir.appendingPathComponent(
+            "\(t2.id)-\(Cloud189Protocol.sanitizeFileName(t2.name))"
+        )
+        #expect(await vm.transferEngine.hasInFlightCacheDownload(for: expectedCacheURL) == true)
+
+        let playUpcomingTask = Task { @MainActor in
+            await vm.playTrack(t2)
+        }
+        // Allow playTrack(t2) to attach as coalesced waiter before releasing the body stream
+        try await Task.sleep(for: .milliseconds(25))
+        await gatedStream.releaseBodyStream()
+        await playUpcomingTask.value
+
+        #expect(vm.currentTrackId == t2.id)
+        #expect(await transport.resolveCount(for: t2.id) == 1)
+        #expect(await gatedStream.probeCount == 1)
+        #expect(await gatedStream.bodyStreamCount == 1)
+        #expect(await gatedStream.cancelledBodyStreamCount == 0)
+        #expect(try Data(contentsOf: expectedCacheURL) == mediaPayload)
+    }
+
     #if os(macOS)
     @Test("macOS full-state Light & Dark offscreen PNG rendering and glyph pixel contrast")
     @MainActor

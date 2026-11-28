@@ -10,7 +10,9 @@ struct CloudTuneMacMain {
         let delegate = CloudTuneAppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.regular)
-        app.run()
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 }
 
@@ -41,8 +43,34 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             onShowPreferences: { [weak self] in self?.showOrCreatePreferencesWindow() },
             onQuitApp: { [weak self] in self?.quitExplicitly() }
         )
+        observeAuthenticationState()
         Task {
             await viewModel.bootstrap()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let token = prefsNotificationToken {
+            NotificationCenter.default.removeObserver(token)
+            prefsNotificationToken = nil
+        }
+        viewModel.shutdownForTermination()
+    }
+
+    private func observeAuthenticationState() {
+        withObservationTracking {
+            _ = viewModel.isAuthenticated
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.viewModel.isAuthenticated, let prefsWin = self.preferencesWindow {
+                    for sheet in prefsWin.sheets {
+                        prefsWin.endSheet(sheet)
+                    }
+                    prefsWin.close()
+                }
+                self.observeAuthenticationState()
+            }
         }
     }
 

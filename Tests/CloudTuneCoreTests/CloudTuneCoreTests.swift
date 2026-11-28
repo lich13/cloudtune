@@ -1,7 +1,14 @@
 import CloudTuneCore
+import CoreGraphics
+import CryptoKit
 import Darwin
 import Foundation
+import ImageIO
 import Testing
+import UniformTypeIdentifiers
+#if canImport(MediaPlayer)
+import MediaPlayer
+#endif
 
 private struct MockUpstreamFetcher: UpstreamStreamFetcher {
     let handler: @Sendable (URL, String?) async throws -> (Int, [String: String], AsyncThrowingStream<Data, Error>)
@@ -1141,6 +1148,386 @@ struct CloudTuneCoreTests {
         await engine.updateExternalTransferStatus(id: "stream:t1", accountHash: "hashA", status: nil)
         #expect(await engine.hasActiveTransfers() == false)
         #expect(activityTransitions.withValue { $0 } == [true, false])
+    }
+
+    @Test("NowPlayingCoordinator off-MainActor MPMediaItemArtwork callback, NowPlayingMetadata artworkDigest sync, and >1024px AudioMetadataReader downsampling")
+    func verifyNowPlayingOffMainActorCallbackArtworkDigestAndDownsampling() async throws {
+        let largeAlphaPNG = try Self.makeSyntheticPNGData(width: 1536, height: 1152, includeAlpha: true)
+        let largeOpaquePNG = try Self.makeSyntheticPNGData(width: 1400, height: 1400, includeAlpha: false)
+
+        // 1) NowPlayingMetadata precomputes artworkDigest in init and keeps it synced in didSet
+        var meta = NowPlayingMetadata(title: "Nocturne", artist: "Chopin", album: "Opus 9", artworkData: largeAlphaPNG)
+        #expect(meta.artworkDigest == SHA256.hash(data: largeAlphaPNG))
+        meta.artworkData = largeOpaquePNG
+        #expect(meta.artworkDigest == SHA256.hash(data: largeOpaquePNG))
+        meta.artworkData = nil
+        #expect(meta.artworkDigest == nil)
+
+        // 2) MPMediaItemArtwork created on @MainActor MUST safely render on DispatchQueue.global() without _swift_task_checkIsolatedSwift trap
+        #if canImport(MediaPlayer)
+        struct SendableArtworkBox: @unchecked Sendable {
+            let artwork: MPMediaItemArtwork
+        }
+        let artworkBox = try await MainActor.run {
+            let created = try #require(NowPlayingCoordinator.makeMediaArtwork(from: largeAlphaPNG))
+            #expect(created.bounds.size.width == 1024)
+            #expect(created.bounds.size.height == 768)
+            return SendableArtworkBox(artwork: created)
+        }
+
+        let renderedOnGlobalQueue: (onMainThread: Bool, size: CGSize?) = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let isMain = Thread.isMainThread
+                let img = artworkBox.artwork.image(at: CGSize(width: 256, height: 256))
+                continuation.resume(returning: (isMain, img?.size))
+            }
+        }
+        #expect(renderedOnGlobalQueue.onMainThread == false)
+        let renderedSize = try #require(renderedOnGlobalQueue.size)
+        #expect(renderedSize.width > 0 && renderedSize.height > 0)
+        #endif
+
+        // 3) AudioMetadataReader downsamples >1024px PNG embedded in audio file to <= 1024px thumbnail and computes artworkDigest
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-art-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let mp3URL = tempDir.appendingPathComponent("SyntheticArtwork.mp3")
+        let mp3Bytes = Self.makeMinimalID3v23MP3(
+            title: "Nocturne Op.9 No.2",
+            artist: "Frederic Chopin",
+            album: "Complete Nocturnes",
+            pngArtwork: largeAlphaPNG
+        )
+        try mp3Bytes.write(to: mp3URL, options: .atomic)
+
+        let parsedMeta = await AudioMetadataReader.readMetadata(
+            from: mp3URL,
+            fallbackTitle: "Fallback",
+            fallbackAlbum: "FallbackAlbum"
+        )
+        #expect(parsedMeta.title == "Nocturne Op.9 No.2")
+        #expect(parsedMeta.artist == "Frederic Chopin")
+        #expect(parsedMeta.album == "Complete Nocturnes")
+        let compactArtwork = try #require(parsedMeta.artworkData)
+        #expect(parsedMeta.artworkDigest == SHA256.hash(data: compactArtwork))
+
+        let compactSrc = try #require(CGImageSourceCreateWithData(compactArtwork as CFData, nil))
+        let compactProps = try #require(CGImageSourceCopyPropertiesAtIndex(compactSrc, 0, nil) as? [CFString: Any])
+        let outW = try #require((compactProps[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue)
+        let outH = try #require((compactProps[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue)
+        #expect(outW == 1024)
+        #expect(outH == 768)
+
+        // Opaque >1024px artwork re-encodes to compact JPEG <= 1024px
+        let compactOpaque = AudioMetadataReader.compactArtworkData(largeOpaquePNG)
+        let opaqueSrc = try #require(CGImageSourceCreateWithData(compactOpaque as CFData, nil))
+        #expect((CGImageSourceGetType(opaqueSrc) as String?) == UTType.jpeg.identifier)
+        let opaqueProps = try #require(CGImageSourceCopyPropertiesAtIndex(opaqueSrc, 0, nil) as? [CFString: Any])
+        #expect((opaqueProps[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == 1024)
+    }
+
+    @Test("Cloud189Client sessionEpoch prevents stale clearSession(ifEpoch:) or in-flight restoreFromRefreshCredential from wiping/overwriting newer login, and StreamProxyServer.revokeSource revokes single token")
+    func verifySessionEpochAndSingleSourceRevocation() async throws {
+        actor EpochGateTransport: CloudHTTPTransport {
+            private var enteredRefresh = false
+            private var refreshEnteredCont: CheckedContinuation<Void, Never>?
+            private var refreshReleaseCont: CheckedContinuation<Void, Never>?
+            private(set) var clearCookiesCount = 0
+
+            func waitUntilEnteredRefresh() async {
+                if enteredRefresh { return }
+                await withCheckedContinuation { cont in refreshEnteredCont = cont }
+            }
+
+            func releaseRefresh() {
+                refreshReleaseCont?.resume()
+                refreshReleaseCont = nil
+            }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                if url.path.contains("refreshToken.do") {
+                    enteredRefresh = true
+                    refreshEnteredCont?.resume()
+                    refreshEnteredCont = nil
+                    await withCheckedContinuation { cont in refreshReleaseCont = cont }
+                    let body = #"{"accessToken":"at_stale","refreshToken":"rt_stale_next"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if url.path.contains("getSessionForPC.action") {
+                    let query = url.query ?? ""
+                    if query.contains("redirectURL=") {
+                        let body = #"{"res_code":0,"loginName":"fresh_login@example.invalid","accessToken":"at_fresh","refreshToken":"rt_fresh","sessionKey":"sk_fresh","sessionSecret":"ss_fresh"}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                    }
+                    let body = #"{"res_code":0,"loginName":"stale_restore@example.invalid","accessToken":"at_stale","refreshToken":"rt_stale_next","sessionKey":"sk_stale","sessionSecret":"ss_stale"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async { clearCookiesCount += 1 }
+        }
+
+        let transport = EpochGateTransport()
+        let client = Cloud189Client(transport: transport)
+        let initialEpoch = await client.currentSessionEpoch
+        #expect(initialEpoch == 0)
+
+        let staleCred = try #require(PersistedRefreshCredential(refreshToken: "rt_stale", accountName: "stale_restore@example.invalid"))
+        let restoreTask = Task {
+            try await client.restoreFromRefreshCredential(staleCred)
+        }
+        await transport.waitUntilEnteredRefresh()
+
+        // Newer interactive web login completes while restoreFromRefreshCredential is suspended
+        _ = try await client.exchangeRedirectForSession(redirectURL: "https://m.cloud.189.cn/cb?paras=fresh")
+        let freshEpoch = await client.currentSessionEpoch
+        #expect(freshEpoch == 1)
+        #expect(await client.activeSession?.loginName == "fresh_login@example.invalid")
+
+        // Stale clearSession(ifEpoch: 0) MUST NOT wipe the newer login
+        await client.clearSession(ifEpoch: initialEpoch)
+        #expect(await client.isAuthenticated == true)
+        #expect(await client.activeSession?.loginName == "fresh_login@example.invalid")
+        #expect(await transport.clearCookiesCount == 0)
+
+        // Releasing in-flight restoreFromRefreshCredential MUST throw CancellationError and preserve fresh session
+        await transport.releaseRefresh()
+        await #expect(throws: CancellationError.self) {
+            _ = try await restoreTask.value
+        }
+        #expect(await client.activeSession?.loginName == "fresh_login@example.invalid")
+        #expect(await client.persistedCredential?.refreshToken == "rt_fresh")
+
+        // Matching epoch clearSession(ifEpoch: freshEpoch) DOES clear
+        await client.clearSession(ifEpoch: freshEpoch)
+        #expect(await client.isAuthenticated == false)
+        #expect(await transport.clearCookiesCount == 1)
+
+        // StreamProxyServer.revokeSource(token:) revokes only the targeted registration
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-rev-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cacheStore = try CacheStore(cacheDirectory: tempDir)
+        let proxy = try StreamProxyServer(
+            semaphore: GlobalTransferSemaphore(maxPermits: 4),
+            fetcher: MockUpstreamFetcher { _, _ in
+                (200, ["content-length": "2"], AsyncThrowingStream { $0.yield(Data("ok".utf8)); $0.finish() })
+            }
+        )
+        defer { Task { await proxy.shutdown() } }
+        let reg1 = StreamSourceRegistration(
+            token: "tok-stale-1",
+            accountHash: "acct1",
+            trackId: "t1",
+            remoteURL: URL(string: "https://media.example.invalid/1.flac")!,
+            cacheDestinationURL: tempDir.appendingPathComponent("1.flac"),
+            expectedSize: 2,
+            fileName: "1.flac",
+            cacheLimitBytes: 1024 * 1024
+        )
+        let reg2 = StreamSourceRegistration(
+            token: "tok-live-2",
+            accountHash: "acct1",
+            trackId: "t2",
+            remoteURL: URL(string: "https://media.example.invalid/2.flac")!,
+            cacheDestinationURL: tempDir.appendingPathComponent("2.flac"),
+            expectedSize: 2,
+            fileName: "2.flac",
+            cacheLimitBytes: 1024 * 1024
+        )
+        let url1 = await proxy.registerSource(reg1, cacheStore: cacheStore)
+        let url2 = await proxy.registerSource(reg2, cacheStore: cacheStore)
+        await proxy.revokeSource(token: "tok-stale-1")
+        let (_, resp1) = try await URLSession.shared.data(from: url1)
+        let (_, resp2) = try await URLSession.shared.data(from: url2)
+        #expect((resp1 as? HTTPURLResponse)?.statusCode == 404)
+        #expect((resp2 as? HTTPURLResponse)?.statusCode == 200)
+    }
+
+    @Test("StagedDownloadManifest pins exportBookmarkData at enqueue time so changing default export folder only redirects subsequent tasks")
+    func verifyPinnedExportBookmarkInStagedDownloadManifest() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-pin-root-\(UUID().uuidString)")
+        let dirA = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-pin-dirA-\(UUID().uuidString)")
+        let dirB = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-pin-dirB-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: dirA)
+            try? FileManager.default.removeItem(at: dirB)
+        }
+        try FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dirB, withIntermediateDirectories: true)
+
+        let store = try AccountScopedStore(rootDirectory: root)
+        let accountId = "bookmark_pin@example.invalid"
+        let payload1 = Data("track-one-audio-bytes".utf8)
+        let payload2 = Data("track-two-audio-bytes".utf8)
+
+        actor DownloadReleaseGate {
+            private var isReleased = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+
+            func waitIfNeeded() async {
+                if isReleased { return }
+                await withCheckedContinuation { cont in waiters.append(cont) }
+            }
+
+            func releaseAll() {
+                isReleased = true
+                let current = waiters
+                waiters.removeAll()
+                for cont in current {
+                    cont.resume()
+                }
+            }
+        }
+
+        let gate = DownloadReleaseGate()
+        let engine = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 4),
+            fetcher: MockUpstreamFetcher { url, rangeHeader in
+                let data = url.lastPathComponent == "one.flac" ? payload1 : payload2
+                if rangeHeader == "bytes=0-0" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/\(data.count)", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(data.prefix(1)); $0.finish() }
+                    )
+                }
+                await gate.waitIfNeeded()
+                return (
+                    200,
+                    ["content-length": "\(data.count)"],
+                    AsyncThrowingStream { $0.yield(data); $0.finish() }
+                )
+            },
+            urlResolver: { trackId in
+                URL(string: "https://media.example.invalid/\(trackId == "t-1" ? "one.flac" : "two.flac")")!
+            }
+        )
+
+        // 1) Set default export directory to dirA and enqueue task 1 without explicitDirectoryURL
+        _ = try await store.saveExportDirectoryBookmark(dirA, for: accountId)
+        let task1 = try await engine.enqueueExportDownload(
+            accountId: accountId,
+            track: TrackSummary(id: "t-1", name: "Track1.flac", folderPath: "Music", sizeBytes: UInt64(payload1.count)),
+            relativeExportSubpath: "Track1.flac",
+            parallelThreads: 1,
+            explicitDirectoryURL: nil,
+            accountStore: store
+        )
+
+        let paths = try await store.paths(for: accountId)
+        let persistedManifests = try JSONDecoder().decode([StagedDownloadManifest].self, from: Data(contentsOf: paths.transfersURL))
+        #expect(persistedManifests.first(where: { $0.taskId == task1 })?.exportBookmarkData != nil)
+
+        // 2) Switch default export directory to dirB while task 1 is still in-flight, then enqueue task 2
+        _ = try await store.saveExportDirectoryBookmark(dirB, for: accountId)
+        let task2 = try await engine.enqueueExportDownload(
+            accountId: accountId,
+            track: TrackSummary(id: "t-2", name: "Track2.flac", folderPath: "Music", sizeBytes: UInt64(payload2.count)),
+            relativeExportSubpath: "Track2.flac",
+            parallelThreads: 1,
+            explicitDirectoryURL: nil,
+            accountStore: store
+        )
+
+        await gate.releaseAll()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await engine.hasActiveTransfers() && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        let snap = await engine.snapshot()
+        #expect(snap.items.first(where: { $0.id == task1 })?.state == "completed")
+        #expect(snap.items.first(where: { $0.id == task2 })?.state == "completed")
+
+        #expect(try Data(contentsOf: dirA.appendingPathComponent("Track1.flac")) == payload1)
+        #expect(!FileManager.default.fileExists(atPath: dirB.appendingPathComponent("Track1.flac").path))
+        #expect(try Data(contentsOf: dirB.appendingPathComponent("Track2.flac")) == payload2)
+        #expect(!FileManager.default.fileExists(atPath: dirA.appendingPathComponent("Track2.flac").path))
+    }
+
+    private static func makeSyntheticPNGData(width: Int, height: Int, includeAlpha: Bool) throws -> Data {
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo: UInt32 = includeAlpha
+            ? CGImageAlphaInfo.premultipliedLast.rawValue
+            : CGImageAlphaInfo.noneSkipLast.rawValue
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ))
+        ctx.setFillColor(red: 0.12, green: 0.28, blue: 0.22, alpha: includeAlpha ? 0.85 : 1.0)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        ctx.setFillColor(red: 0.92, green: 0.86, blue: 0.74, alpha: 1.0)
+        ctx.fill(CGRect(x: width / 6, y: height / 6, width: (width * 2) / 3, height: (height * 2) / 3))
+        let cgImage = try #require(ctx.makeImage())
+        let out = NSMutableData()
+        let dest = try #require(CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        #expect(CGImageDestinationFinalize(dest))
+        return out as Data
+    }
+
+    private static func makeMinimalID3v23MP3(
+        title: String,
+        artist: String,
+        album: String,
+        pngArtwork: Data
+    ) -> Data {
+        func makeTextFrame(id: String, text: String) -> Data {
+            var payload = Data([0x00]) // ISO-8859-1 / ASCII
+            payload.append(Data(text.utf8))
+            return wrapID3v23Frame(id: id, payload: payload)
+        }
+
+        func wrapID3v23Frame(id: String, payload: Data) -> Data {
+            var frame = Data(id.utf8.prefix(4))
+            var sizeBE = UInt32(payload.count).bigEndian
+            withUnsafeBytes(of: &sizeBE) { frame.append(contentsOf: $0) }
+            frame.append(contentsOf: [0x00, 0x00])
+            frame.append(payload)
+            return frame
+        }
+
+        var apicPayload = Data([0x00]) // ISO-8859-1
+        apicPayload.append(Data("image/png".utf8))
+        apicPayload.append(0x00)
+        apicPayload.append(0x03) // Front cover
+        apicPayload.append(0x00) // Empty description
+        apicPayload.append(pngArtwork)
+
+        var frames = Data()
+        frames.append(makeTextFrame(id: "TIT2", text: title))
+        frames.append(makeTextFrame(id: "TPE1", text: artist))
+        frames.append(makeTextFrame(id: "TALB", text: album))
+        frames.append(wrapID3v23Frame(id: "APIC", payload: apicPayload))
+
+        let tagSize = frames.count
+        let synchsafe: [UInt8] = [
+            UInt8((tagSize >> 21) & 0x7F),
+            UInt8((tagSize >> 14) & 0x7F),
+            UInt8((tagSize >> 7) & 0x7F),
+            UInt8(tagSize & 0x7F)
+        ]
+        var mp3 = Data([0x49, 0x44, 0x33, 0x03, 0x00, 0x00])
+        mp3.append(contentsOf: synchsafe)
+        mp3.append(frames)
+
+        // Append valid silent MPEG-1 Layer 3 frames (128kbps, 44.1kHz -> 417 bytes/frame)
+        var silentFrame = Data([0xFF, 0xFB, 0x90, 0x64])
+        silentFrame.append(Data(repeating: 0, count: 413))
+        for _ in 0..<6 {
+            mp3.append(silentFrame)
+        }
+        return mp3
     }
 }
 

@@ -171,11 +171,40 @@ public actor AccountScopedStore {
         return (displayName, updated)
     }
 
+    public func captureExportBookmarkData(
+        explicitDirectoryURL: URL? = nil,
+        for accountId: String
+    ) -> Data? {
+        if let explicitDirectoryURL {
+            let didStart = explicitDirectoryURL.startAccessingSecurityScopedResource()
+            defer {
+                if didStart { explicitDirectoryURL.stopAccessingSecurityScopedResource() }
+            }
+            #if os(macOS)
+            let options: URL.BookmarkCreationOptions = [.withSecurityScope]
+            #else
+            let options: URL.BookmarkCreationOptions = []
+            #endif
+            if let data = try? explicitDirectoryURL.bookmarkData(
+                options: options,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            ) {
+                return data
+            }
+        }
+        guard let p = try? paths(for: accountId) else {
+            return nil
+        }
+        return try? Data(contentsOf: p.exportBookmarkURL)
+    }
+
     /// Exports a verified staged file into the user-selected folder using security-scoped bookmark + NSFileCoordinator.
     public func exportStagedFile(
         stagedFileURL: URL,
         relativeSubpath: String,
         explicitDirectoryURL: URL? = nil,
+        manifestBookmarkData: Data? = nil,
         for accountId: String
     ) throws -> URL {
         let folderURL: URL
@@ -183,7 +212,15 @@ public actor AccountScopedStore {
             folderURL = explicitDirectoryURL
         } else {
             let p = try paths(for: accountId)
-            guard let bookmarkData = try? Data(contentsOf: p.exportBookmarkURL) else {
+            let bookmarkData: Data
+            let usedAccountDefaultBookmark: Bool
+            if let manifestBookmarkData {
+                bookmarkData = manifestBookmarkData
+                usedAccountDefaultBookmark = false
+            } else if let defaultBookmarkData = try? Data(contentsOf: p.exportBookmarkURL) {
+                bookmarkData = defaultBookmarkData
+                usedAccountDefaultBookmark = true
+            } else {
                 throw CloudTuneError.exportPermissionRevoked("尚未选择导出目录或目录授权已失效，请重新选择导出文件夹。")
             }
             var isStale = false
@@ -200,7 +237,7 @@ public actor AccountScopedStore {
             ) else {
                 throw CloudTuneError.exportPermissionRevoked("导出文件夹权限已撤销，请重新授权下载目录。")
             }
-            if isStale {
+            if isStale && usedAccountDefaultBookmark {
                 let refreshedAccess = resolved.startAccessingSecurityScopedResource()
                 defer {
                     if refreshedAccess { resolved.stopAccessingSecurityScopedResource() }
@@ -234,9 +271,10 @@ public actor AccountScopedStore {
             throw CloudTuneError.invalidRequest("导出文件名为空")
         }
 
-        let baseStandardPath = folderURL.standardizedFileURL.path
-        let basePrefix = baseStandardPath.hasSuffix("/") ? baseStandardPath : (baseStandardPath + "/")
-        var targetURL = folderURL
+        let baseDirectoryURL = ((folderURL as NSURL).filePathURL ?? folderURL).standardizedFileURL
+        let canonicalBasePath = baseDirectoryURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let basePrefix = canonicalBasePath.hasSuffix("/") ? canonicalBasePath : (canonicalBasePath + "/")
+        var targetURL = baseDirectoryURL
         for part in components.dropLast() {
             targetURL.appendPathComponent(part, isDirectory: true)
             if let vals = try? targetURL.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey]) {
@@ -250,7 +288,12 @@ public actor AccountScopedStore {
         }
         let parentDir = targetURL
         targetURL.appendPathComponent(components.last!, isDirectory: false)
-        guard targetURL.standardizedFileURL.path.hasPrefix(basePrefix) else {
+        let canonicalParentPath = parentDir.resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalTargetPath = URL(fileURLWithPath: canonicalParentPath, isDirectory: true)
+            .appendingPathComponent(components.last!, isDirectory: false)
+            .standardizedFileURL
+            .path
+        guard canonicalTargetPath.hasPrefix(basePrefix) else {
             throw CloudTuneError.invalidRequest("导出路径越界")
         }
 

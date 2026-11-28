@@ -183,6 +183,53 @@ private final class ActiveStreamConnection: @unchecked Sendable {
     }
 }
 
+private final class ConnectionRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [UUID: ActiveStreamConnection] = [:]
+
+    func insert(_ conn: ActiveStreamConnection) {
+        lock.withLock {
+            entries[conn.id] = conn
+        }
+    }
+
+    func remove(id: UUID) {
+        _ = lock.withLock {
+            entries.removeValue(forKey: id)
+        }
+    }
+
+    func removeAll(matchingToken token: String) -> [ActiveStreamConnection] {
+        lock.withLock {
+            var matched: [ActiveStreamConnection] = []
+            for (id, conn) in entries where conn.token == token {
+                entries.removeValue(forKey: id)
+                matched.append(conn)
+            }
+            return matched
+        }
+    }
+
+    func removeAll(matchingAccountHash accountHash: String) -> [ActiveStreamConnection] {
+        lock.withLock {
+            var matched: [ActiveStreamConnection] = []
+            for (id, conn) in entries where conn.accountHash == accountHash {
+                entries.removeValue(forKey: id)
+                matched.append(conn)
+            }
+            return matched
+        }
+    }
+
+    func drainAll() -> [ActiveStreamConnection] {
+        lock.withLock {
+            let all = Array(entries.values)
+            entries.removeAll()
+            return all
+        }
+    }
+}
+
 /// Localhost (`127.0.0.1:0`) HTTP/1.1 Range streaming proxy with strict write-through & `206` resume validation.
 public actor StreamProxyServer {
     public nonisolated let port: UInt16
@@ -194,9 +241,9 @@ public actor StreamProxyServer {
     private nonisolated let urlRefresher: (@Sendable (String) async throws -> URL)?
     private nonisolated let onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)?
     private nonisolated let onWriteThroughCompleted: (@Sendable (String, String, URL) async -> Void)?
+    private nonisolated let connectionRegistry = ConnectionRegistry()
     private var sourcesByToken: [String: StreamSourceRegistration] = [:]
     private var cacheStoresByAccount: [String: CacheStore] = [:]
-    private var activeConnectionsByID: [UUID: ActiveStreamConnection] = [:]
 
     public init(
         semaphore: GlobalTransferSemaphore,
@@ -311,15 +358,17 @@ public actor StreamProxyServer {
         return URL(string: "http://127.0.0.1:\(port)/stream/\(registration.token)/\(encodedName)")!
     }
 
+    public func revokeSource(token: String) {
+        sourcesByToken.removeValue(forKey: token)
+        for conn in connectionRegistry.removeAll(matchingToken: token) {
+            conn.revokeAndShutdownSocket()
+        }
+    }
+
     public func revokeAllSources(forAccountHash accountHash: String) {
         sourcesByToken = sourcesByToken.filter { $0.value.accountHash != accountHash }
         cacheStoresByAccount.removeValue(forKey: accountHash)
-        var toRevoke: [ActiveStreamConnection] = []
-        for (id, conn) in activeConnectionsByID where conn.accountHash == accountHash {
-            activeConnectionsByID.removeValue(forKey: id)
-            toRevoke.append(conn)
-        }
-        for conn in toRevoke {
+        for conn in connectionRegistry.removeAll(matchingAccountHash: accountHash) {
             conn.revokeAndShutdownSocket()
         }
     }
@@ -327,12 +376,23 @@ public actor StreamProxyServer {
     public func shutdown() {
         sourcesByToken.removeAll()
         cacheStoresByAccount.removeAll()
-        let active = Array(activeConnectionsByID.values)
-        activeConnectionsByID.removeAll()
-        for conn in active {
+        for conn in connectionRegistry.drainAll() {
             conn.revokeAndShutdownSocket()
         }
         acceptSource.cancel()
+    }
+
+    public nonisolated func shutdownImmediate() {
+        for conn in connectionRegistry.drainAll() {
+            conn.revokeAndShutdownSocket()
+        }
+        acceptSource.cancel()
+        Task { await self.clearSourcesOnTermination() }
+    }
+
+    private func clearSourcesOnTermination() {
+        sourcesByToken.removeAll()
+        cacheStoresByAccount.removeAll()
     }
 
     private func acquireConnection(
@@ -344,12 +404,12 @@ public actor StreamProxyServer {
             return nil
         }
         let conn = ActiveStreamConnection(fd: clientFD, accountHash: reg.accountHash, token: token)
-        activeConnectionsByID[conn.id] = conn
+        connectionRegistry.insert(conn)
         return (reg, store, conn)
     }
 
-    private func unregisterConnection(id: UUID) {
-        activeConnectionsByID.removeValue(forKey: id)
+    private nonisolated func unregisterConnection(id: UUID) {
+        connectionRegistry.remove(id: id)
     }
 
     private func isSourceStillRegistered(token: String, accountHash: String) -> Bool {
@@ -425,7 +485,7 @@ public actor StreamProxyServer {
     ) async {
         defer {
             conn.closeOnce()
-            Task { await self.unregisterConnection(id: conn.id) }
+            self.unregisterConnection(id: conn.id)
         }
         guard !conn.isRevoked, !Task.isCancelled else { return }
         var source = initialSource

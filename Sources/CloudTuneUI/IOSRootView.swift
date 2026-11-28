@@ -82,7 +82,7 @@ public struct IOSRootView: View {
                 pendingExportTrack = nil
                 pendingExportPane = nil
                 Task {
-                    await viewModel.saveExportDirectoryBookmark(pickedURL)
+                    guard await viewModel.saveExportDirectoryBookmark(pickedURL) else { return }
                     if let trackToExport {
                         await viewModel.enqueueTrackDownload(trackToExport, explicitDirectoryURL: pickedURL)
                     } else if let paneToExport {
@@ -226,7 +226,10 @@ public struct IOSRootView: View {
                                     systemImage: "photo.badge.arrow.down",
                                     palette: palette
                                 ) {
-                                    saveQRToPhotoLibrary(pngData)
+                                    let vm = viewModel
+                                    Self.saveQRToPhotoLibrary(pngData) { message in
+                                        vm.statusMessage = message
+                                    }
                                 }
                             }
                         }
@@ -1683,22 +1686,29 @@ public struct IOSRootView: View {
         }
     }
 
-    private func saveQRToPhotoLibrary(_ pngData: Data) {
-        guard let image = UIImage(data: pngData) else { return }
+    nonisolated private static func saveQRToPhotoLibrary(
+        _ pngData: Data,
+        onStatus: @escaping @MainActor @Sendable (String) -> Void
+    ) {
+        guard !pngData.isEmpty else { return }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 Task { @MainActor in
-                    viewModel.statusMessage = "未获相册写入权限，请在系统设置中开启相册访问。"
+                    onStatus("未获相册写入权限，请在系统设置中开启相册访问。")
                 }
                 return
             }
             PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAsset(from: image)
+                let creationRequest = PHAssetCreationRequest.forAsset()
+                creationRequest.addResource(with: .photo, data: pngData, options: nil)
             }) { ok, err in
+                let errDesc = err?.localizedDescription ?? ""
                 Task { @MainActor in
-                    viewModel.statusMessage = ok
-                        ? "二维码已保存到系统相册，请打开天翼云盘 App 扫一扫选择相册图片。"
-                        : "保存相册失败：\(err?.localizedDescription ?? "")"
+                    onStatus(
+                        ok
+                            ? "二维码已保存到系统相册，请打开天翼云盘 App 扫一扫选择相册图片。"
+                            : "保存相册失败：\(errDesc)"
+                    )
                 }
             }
         }
@@ -1751,6 +1761,7 @@ struct IOSAVPlayerContainer: UIViewControllerRepresentable {
         uiViewController.player?.pause()
         uiViewController.player?.replaceCurrentItem(with: nil)
         uiViewController.player = nil
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
     }
 }
 

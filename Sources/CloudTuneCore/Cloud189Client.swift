@@ -193,9 +193,14 @@ public actor Cloud189Client {
     public private(set) var activeSession: ActiveCloudSession?
     public private(set) var persistedCredential: PersistedRefreshCredential?
     private var pendingQr: PendingQrLogin?
+    private var sessionEpoch: UInt64 = 0
 
     public init(transport: CloudHTTPTransport = URLSessionCloudHTTPTransport()) {
         self.transport = transport
+    }
+
+    public var currentSessionEpoch: UInt64 {
+        sessionEpoch
     }
 
     public var isAuthenticated: Bool {
@@ -206,11 +211,27 @@ public actor Cloud189Client {
         activeSession?.loginName ?? persistedCredential?.accountName
     }
 
-    public func clearSession() async {
+    public func clearSession(ifEpoch expectedEpoch: UInt64? = nil) async {
+        if let expectedEpoch {
+            guard sessionEpoch == expectedEpoch else { return }
+        }
+        sessionEpoch &+= 1
         activeSession = nil
         persistedCredential = nil
         pendingQr = nil
         await transport.clearCookies()
+    }
+
+    public func invalidateInFlightAuth() {
+        sessionEpoch &+= 1
+        pendingQr = nil
+    }
+
+    public func sessionSnapshot(forEpoch expectedEpoch: UInt64?) -> (active: ActiveCloudSession?, persisted: PersistedRefreshCredential?)? {
+        if let expectedEpoch, sessionEpoch != expectedEpoch {
+            return nil
+        }
+        return (activeSession, persistedCredential)
     }
 
     public func importWebCookies(_ cookies: [HTTPCookie]) async {
@@ -219,6 +240,13 @@ public actor Cloud189Client {
 
     /// Cold-start session restoration: only sets `activeSession` AFTER network exchange succeeds.
     public func restoreFromRefreshCredential(_ credential: PersistedRefreshCredential) async throws -> Cloud189Protocol.ParsedSessionPayload {
+        try await restoreSessionWithEpoch(credential).payload
+    }
+
+    public func restoreSessionWithEpoch(
+        _ credential: PersistedRefreshCredential
+    ) async throws -> (payload: Cloud189Protocol.ParsedSessionPayload, epoch: UInt64) {
+        let startEpoch = sessionEpoch
         var req = URLRequest(url: URL(string: "\(Cloud189Constants.authURL)/api/oauth2/refreshToken.do")!)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
@@ -232,6 +260,9 @@ public actor Cloud189Client {
         ])
 
         let resp = try await transport.send(req)
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
         if let err = Cloud189Protocol.extractAPIErrorMessage(resp.text) {
             throw CloudTuneError.protocolError(err)
         }
@@ -251,17 +282,26 @@ public actor Cloud189Client {
             fallbackAccountName: credential.accountName,
             fallbackAccountKey: credential.accountKey
         )
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
+        sessionEpoch &+= 1
+        let committedEpoch = sessionEpoch
         self.activeSession = parsed.activeSession
         self.persistedCredential = parsed.persistedCredential
-        return parsed
+        return (parsed, committedEpoch)
     }
 
     public func startQrLogin() async throws -> QrLoginStart {
+        let startEpoch = sessionEpoch
         let entryURL = Cloud189Protocol.webLoginEntryURL()
         var initReq = URLRequest(url: entryURL)
         initReq.httpMethod = "GET"
         initReq.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
         let initResp = try await transport.send(initReq)
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
         guard (200..<300).contains(initResp.statusCode) else {
             throw CloudTuneError.httpStatus(initResp.statusCode, "获取扫码登录页失败")
         }
@@ -275,6 +315,9 @@ public actor Cloud189Client {
         uuidReq.httpBody = formEncoded([("appId", Cloud189Constants.appId)])
 
         let uuidResp = try await transport.send(uuidReq)
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
         if let err = Cloud189Protocol.extractAPIErrorMessage(uuidResp.text) {
             throw CloudTuneError.protocolError(err)
         }
@@ -302,6 +345,7 @@ public actor Cloud189Client {
         guard let pending = pendingQr else {
             throw CloudTuneError.invalidRequest("请先生成二维码，再轮询登录状态")
         }
+        let startEpoch = sessionEpoch
         let now = Date()
         var req = URLRequest(url: URL(string: "\(Cloud189Constants.authURL)/api/logbox/oauth2/qrcodeLoginState.do")!)
         req.httpMethod = "POST"
@@ -322,6 +366,9 @@ public actor Cloud189Client {
         ])
 
         let resp = try await transport.send(req)
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
         guard (200..<300).contains(resp.statusCode) else {
             throw CloudTuneError.httpStatus(resp.statusCode, "二维码轮询请求失败")
         }
@@ -331,11 +378,15 @@ public actor Cloud189Client {
             guard let redirect = parsed.redirectURL else {
                 throw CloudTuneError.protocolError("缺少扫码跳转链接")
             }
-            let sessionResult = try await exchangeRedirectForSession(redirectURL: redirect)
+            let (sessionResult, committedEpoch) = try await exchangeRedirectForSessionWithEpoch(redirectURL: redirect)
             self.pendingQr = nil
             parsed.accountName = sessionResult.activeSession.loginName
+            parsed.sessionEpoch = committedEpoch
             return parsed
         case .expired:
+            guard sessionEpoch == startEpoch else {
+                throw CancellationError()
+            }
             self.pendingQr = nil
             return parsed
         case .waitingScan, .waitingConfirm:
@@ -345,6 +396,14 @@ public actor Cloud189Client {
 
     @discardableResult
     public func exchangeRedirectForSession(redirectURL: String) async throws -> Cloud189Protocol.ParsedSessionPayload {
+        try await exchangeRedirectForSessionWithEpoch(redirectURL: redirectURL).payload
+    }
+
+    @discardableResult
+    public func exchangeRedirectForSessionWithEpoch(
+        redirectURL: String
+    ) async throws -> (payload: Cloud189Protocol.ParsedSessionPayload, epoch: UInt64) {
+        let startEpoch = sessionEpoch
         var comps = URLComponents(string: "\(Cloud189Constants.apiURL)/getSessionForPC.action")!
         comps.queryItems = clientSuffixItems() + [URLQueryItem(name: "redirectURL", value: redirectURL)]
         var req = URLRequest(url: comps.url!)
@@ -353,6 +412,9 @@ public actor Cloud189Client {
         req.setValue(Cloud189Constants.referer, forHTTPHeaderField: "Referer")
 
         let resp = try await transport.send(req)
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
         guard (200..<300).contains(resp.statusCode) else {
             if let err = Cloud189Protocol.extractAPIErrorMessage(resp.text) {
                 throw CloudTuneError.protocolError(err)
@@ -363,9 +425,15 @@ public actor Cloud189Client {
             resp.text,
             statusCode: resp.statusCode
         )
+        guard sessionEpoch == startEpoch else {
+            throw CancellationError()
+        }
+        sessionEpoch &+= 1
+        let committedEpoch = sessionEpoch
         self.activeSession = parsed.activeSession
         self.persistedCredential = parsed.persistedCredential
-        return parsed
+        self.pendingQr = nil
+        return (parsed, committedEpoch)
     }
 
     public func listRemoteFolder(
@@ -567,6 +635,7 @@ public actor Cloud189Client {
             guard let session = activeSession else {
                 throw CloudTuneError.unauthenticated
             }
+            let startEpoch = sessionEpoch
             var comps = URLComponents(string: "\(Cloud189Constants.apiURL)\(path)")!
             comps.queryItems = clientSuffixItems() + query.map { URLQueryItem(name: $0.0, value: $0.1) }
             let url = comps.url!
@@ -589,6 +658,9 @@ public actor Cloud189Client {
             req.setValue(signature, forHTTPHeaderField: "Signature")
 
             let resp = try await transport.send(req)
+            guard sessionEpoch == startEpoch else {
+                throw CancellationError()
+            }
             let body = resp.text
             if body.contains("userSessionBO is null") || body.contains("InvalidSessionKey") {
                 if attempt == 0, !session.accessToken.isEmpty {
@@ -598,6 +670,9 @@ public actor Cloud189Client {
                         fallbackAccountName: session.loginName,
                         fallbackAccountKey: persistedCredential?.accountKey
                     )
+                    guard sessionEpoch == startEpoch else {
+                        throw CancellationError()
+                    }
                     self.activeSession = refreshed.activeSession
                     self.persistedCredential = refreshed.persistedCredential
                     continue

@@ -406,7 +406,7 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(420_000L, restored.transferredBytes)
 
             val exportedOut = File(tempRoot, "exported-Concert.flac")
-            engine.resumeTransfer(taskId, paths.stagingDir, paths.transfersFile) { staged, _, _ ->
+            engine.resumeTransfer(taskId, paths.stagingDir, paths.transfersFile) { staged, _, _, _ ->
                 staged.copyTo(exportedOut, overwrite = true)
                 exportedOut.absolutePath
             }
@@ -562,7 +562,7 @@ class Cloud189ProtocolAndProxyTest {
                 parallelThreads = 2,
                 stagingRootDir = alicePaths.stagingDir,
                 manifestsFile = alicePaths.transfersFile
-            ) { staged, _, _ ->
+            ) { staged, _, _, _ ->
                 staged.copyTo(outFile, overwrite = true)
                 outFile.absolutePath
             }
@@ -767,7 +767,7 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals("CD 1", vm.browser?.currentFolderName)
             assertEquals("CD 1", vm.browser?.audioFiles?.firstOrNull()?.folderPath)
 
-            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ -> subpath }
+            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
             repeat(40) {
                 if (vm.downloadTransfers.any { it.path == "CD 1/01. Song.flac" }) return@repeat
                 delay(20L)
@@ -775,7 +775,7 @@ class Cloud189ProtocolAndProxyTest {
             vm.browseTo("cd2", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd2", "CD 2")))
             repeat(40) { if (vm.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
             assertEquals("CD 2", vm.browser?.currentFolderName)
-            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _ -> subpath }
+            runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
             repeat(40) {
                 if (vm.downloadTransfers.any { it.path == "CD 2/01. Song.flac" }) return@repeat
                 delay(20L)
@@ -1202,6 +1202,183 @@ class Cloud189ProtocolAndProxyTest {
             repeat(40) { if (rt.currentTrackId == "lib-1") return@repeat; delay(15L) }
             assertEquals("lib-1", rt.currentTrack?.id)
             Unit
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifySessionEpochGuardSingleSourceRevokeAndPinnedExportTreeUri(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-slice0-parity").toFile()
+        try {
+            // 1) Cloud189Client sessionEpoch guard prevents stale expectedEpoch cleanup from wiping a newer session
+            val currentLogin = java.util.concurrent.atomic.AtomicReference("alice@example.invalid")
+            val epochClient = Cloud189Client(
+                transport = object : CloudHttpTransport {
+                    override suspend fun send(
+                        url: String,
+                        method: String,
+                        headers: Map<String, String>,
+                        formBody: List<Pair<String, String>>?
+                    ): CloudHttpResponse {
+                        val user = currentLogin.get()
+                        val body = """{"res_code":0,"loginName":"$user","sessionKey":"sk_$user","sessionSecret":"ss_$user","refreshToken":"rt_$user"}"""
+                        return CloudHttpResponse(200, emptyMap(), body.toByteArray(Charsets.UTF_8), url)
+                    }
+                    override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
+                    override fun clearCookies() {}
+                }
+            )
+            epochClient.exchangeRedirectForSession("https://m.cloud.189.cn/cb?paras=alice")
+            val aliceEpoch = epochClient.sessionEpoch
+            assertTrue(epochClient.isAuthenticated)
+            assertEquals("alice@example.invalid", epochClient.accountName)
+
+            currentLogin.set("bob@example.invalid")
+            epochClient.exchangeRedirectForSession("https://m.cloud.189.cn/cb?paras=bob")
+            val bobEpoch = epochClient.sessionEpoch
+            assertTrue(bobEpoch > aliceEpoch)
+            assertEquals("bob@example.invalid", epochClient.accountName)
+
+            // Stale cleanup for aliceEpoch MUST NOT clear Bob's active session
+            epochClient.clearSessionImmediate(expectedEpoch = aliceEpoch)
+            assertTrue("Stale expectedEpoch must not wipe newer session", epochClient.isAuthenticated)
+            assertEquals("bob@example.invalid", epochClient.accountName)
+            assertEquals(bobEpoch, epochClient.sessionEpoch)
+
+            // Matching expectedEpoch clears Bob's session cleanly
+            epochClient.clearSessionImmediate(expectedEpoch = bobEpoch)
+            assertFalse(epochClient.isAuthenticated)
+            assertNull(epochClient.activeSession)
+            assertTrue(epochClient.sessionEpoch > bobEpoch)
+
+            // 2) LocalStreamServer.revokeSource revokes only the superseded token without disturbing sibling streams
+            val limiter = GlobalTransferLimiter(8)
+            val cm = CacheManager(File(tempRoot, "stream-cache"))
+            val sampleBytes = ByteArray(1024) { (it and 0x7F).toByte() }
+            LocalStreamServer(
+                limiter = limiter,
+                opener = { _, _ ->
+                    OpenedUpstreamStream(
+                        statusCode = 200,
+                        headers = mapOf("content-length" to sampleBytes.size.toString()),
+                        bodyStream = ByteArrayInputStream(sampleBytes)
+                    )
+                }
+            ).use { server ->
+                val regA = StreamSourceRegistration(
+                    accountHash = "sameAcct",
+                    trackId = "t-a",
+                    remoteUrl = "https://media.example.invalid/a.flac",
+                    cacheDestination = cm.cacheFile("t-a", "a.flac"),
+                    expectedSize = sampleBytes.size.toLong(),
+                    fileName = "a.flac",
+                    cacheLimitBytes = 64L * 1024L * 1024L
+                )
+                val regB = StreamSourceRegistration(
+                    accountHash = "sameAcct",
+                    trackId = "t-b",
+                    remoteUrl = "https://media.example.invalid/b.flac",
+                    cacheDestination = cm.cacheFile("t-b", "b.flac"),
+                    expectedSize = sampleBytes.size.toLong(),
+                    fileName = "b.flac",
+                    cacheLimitBytes = 64L * 1024L * 1024L
+                )
+                val urlA = server.registerSource(regA, cm)
+                val urlB = server.registerSource(regB, cm)
+                server.revokeSource(regA.token)
+                assertEquals(404, (URL(urlA).openConnection() as HttpURLConnection).responseCode)
+                assertEquals(200, (URL(urlB).openConnection() as HttpURLConnection).responseCode)
+            }
+
+            // 3) Pinned exportTreeUri in StagedDownloadManifest survives transfers.json persistence & resumeTransfer
+            val store = AccountStore(tempRoot)
+            val accountId = "bob@example.invalid"
+            val paths = store.paths(accountId)
+            val pinnedUri = "content://com.android.externalstorage.documents/tree/primary%3APinnedMusicExport"
+            val changedDefaultUri = "content://com.android.externalstorage.documents/tree/primary%3AChangedLaterFolder"
+            val filePayload = ByteArray(64_000) { ((it * 7) and 0xFF).toByte() }
+            val holdDownload = CompletableDeferred<Unit>()
+            val enteredDownload = CompletableDeferred<Unit>()
+
+            val engine1 = TransferEngine(
+                limiter = limiter,
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/${filePayload.size}", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(filePayload.copyOfRange(0, 1))
+                        )
+                    } else {
+                        enteredDownload.complete(Unit)
+                        holdDownload.await()
+                        OpenedUpstreamStream(
+                            statusCode = 200,
+                            headers = mapOf("content-length" to filePayload.size.toString()),
+                            bodyStream = ByteArrayInputStream(filePayload)
+                        )
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/pinned.flac" }
+            )
+
+            val track = TrackSummary("trk-pin", "Pinned.flac", "Lossless", filePayload.size.toLong())
+            val taskId = engine1.enqueueExportDownload(
+                accountId = accountId,
+                track = track,
+                relativeSubpath = "Lossless/Pinned.flac",
+                parallelThreads = 1,
+                stagingRootDir = paths.stagingDir,
+                manifestsFile = paths.transfersFile,
+                exportTreeUri = pinnedUri
+            ) { _, _, _, uri -> uri ?: "missing" }
+
+            withTimeout(5000L) { enteredDownload.await() }
+            engine1.pauseTransfer(taskId, paths.transfersFile)
+            holdDownload.complete(Unit)
+
+            val persistedJson = paths.transfersFile.readText(Charsets.UTF_8)
+            assertTrue("transfers.json must persist exportTreeUri", persistedJson.contains(pinnedUri))
+
+            // Simulate app restart with a new TransferEngine and a changed default SAF export folder
+            val engine2 = TransferEngine(
+                limiter = limiter,
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/${filePayload.size}", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(filePayload.copyOfRange(0, 1))
+                        )
+                    } else {
+                        OpenedUpstreamStream(
+                            statusCode = 200,
+                            headers = mapOf("content-length" to filePayload.size.toString()),
+                            bodyStream = ByteArrayInputStream(filePayload)
+                        )
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/pinned.flac" }
+            )
+            engine2.restorePersistedDownloads(accountId, paths.stagingDir, paths.transfersFile)
+            val observedUri = java.util.concurrent.atomic.AtomicReference<String?>(null)
+            val exportedFile = File(tempRoot, "resumed-Pinned.flac")
+            engine2.resumeTransfer(taskId, paths.stagingDir, paths.transfersFile) { staged, _, _, manifestTreeUri ->
+                val effective = manifestTreeUri ?: changedDefaultUri
+                observedUri.set(effective)
+                staged.copyTo(exportedFile, overwrite = true)
+                effective
+            }
+
+            var waitAttempts = 0
+            while (waitAttempts < 50 && engine2.snapshot().items.firstOrNull { it.id == taskId }?.state != "completed") {
+                delay(30L)
+                waitAttempts += 1
+            }
+            assertEquals("completed", engine2.snapshot().items.first { it.id == taskId }.state)
+            assertEquals("Resumed task must keep its pinned exportTreeUri", pinnedUri, observedUri.get())
+            assertArrayEquals(filePayload, exportedFile.readBytes())
         } finally {
             tempRoot.deleteRecursively()
         }

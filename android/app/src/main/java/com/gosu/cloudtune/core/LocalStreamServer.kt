@@ -165,6 +165,26 @@ class LocalStreamServer(
         return "http://127.0.0.1:$port/stream/${reg.token}/$encoded"
     }
 
+    fun revokeSource(token: String) {
+        val sessionsToRevoke: List<ActiveClientSession>
+        synchronized(stateLock) {
+            sources.remove(token)
+            val collected = ArrayList<ActiveClientSession>()
+            val sessIter = activeSessions.entries.iterator()
+            while (sessIter.hasNext()) {
+                val entry = sessIter.next()
+                if (entry.value.token == token) {
+                    collected.add(entry.value)
+                    sessIter.remove()
+                }
+            }
+            sessionsToRevoke = collected
+        }
+        for (session in sessionsToRevoke) {
+            session.revoke()
+        }
+    }
+
     fun revokeAllSources(accountHash: String) {
         val sessionsToRevoke: List<ActiveClientSession>
         synchronized(stateLock) {

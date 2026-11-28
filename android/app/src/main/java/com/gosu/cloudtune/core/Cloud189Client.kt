@@ -216,6 +216,9 @@ class Cloud189Client(
     )
 
     private val mutex = Mutex()
+    private val sessionLock = Any()
+    @Volatile var sessionEpoch: Int = 0
+        private set
     @Volatile var activeSession: ActiveCloudSession? = null
         private set
     @Volatile var persistedCredential: PersistedRefreshCredential? = null
@@ -225,15 +228,21 @@ class Cloud189Client(
     val isAuthenticated: Boolean get() = activeSession != null
     val accountName: String? get() = activeSession?.loginName ?: persistedCredential?.accountName
 
-    fun clearSessionImmediate() {
-        activeSession = null
-        persistedCredential = null
-        pendingQr = null
-        transport.clearCookies()
+    fun clearSessionImmediate(expectedEpoch: Int? = null) {
+        synchronized(sessionLock) {
+            if (expectedEpoch != null && expectedEpoch != sessionEpoch) {
+                return
+            }
+            sessionEpoch += 1
+            activeSession = null
+            persistedCredential = null
+            pendingQr = null
+            transport.clearCookies()
+        }
     }
 
-    suspend fun clearSession() = mutex.withLock {
-        clearSessionImmediate()
+    suspend fun clearSession(expectedEpoch: Int? = null) = mutex.withLock {
+        clearSessionImmediate(expectedEpoch)
     }
 
     fun importWebCookies(domainUrl: String, cookieHeader: String?) {
@@ -243,7 +252,13 @@ class Cloud189Client(
     /** Cold-start restoration: only sets `activeSession` AFTER network exchange succeeds. */
     suspend fun restoreFromRefreshCredential(
         credential: PersistedRefreshCredential
-    ): Cloud189Protocol.ParsedSessionPayload = mutex.withLock {
+    ): Cloud189Protocol.ParsedSessionPayload =
+        restoreFromRefreshCredentialWithEpoch(credential).first
+
+    internal suspend fun restoreFromRefreshCredentialWithEpoch(
+        credential: PersistedRefreshCredential
+    ): Pair<Cloud189Protocol.ParsedSessionPayload, Int> = mutex.withLock {
+        val startEpoch = synchronized(sessionLock) { sessionEpoch }
         val resp = transport.send(
             url = "${Cloud189Constants.AUTH_URL}/api/oauth2/refreshToken.do",
             method = "POST",
@@ -258,6 +273,9 @@ class Cloud189Client(
                 "format" to "json"
             )
         )
+        if (synchronized(sessionLock) { sessionEpoch != startEpoch }) {
+            throw CloudTuneException("登录会话已变更，请重试")
+        }
         Cloud189Protocol.extractApiErrorMessage(resp.text)?.let { throw CloudTuneException(it) }
         if (resp.statusCode !in 200..299) {
             throw CloudTuneException("刷新登录态失败 (HTTP ${resp.statusCode})")
@@ -275,17 +293,28 @@ class Cloud189Client(
             fallbackAccountName = credential.accountName,
             fallbackAccountKey = credential.accountKey
         )
-        activeSession = parsed.activeSession
-        persistedCredential = parsed.persistedCredential
-        parsed
+        val committedEpoch = synchronized(sessionLock) {
+            if (sessionEpoch != startEpoch) {
+                throw CloudTuneException("登录会话已变更，请重试")
+            }
+            sessionEpoch += 1
+            activeSession = parsed.activeSession
+            persistedCredential = parsed.persistedCredential
+            sessionEpoch
+        }
+        parsed to committedEpoch
     }
 
     suspend fun startQrLogin(): QrLoginStart = mutex.withLock {
+        val startEpoch = synchronized(sessionLock) { sessionEpoch }
         val initResp = transport.send(
             url = Cloud189Protocol.webLoginEntryUrl(),
             method = "GET",
             headers = mapOf("Referer" to Cloud189Constants.REFERER)
         )
+        if (synchronized(sessionLock) { sessionEpoch != startEpoch }) {
+            throw CloudTuneException("登录会话已变更")
+        }
         if (initResp.statusCode !in 200..299) {
             throw CloudTuneException("获取扫码登录页失败 (HTTP ${initResp.statusCode})")
         }
@@ -308,12 +337,22 @@ class Cloud189Client(
         val uuid = Cloud189Protocol.optNonBlank(json, "uuid") ?: throw CloudTuneException("缺少二维码 uuid")
         val encryUuid = Cloud189Protocol.optNonBlank(json, "encryuuid") ?: throw CloudTuneException("缺少 encryuuid")
 
-        pendingQr = PendingQrLogin(params.lt, params.paramId, params.reqId, uuid, encryUuid)
+        synchronized(sessionLock) {
+            if (sessionEpoch != startEpoch) {
+                throw CloudTuneException("登录会话已变更")
+            }
+            pendingQr = PendingQrLogin(params.lt, params.paramId, params.reqId, uuid, encryUuid)
+        }
         QrLoginStart(qrContent = uuid, message = "请使用天翼云盘 App 扫码，并在手机端确认登录")
     }
 
-    suspend fun pollQrLogin(): QrPollResponse = mutex.withLock {
-        val pending = pendingQr ?: throw CloudTuneException("请先生成二维码，再轮询登录状态")
+    suspend fun pollQrLogin(): QrPollResponse =
+        pollQrLoginWithEpoch().first
+
+    internal suspend fun pollQrLoginWithEpoch(): Pair<QrPollResponse, Int?> = mutex.withLock {
+        val (pending, startEpoch) = synchronized(sessionLock) {
+            (pendingQr ?: throw CloudTuneException("请先生成二维码，再轮询登录状态")) to sessionEpoch
+        }
         val resp = transport.send(
             url = "${Cloud189Constants.AUTH_URL}/api/logbox/oauth2/qrcodeLoginState.do",
             method = "POST",
@@ -334,6 +373,9 @@ class Cloud189Client(
                 "timeStamp" to System.currentTimeMillis().toString()
             )
         )
+        if (synchronized(sessionLock) { sessionEpoch != startEpoch }) {
+            throw CloudTuneException("登录会话已变更")
+        }
         if (resp.statusCode !in 200..299) {
             throw CloudTuneException("二维码轮询请求失败 (HTTP ${resp.statusCode})")
         }
@@ -341,20 +383,35 @@ class Cloud189Client(
         when (parsed.state) {
             QrLoginState.AUTHENTICATED -> {
                 val redirect = parsed.redirectUrl ?: throw CloudTuneException("缺少扫码跳转链接")
-                val sessionResult = exchangeRedirectUnlocked(redirect)
-                pendingQr = null
-                parsed.copy(accountName = sessionResult.activeSession.loginName)
+                val (sessionResult, committedEpoch) = exchangeRedirectUnlocked(redirect, startEpoch)
+                synchronized(sessionLock) {
+                    if (pendingQr === pending) {
+                        pendingQr = null
+                    }
+                }
+                parsed.copy(accountName = sessionResult.activeSession.loginName) to committedEpoch
             }
             QrLoginState.EXPIRED -> {
-                pendingQr = null
-                parsed
+                synchronized(sessionLock) {
+                    if (pendingQr === pending) {
+                        pendingQr = null
+                    }
+                }
+                parsed to null
             }
-            QrLoginState.WAITING_SCAN, QrLoginState.WAITING_CONFIRM -> parsed
+            QrLoginState.WAITING_SCAN, QrLoginState.WAITING_CONFIRM -> parsed to null
         }
     }
 
     suspend fun exchangeRedirectForSession(redirectUrl: String): Cloud189Protocol.ParsedSessionPayload =
-        mutex.withLock { exchangeRedirectUnlocked(redirectUrl) }
+        exchangeRedirectForSessionWithEpoch(redirectUrl).first
+
+    internal suspend fun exchangeRedirectForSessionWithEpoch(
+        redirectUrl: String
+    ): Pair<Cloud189Protocol.ParsedSessionPayload, Int> = mutex.withLock {
+        val startEpoch = synchronized(sessionLock) { sessionEpoch }
+        exchangeRedirectUnlocked(redirectUrl, startEpoch)
+    }
 
     suspend fun listRemoteFolder(
         folderId: String?,
@@ -489,7 +546,10 @@ class Cloud189Client(
         return out.sortedBy { "${it.folderPath}/${it.name}".lowercase() }
     }
 
-    private suspend fun exchangeRedirectUnlocked(redirectUrl: String): Cloud189Protocol.ParsedSessionPayload {
+    private suspend fun exchangeRedirectUnlocked(
+        redirectUrl: String,
+        expectedEpoch: Int
+    ): Pair<Cloud189Protocol.ParsedSessionPayload, Int> {
         val query = buildQuery(clientSuffix() + ("redirectURL" to redirectUrl))
         val resp = transport.send(
             url = "${Cloud189Constants.API_URL}/getSessionForPC.action?$query",
@@ -499,6 +559,9 @@ class Cloud189Client(
                 "Referer" to Cloud189Constants.REFERER
             )
         )
+        if (synchronized(sessionLock) { sessionEpoch != expectedEpoch }) {
+            throw CloudTuneException("登录会话已变更，请重试")
+        }
         if (resp.statusCode !in 200..299) {
             Cloud189Protocol.extractApiErrorMessage(resp.text)?.let { throw CloudTuneException(it) }
             throw CloudTuneException("会话兑换失败 (HTTP ${resp.statusCode})")
@@ -507,9 +570,16 @@ class Cloud189Client(
             body = resp.text,
             statusCode = resp.statusCode
         )
-        activeSession = parsed.activeSession
-        persistedCredential = parsed.persistedCredential
-        return parsed
+        val committedEpoch = synchronized(sessionLock) {
+            if (sessionEpoch != expectedEpoch) {
+                throw CloudTuneException("登录会话已变更，请重试")
+            }
+            sessionEpoch += 1
+            activeSession = parsed.activeSession
+            persistedCredential = parsed.persistedCredential
+            sessionEpoch
+        }
+        return parsed to committedEpoch
     }
 
     private suspend fun exchangeAccessTokenUnlocked(
@@ -549,7 +619,9 @@ class Cloud189Client(
 
     private suspend fun signedGetJson(path: String, query: List<Pair<String, String>>): JSONObject {
         repeat(2) { attempt ->
-            val session = activeSession ?: throw CloudTuneException("请先登录天翼云盘")
+            val (session, requestEpoch) = synchronized(sessionLock) {
+                (activeSession ?: throw CloudTuneException("请先登录天翼云盘")) to sessionEpoch
+            }
             val fullQuery = buildQuery(clientSuffix() + query)
             val fullUrl = "${Cloud189Constants.API_URL}$path?$fullQuery"
             val dateHeader = Cloud189Protocol.formatHttpDate()
@@ -575,17 +647,34 @@ class Cloud189Client(
             val body = resp.text
             if (body.contains("userSessionBO is null") || body.contains("InvalidSessionKey")) {
                 if (attempt == 0 && session.accessToken.isNotEmpty()) {
+                    var shouldRetry = false
                     mutex.withLock {
-                        val refreshed = exchangeAccessTokenUnlocked(
-                            accessToken = session.accessToken,
-                            fallbackRefreshToken = persistedCredential?.refreshToken.orEmpty(),
-                            fallbackAccountName = session.loginName,
-                            fallbackAccountKey = persistedCredential?.accountKey
-                        )
-                        activeSession = refreshed.activeSession
-                        persistedCredential = refreshed.persistedCredential
+                        val (currentEpoch, currentActive, fallbackCred) = synchronized(sessionLock) {
+                            Triple(sessionEpoch, activeSession, persistedCredential)
+                        }
+                        if (currentEpoch != requestEpoch) {
+                            shouldRetry = currentActive != null && currentActive.loginName == session.loginName
+                        } else {
+                            val refreshed = exchangeAccessTokenUnlocked(
+                                accessToken = session.accessToken,
+                                fallbackRefreshToken = fallbackCred?.refreshToken.orEmpty(),
+                                fallbackAccountName = session.loginName,
+                                fallbackAccountKey = fallbackCred?.accountKey
+                            )
+                            synchronized(sessionLock) {
+                                if (sessionEpoch != requestEpoch) {
+                                    throw CloudTuneException("天翼云盘会话已失效，请重新登录", isSessionExpired = true)
+                                }
+                                sessionEpoch += 1
+                                activeSession = refreshed.activeSession
+                                persistedCredential = refreshed.persistedCredential
+                            }
+                            shouldRetry = true
+                        }
                     }
-                    return@repeat
+                    if (shouldRetry) {
+                        return@repeat
+                    }
                 }
                 throw CloudTuneException("天翼云盘会话已失效，请重新登录", isSessionExpired = true)
             }

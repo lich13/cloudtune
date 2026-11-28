@@ -10,6 +10,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
@@ -17,8 +18,9 @@ import com.gosu.cloudtune.ui.CloudTuneRootApp
 import com.gosu.cloudtune.ui.CloudTuneViewModel
 
 class MainActivity : ComponentActivity() {
-    private var isInPipMode by mutableStateOf(false)
-    private var runtimeRef: CloudTuneAppRuntime? = null
+    internal var isInPipMode by mutableStateOf(false)
+        private set
+    internal var runtimeRef: CloudTuneAppRuntime? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,6 +59,9 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         isInPipMode = isInPictureInPictureMode
+        if (!isInPictureInPictureMode && !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            runtimeRef?.closeVideoPlayer()
+        }
     }
 
     fun enterVideoPipMode(): Boolean {

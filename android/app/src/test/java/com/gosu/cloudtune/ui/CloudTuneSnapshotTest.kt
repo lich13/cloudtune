@@ -1,5 +1,6 @@
 package com.gosu.cloudtune.ui
 
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
@@ -9,11 +10,15 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.documentfile.provider.DocumentFile
+import androidx.lifecycle.Lifecycle
+import com.gosu.cloudtune.MainActivity
 import com.gosu.cloudtune.core.AppearanceMode
 import com.gosu.cloudtune.core.CloudTuneException
 import com.gosu.cloudtune.core.RepresentativeFixture
 import com.gosu.cloudtune.core.SnapshotScene
 import com.gosu.cloudtune.data.SafExporter
+import com.gosu.cloudtune.media.AudioMetadataHelper
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
@@ -466,6 +471,125 @@ class CloudTuneSnapshotTest {
         } finally {
             controller.pause().stop().destroy()
             scopedFilesRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifySampledArtworkDownsamplingAndCompactThumbnail() {
+        val width = 2048
+        val height = 2048
+        val pixels = IntArray(width * height)
+        for (y in 0 until height) {
+            val row = y * width
+            for (x in 0 until width) {
+                val r = (x * 13 + y * 5) and 0xFF
+                val g = (x * 3 + y * 17) and 0xFF
+                val b = ((x xor y) * 29) and 0xFF
+                pixels[row + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val hugeBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            setPixels(pixels, 0, width, 0, 0, width, height)
+        }
+        val rawPngBytes = ByteArrayOutputStream().use { out ->
+            assertTrue(hugeBitmap.compress(Bitmap.CompressFormat.PNG, 100, out))
+            out.toByteArray()
+        }
+        hugeBitmap.recycle()
+        assertTrue(
+            "Synthetic 2048x2048 PNG should exceed inline threshold, got ${rawPngBytes.size}",
+            rawPngBytes.size > AudioMetadataHelper.MAX_INLINE_ARTWORK_BYTES
+        )
+
+        val sampled = AudioMetadataHelper.decodeSampledBitmap(rawPngBytes, maxDimensionPx = 512)
+        assertNotNull("decodeSampledBitmap must decode valid 2048x2048 PNG", sampled)
+        assertTrue("Decoded width must be <= 512, got ${sampled!!.width}", sampled.width <= 512)
+        assertTrue("Decoded height must be <= 512, got ${sampled.height}", sampled.height <= 512)
+        sampled.recycle()
+
+        val compactBytes = AudioMetadataHelper.compactArtworkBytes(rawPngBytes, maxDimensionPx = 512)
+        assertNotNull("compactArtworkBytes must return compact thumbnail bytes", compactBytes)
+        assertTrue(
+            "Compact bytes (${compactBytes!!.size}) must be much smaller than raw PNG (${rawPngBytes.size})",
+            compactBytes.size < rawPngBytes.size / 2
+        )
+        assertTrue(
+            "Compact bytes (${compactBytes.size}) must fit Binder-safe threshold",
+            compactBytes.size <= AudioMetadataHelper.MAX_INLINE_ARTWORK_BYTES * 2
+        )
+
+        val redecoded = AudioMetadataHelper.decodeSampledBitmap(compactBytes, maxDimensionPx = 512)
+        assertNotNull(redecoded)
+        assertTrue(redecoded!!.width in 1..512 && redecoded.height in 1..512)
+        redecoded.recycle()
+    }
+
+    @Test
+    fun verifyMainActivityPipCloseClearsOverlayAndAudioResumeDismissesVideo() {
+        val tempRoot = Files.createTempDirectory("cloudtune-pip-lifecycle").toFile()
+        val bootProbe = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        val appCtx = bootProbe.get().applicationContext
+        bootProbe.pause().stop().destroy()
+
+        val runtime = CloudTuneAppRuntime(
+            appContext = appCtx,
+            accountStore = com.gosu.cloudtune.data.AccountStore(tempRoot),
+            credentialStore = null,
+            enableLiveLoops = false
+        )
+        CloudTuneAppRuntime.setSharedInstanceForTest(runtime)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            assertEquals(runtime, activity.runtimeRef)
+            val config = Configuration(activity.resources.configuration)
+            val video = com.gosu.cloudtune.core.TrackSummary("vid-pip-1", "StageLive.mp4", "Videos", 8192L)
+
+            runtime.isAuthenticated = true
+            runtime.activeVideoTrack = video
+            runtime.activeVideoTitle = video.name
+            runtime.activeVideoUrl = "http://127.0.0.1:19000/stream/pip/StageLive.mp4"
+            runtime.isVideoPlaying = true
+
+            // 1) Enter PiP (Activity paused -> STARTED): video stays alive
+            activity.onPictureInPictureModeChanged(true, config)
+            controller.pause()
+            assertEquals(Lifecycle.State.STARTED, activity.lifecycle.currentState)
+            assertTrue(activity.isInPipMode)
+            assertNotNull(runtime.activeVideoUrl)
+
+            // 2) Expand PiP back to full screen (Activity RESUMED >= STARTED): video overlay stays open
+            controller.resume()
+            activity.onPictureInPictureModeChanged(false, config)
+            assertFalse(activity.isInPipMode)
+            assertNotNull("Expanding PiP back to foreground must keep activeVideoUrl", runtime.activeVideoUrl)
+
+            // 3) Dismiss/close PiP window ('X'): Activity moves to STOPPED (CREATED) then exits PiP -> closes video player!
+            activity.onPictureInPictureModeChanged(true, config)
+            controller.pause().stop()
+            assertEquals(Lifecycle.State.CREATED, activity.lifecycle.currentState)
+            activity.onPictureInPictureModeChanged(false, config)
+            assertFalse(activity.isInPipMode)
+            assertNull("Closing PiP window must clear activeVideoUrl residue", runtime.activeVideoUrl)
+            assertNull(runtime.activeVideoTrack)
+            assertFalse(runtime.isVideoPlaying)
+
+            // 4) Resuming audio playback dismisses any active in-app video overlay
+            runtime.activeVideoTrack = video
+            runtime.activeVideoTitle = video.name
+            runtime.activeVideoUrl = "http://127.0.0.1:19000/stream/pip2/StageLive.mp4"
+            runtime.isVideoPlaying = true
+            val song = com.gosu.cloudtune.core.TrackSummary("aud-1", "Symphony.flac", "Music", 2048L)
+            runtime.activeTrack = song
+            runtime.currentTrackId = song.id
+            runtime.isPlaying = false
+            runtime.togglePlayback()
+            assertTrue(runtime.isPlaying)
+            assertNull("Starting/resuming audio playback must close video overlay", runtime.activeVideoUrl)
+        } finally {
+            runCatching { controller.destroy() }
+            CloudTuneAppRuntime.setSharedInstanceForTest(null)
+            tempRoot.deleteRecursively()
         }
     }
 }

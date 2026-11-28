@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.webkit.CookieManager
 import androidx.compose.runtime.getValue
@@ -105,7 +104,9 @@ class CloudTuneAppRuntime(
     val accountStore: AccountStore = AccountStore(
         appContext?.applicationContext?.filesDir ?: File(System.getProperty("java.io.tmpdir"), "cloudtune-android")
     ),
-    val credentialStore: CredentialStore? = appContext?.applicationContext?.let { EncryptedCredentialStore(it) },
+    val credentialStore: CredentialStore? = appContext?.applicationContext?.let {
+        runCatching { EncryptedCredentialStore(it) }.getOrNull()
+    },
     val limiter: GlobalTransferLimiter = GlobalTransferLimiter(maxPermits = 8),
     val enableLiveLoops: Boolean = true,
     dispatcher: CoroutineDispatcher = if (appContext != null) Dispatchers.Main.immediate else Dispatchers.Unconfined,
@@ -225,6 +226,9 @@ class CloudTuneAppRuntime(
     private var transferRefreshJob: Job? = null
     private var uiProgressClockJob: Job? = null
     private var scheduledPrefetchJob: Job? = null
+    private var activePrefetchJob: Job? = null
+    private var activeAudioSourceToken: String? = null
+    private var activeVideoSourceToken: String? = null
     internal var lastExternalVideoJob: Job? = null
     private var prefetchedTrackId: String? = null
     private var prefetchingTrackId: String? = null
@@ -595,9 +599,9 @@ class CloudTuneAppRuntime(
                 if (!isActive || authEpoch != expectedAuthEpoch || isAuthenticated) return@async
                 isBootstrapping = true
                 busyLabel = assignedBusy
-                val restored = cloudClient.restoreFromRefreshCredential(stored)
+                val (restored, clientEpoch) = cloudClient.restoreFromRefreshCredentialWithEpoch(stored)
                 if (authEpoch != expectedAuthEpoch) {
-                    cloudClient.clearSessionImmediate()
+                    cloudClient.clearSessionImmediate(clientEpoch)
                     return@async
                 }
                 val identity = Cloud189Protocol.resolveAccountIdentity(
@@ -606,7 +610,7 @@ class CloudTuneAppRuntime(
                     priorAccountKey = stored.accountKey
                 )
                 if (authEpoch != expectedAuthEpoch) {
-                    cloudClient.clearSessionImmediate()
+                    cloudClient.clearSessionImmediate(clientEpoch)
                     return@async
                 }
                 restored.persistedCredential?.let { cred ->
@@ -623,7 +627,7 @@ class CloudTuneAppRuntime(
                     }
                 }
                 if (authEpoch != expectedAuthEpoch) {
-                    cloudClient.clearSessionImmediate()
+                    cloudClient.clearSessionImmediate(clientEpoch)
                     return@async
                 }
                 activateAccount(
@@ -631,7 +635,12 @@ class CloudTuneAppRuntime(
                     displayName = identity.displayName,
                     expectedAuthEpoch = expectedAuthEpoch
                 )
-                if (authEpoch != expectedAuthEpoch || !isAuthenticated) return@async
+                if (authEpoch != expectedAuthEpoch || !isAuthenticated) {
+                    if (authEpoch != expectedAuthEpoch) {
+                        cloudClient.clearSessionImmediate(clientEpoch)
+                    }
+                    return@async
+                }
                 browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
             } catch (ce: CancellationException) {
                 throw ce
@@ -706,8 +715,13 @@ class CloudTuneAppRuntime(
                 delay(2500L)
                 if (!isActive || authEpoch != startEpoch) return@launch
                 try {
-                    val poll = cloudClient.pollQrLogin()
-                    if (!isActive || authEpoch != startEpoch) return@launch
+                    val (poll, clientEpoch) = cloudClient.pollQrLoginWithEpoch()
+                    if (!isActive || authEpoch != startEpoch) {
+                        if (clientEpoch != null) {
+                            cloudClient.clearSessionImmediate(clientEpoch)
+                        }
+                        return@launch
+                    }
                     qrHint = poll.message
                     statusMessage = poll.message
                     when (poll.state) {
@@ -716,7 +730,9 @@ class CloudTuneAppRuntime(
                             val pendingCleanup: Deferred<Unit>?
                             synchronized(bootstrapLock) {
                                 if (authEpoch != startEpoch) {
-                                    cloudClient.clearSessionImmediate()
+                                    if (clientEpoch != null) {
+                                        cloudClient.clearSessionImmediate(clientEpoch)
+                                    }
                                     return@launch
                                 }
                                 authEpoch += 1
@@ -735,7 +751,9 @@ class CloudTuneAppRuntime(
                                 }
                             }
                             if (!isActive || authEpoch != qrAuthEpoch) {
-                                cloudClient.clearSessionImmediate()
+                                if (clientEpoch != null) {
+                                    cloudClient.clearSessionImmediate(clientEpoch)
+                                }
                                 return@launch
                             }
                             val active = cloudClient.activeSession
@@ -769,7 +787,9 @@ class CloudTuneAppRuntime(
                                 }
                             }
                             if (authEpoch != qrAuthEpoch) {
-                                cloudClient.clearSessionImmediate()
+                                if (clientEpoch != null) {
+                                    cloudClient.clearSessionImmediate(clientEpoch)
+                                }
                                 return@launch
                             }
                             qrContent = null
@@ -779,7 +799,12 @@ class CloudTuneAppRuntime(
                                 displayName = identity.displayName,
                                 expectedAuthEpoch = qrAuthEpoch
                             )
-                            if (authEpoch != qrAuthEpoch || !isAuthenticated) return@launch
+                            if (authEpoch != qrAuthEpoch || !isAuthenticated) {
+                                if (authEpoch != qrAuthEpoch && clientEpoch != null) {
+                                    cloudClient.clearSessionImmediate(clientEpoch)
+                                }
+                                return@launch
+                            }
                             browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                             return@launch
                         }
@@ -844,9 +869,9 @@ class CloudTuneAppRuntime(
                 for ((origin, header) in cookiesByOrigin) {
                     cloudClient.importWebCookies(origin, header)
                 }
-                val parsed = cloudClient.exchangeRedirectForSession(callbackUrl)
+                val (parsed, clientEpoch) = cloudClient.exchangeRedirectForSessionWithEpoch(callbackUrl)
                 if (authEpoch != loginEpoch) {
-                    cloudClient.clearSessionImmediate()
+                    cloudClient.clearSessionImmediate(clientEpoch)
                     return@launch
                 }
                 val identity = Cloud189Protocol.resolveAccountIdentity(
@@ -870,7 +895,7 @@ class CloudTuneAppRuntime(
                     }
                 }
                 if (authEpoch != loginEpoch) {
-                    cloudClient.clearSessionImmediate()
+                    cloudClient.clearSessionImmediate(clientEpoch)
                     return@launch
                 }
                 isShowingWebLoginDialog = false
@@ -882,7 +907,12 @@ class CloudTuneAppRuntime(
                     displayName = identity.displayName,
                     expectedAuthEpoch = loginEpoch
                 )
-                if (authEpoch != loginEpoch || !isAuthenticated) return@launch
+                if (authEpoch != loginEpoch || !isAuthenticated) {
+                    if (authEpoch != loginEpoch) {
+                        cloudClient.clearSessionImmediate(clientEpoch)
+                    }
+                    return@launch
+                }
                 browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                 if (authEpoch == loginEpoch && isAuthenticated && activeAccountKey == identity.storageKey) {
                     statusMessage = if (credentialWarning != null) {
@@ -995,6 +1025,8 @@ class CloudTuneAppRuntime(
         uiProgressClockJob = null
         scheduledPrefetchJob?.cancel()
         scheduledPrefetchJob = null
+        activePrefetchJob?.cancel()
+        activePrefetchJob = null
         lastExternalVideoJob?.cancel()
         lastExternalVideoJob = null
         playbackGeneration += 1
@@ -1007,6 +1039,10 @@ class CloudTuneAppRuntime(
         pendingMediaItem = null
         prefetchedTrackId = null
         prefetchingTrackId = null
+        activeAudioSourceToken?.let { token ->
+            activeAudioSourceToken = null
+            streamServer?.revokeSource(token)
+        }
         closeVideoPlayer()
         mediaController?.stop()
         mediaController?.clearMediaItems()
@@ -1257,6 +1293,9 @@ class CloudTuneAppRuntime(
 
     fun playNext(track: TrackSummary) {
         upNextQueue = PlaybackQueueResolver.insertPlayNext(upNextQueue, track)
+        activePrefetchJob?.cancel()
+        activePrefetchJob = null
+        prefetchingTrackId = null
         prefetchedTrackId = null
         syncQueueAvailabilityToBridge()
         statusMessage = "已设为下一首播放：《${track.name}》"
@@ -1293,6 +1332,9 @@ class CloudTuneAppRuntime(
         if (shuffle) {
             shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks, currentTrackId)
         }
+        activePrefetchJob?.cancel()
+        activePrefetchJob = null
+        prefetchingTrackId = null
         prefetchedTrackId = null
         syncQueueAvailabilityToBridge()
         scheduleUpcomingPrefetch()
@@ -1303,6 +1345,11 @@ class CloudTuneAppRuntime(
             LoopMode.OFF -> LoopMode.ALL
             LoopMode.ALL -> LoopMode.ONE
             LoopMode.ONE -> LoopMode.OFF
+        }
+        if (loopMode == LoopMode.ONE) {
+            activePrefetchJob?.cancel()
+            activePrefetchJob = null
+            prefetchingTrackId = null
         }
         syncQueueAvailabilityToBridge()
         scheduleUpcomingPrefetch()
@@ -1316,14 +1363,27 @@ class CloudTuneAppRuntime(
     ) {
         val acctKey = activeAccountKey ?: return
         val cm = cacheManager ?: return
+        activeAudioSourceToken?.let { token ->
+            activeAudioSourceToken = null
+            streamServer?.revokeSource(token)
+        }
         closeVideoPlayer()
         playbackGeneration += 1
         val gen = playbackGeneration
         activeTrack = track
         currentTrackId = track.id
         prefetchedTrackId = null
-        prefetchingTrackId = null
+        val candidateCacheDest = cm.cacheFile(track.id, track.name)
+        val coalesceInFlightPrefetch = !forceStreamProxy && (
+            prefetchingTrackId == track.id || transferEngine.hasInFlightCacheDownload(candidateCacheDest)
+        )
+        if (!coalesceInFlightPrefetch) {
+            activePrefetchJob?.cancel()
+            activePrefetchJob = null
+            prefetchingTrackId = null
+        }
         scheduledPrefetchJob?.cancel()
+        scheduledPrefetchJob = null
         if (shuffle && track.id !in shuffleOrderIds && tracks.any { it.id == track.id }) {
             shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks, track.id)
         }
@@ -1338,9 +1398,15 @@ class CloudTuneAppRuntime(
             loadingTrackId = track.id
             val effectiveMode = modeOverride ?: committedSettings.playbackMode
             try {
-                val cached = withContext(ioDispatcher) {
+                val (cached, inFlightNow) = withContext(ioDispatcher) {
                     cm.setProtectedTrackIds(setOf(track.id))
-                    cm.existingCachedFile(track.id)
+                    val existing = cm.existingCachedFile(track.id)
+                    val inFlight = if (existing == null && !forceStreamProxy) {
+                        transferEngine.hasInFlightCacheDownload(cm.cacheFile(track.id, track.name))
+                    } else {
+                        false
+                    }
+                    existing to inFlight
                 }
                 if (cached != null) {
                     val (usage, meta) = withContext(ioDispatcher) {
@@ -1351,17 +1417,18 @@ class CloudTuneAppRuntime(
                             fallbackAlbum = fallbackAlbum
                         )
                     }
-                    if (gen != playbackGeneration || !isAuthenticated) return@launch
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) return@launch
                     cacheUsageBytes = usage
                     val fileUri = Uri.fromFile(cached)?.toString() ?: cached.toURI().toString()
                     startControllerPlayback(track, fileUri, isLoopback = false, metadata = meta)
                     return@launch
                 }
-                val downloadFirst = PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
-                    mode = effectiveMode,
-                    sizeBytes = track.sizeBytes,
-                    forceStreamProxy = forceStreamProxy
-                )
+                val downloadFirst = (!forceStreamProxy && (coalesceInFlightPrefetch || inFlightNow)) ||
+                    PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                        mode = effectiveMode,
+                        sizeBytes = track.sizeBytes,
+                        forceStreamProxy = forceStreamProxy
+                    )
                 if (downloadFirst) {
                     val file = transferEngine.downloadTrackToCache(
                         track = track,
@@ -1371,7 +1438,7 @@ class CloudTuneAppRuntime(
                         kind = "playback",
                         accountHash = accountHash
                     )
-                    if (gen != playbackGeneration || !isAuthenticated) return@launch
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) return@launch
                     val (usage, meta) = withContext(ioDispatcher) {
                         cm.usageBytes() to AudioMetadataHelper.extract(
                             localFile = file,
@@ -1380,28 +1447,38 @@ class CloudTuneAppRuntime(
                             fallbackAlbum = fallbackAlbum
                         )
                     }
-                    if (gen != playbackGeneration || !isAuthenticated) return@launch
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) return@launch
                     cacheUsageBytes = usage
                     val fileUri = Uri.fromFile(file)?.toString() ?: file.toURI().toString()
                     startControllerPlayback(track, fileUri, isLoopback = false, metadata = meta)
                 } else {
                     val remoteUrl = cloudClient.resolveDownloadUrl(track.id)
-                    if (gen != playbackGeneration || !isAuthenticated) return@launch
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) return@launch
                     val dest = withContext(ioDispatcher) { cm.cacheFile(track.id, track.name) }
-                    if (gen != playbackGeneration || !isAuthenticated) return@launch
-                    val playUrl = streamServer?.registerSource(
-                        StreamSourceRegistration(
-                            accountHash = accountHash,
-                            trackId = track.id,
-                            remoteUrl = remoteUrl,
-                            cacheDestination = dest,
-                            expectedSize = track.sizeBytes,
-                            fileName = track.name,
-                            cacheLimitBytes = committedSettings.cacheLimitBytes
-                        ),
-                        cacheManager = cm
-                    ) ?: remoteUrl
-                    startControllerPlayback(track, playUrl, isLoopback = true, metadata = null)
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) return@launch
+                    val server = streamServer
+                    val reg = StreamSourceRegistration(
+                        accountHash = accountHash,
+                        trackId = track.id,
+                        remoteUrl = remoteUrl,
+                        cacheDestination = dest,
+                        expectedSize = track.sizeBytes,
+                        fileName = track.name,
+                        cacheLimitBytes = committedSettings.cacheLimitBytes
+                    )
+                    val playUrl = server?.registerSource(reg, cacheManager = cm) ?: remoteUrl
+                    val registeredToken = if (server != null) reg.token else null
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != acctKey || cacheManager !== cm) {
+                        registeredToken?.let { server?.revokeSource(it) }
+                        return@launch
+                    }
+                    startControllerPlayback(
+                        track = track,
+                        uriString = playUrl,
+                        isLoopback = true,
+                        metadata = null,
+                        sourceToken = registeredToken
+                    )
                 }
             } catch (ce: CancellationException) {
                 throw ce
@@ -1417,10 +1494,8 @@ class CloudTuneAppRuntime(
         }
     }
 
-    private fun decodeArtworkBitmap(bytes: ByteArray?): Bitmap? {
-        if (bytes == null || bytes.isEmpty()) return null
-        return runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
-    }
+    private fun decodeArtworkBitmap(bytes: ByteArray?): Bitmap? =
+        AudioMetadataHelper.decodeSampledBitmap(bytes, maxDimensionPx = AudioMetadataHelper.MAX_ARTWORK_DIMENSION_PX)
 
     private fun buildMediaMetadata(
         track: TrackSummary,
@@ -1445,8 +1520,14 @@ class CloudTuneAppRuntime(
         track: TrackSummary,
         uriString: String,
         isLoopback: Boolean,
-        metadata: ExtractedAudioMetadata?
+        metadata: ExtractedAudioMetadata?,
+        sourceToken: String? = null
     ) {
+        val priorAudioToken = activeAudioSourceToken
+        activeAudioSourceToken = sourceToken
+        if (priorAudioToken != null && priorAudioToken != sourceToken) {
+            streamServer?.revokeSource(priorAudioToken)
+        }
         currentPlaybackIsLoopback = isLoopback
         activeTrack = track
         currentTrackId = track.id
@@ -1650,7 +1731,11 @@ class CloudTuneAppRuntime(
         }
         val controller = mediaController
         if (controller == null) {
-            isPlaying = !isPlaying
+            val nextPlaying = !isPlaying
+            if (nextPlaying && (activeVideoUrl != null || videoPlayer != null)) {
+                closeVideoPlayer()
+            }
+            isPlaying = nextPlaying
             updateUiProgressClock()
             return
         }
@@ -1658,6 +1743,9 @@ class CloudTuneAppRuntime(
             controller.pause()
             isPlaying = false
         } else {
+            if (activeVideoUrl != null || videoPlayer != null) {
+                closeVideoPlayer()
+            }
             if (controller.mediaItemCount == 0) playTrack(curr) else controller.play()
             isPlaying = true
         }
@@ -1716,6 +1804,10 @@ class CloudTuneAppRuntime(
         val expectedAccount = activeAccountKey
         recoveryAttempts = 0
         scheduledPrefetchJob?.cancel()
+        scheduledPrefetchJob = null
+        activePrefetchJob?.cancel()
+        activePrefetchJob = null
+        prefetchingTrackId = null
         mediaController?.pause()
         isPlaying = false
         updateUiProgressClock()
@@ -1726,34 +1818,43 @@ class CloudTuneAppRuntime(
             try {
                 val cm = cacheManager
                 val cached = withContext(ioDispatcher) { cm?.existingCachedFile(video.id) }
-                if (gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) return@launch
+                if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) return@launch
+                var registeredToken: String? = null
                 val resolvedPlayUrl = if (cached != null && cm === cacheManager) {
                     Uri.fromFile(cached)?.toString() ?: cached.toURI().toString()
                 } else {
                     val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
-                    if (gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) return@launch
+                    if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) return@launch
                     val acct = activeAccountKey
                     val currentCm = cacheManager
-                    if (streamServer != null && currentCm != null && acct != null && acct == expectedAccount) {
+                    val server = streamServer
+                    if (server != null && currentCm != null && acct != null && acct == expectedAccount) {
                         val dest = withContext(ioDispatcher) { currentCm.cacheFile(video.id, video.name) }
-                        if (gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount || cacheManager !== currentCm) return@launch
-                        streamServer.registerSource(
-                            StreamSourceRegistration(
-                                accountHash = Cloud189Protocol.accountBucketHash(acct),
-                                trackId = video.id,
-                                remoteUrl = remoteUrl,
-                                cacheDestination = dest,
-                                expectedSize = video.sizeBytes,
-                                fileName = video.name,
-                                cacheLimitBytes = committedSettings.cacheLimitBytes
-                            ),
-                            cacheManager = currentCm
+                        if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount || cacheManager !== currentCm) return@launch
+                        val reg = StreamSourceRegistration(
+                            accountHash = Cloud189Protocol.accountBucketHash(acct),
+                            trackId = video.id,
+                            remoteUrl = remoteUrl,
+                            cacheDestination = dest,
+                            expectedSize = video.sizeBytes,
+                            fileName = video.name,
+                            cacheLimitBytes = committedSettings.cacheLimitBytes
                         )
+                        registeredToken = reg.token
+                        server.registerSource(reg, cacheManager = currentCm)
                     } else {
                         remoteUrl
                     }
                 }
-                if (gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) return@launch
+                if (!isActive || gen != playbackGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                    registeredToken?.let { streamServer?.revokeSource(it) }
+                    return@launch
+                }
+                val priorVideoToken = activeVideoSourceToken
+                activeVideoSourceToken = registeredToken
+                if (priorVideoToken != null && priorVideoToken != registeredToken) {
+                    streamServer?.revokeSource(priorVideoToken)
+                }
                 activeVideoTrack = video
                 activeVideoTitle = video.name
                 activeVideoUrl = resolvedPlayUrl
@@ -1807,6 +1908,10 @@ class CloudTuneAppRuntime(
         activeVideoUrl = null
         activeVideoTitle = null
         activeVideoTrack = null
+        activeVideoSourceToken?.let { token ->
+            activeVideoSourceToken = null
+            streamServer?.revokeSource(token)
+        }
         videoPlayer?.let { p ->
             runCatching {
                 p.stop()
@@ -1853,25 +1958,27 @@ class CloudTuneAppRuntime(
                 }
                 val cm = cacheManager
                 val acct = activeAccountKey
-                val loopbackUrl: String? = if (streamServer != null && cm != null && acct != null && acct == expectedAccount) {
+                val server = streamServer
+                var registeredToken: String? = null
+                val loopbackUrl: String? = if (server != null && cm != null && acct != null && acct == expectedAccount) {
                     val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
-                    if (extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount || cacheManager !== cm) {
+                    if (!isActive || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount || cacheManager !== cm) {
                         return@launch
                     }
-                    streamServer.registerSource(
-                        StreamSourceRegistration(
-                            accountHash = Cloud189Protocol.accountBucketHash(acct),
-                            trackId = video.id,
-                            remoteUrl = remoteUrl,
-                            cacheDestination = dest,
-                            expectedSize = video.sizeBytes,
-                            fileName = video.name,
-                            cacheLimitBytes = committedSettings.cacheLimitBytes
-                        ),
-                        cacheManager = cm
+                    val reg = StreamSourceRegistration(
+                        accountHash = Cloud189Protocol.accountBucketHash(acct),
+                        trackId = video.id,
+                        remoteUrl = remoteUrl,
+                        cacheDestination = dest,
+                        expectedSize = video.sizeBytes,
+                        fileName = video.name,
+                        cacheLimitBytes = committedSettings.cacheLimitBytes
                     )
+                    registeredToken = reg.token
+                    server.registerSource(reg, cacheManager = cm)
                 } else null
-                if (extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                if (!isActive || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                    registeredToken?.let { server?.revokeSource(it) }
                     return@launch
                 }
                 pendingExternalVideoAction = PendingExternalVideoAction(video, loopbackUrl)
@@ -2006,10 +2113,16 @@ class CloudTuneAppRuntime(
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val explicitTreeUri = treeUriString
+        val explicitTreeUri = treeUriString?.takeIf { it.isNotBlank() }
         val fallbackTreeUri = committedSettings.exportTreeUri
-        enqueueDownloadWithExporter(track = track, expectedAccount = acct) { staged, rel, _ ->
-            val effectiveTreeUri = explicitTreeUri
+        val pinnedTreeUri = explicitTreeUri ?: fallbackTreeUri?.takeIf { it.isNotBlank() }
+        enqueueDownloadWithExporter(
+            track = track,
+            expectedAccount = acct,
+            exportTreeUri = pinnedTreeUri
+        ) { staged, rel, _, manifestTreeUri ->
+            val effectiveTreeUri = manifestTreeUri?.takeIf { it.isNotBlank() }
+                ?: explicitTreeUri
                 ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
                 ?: fallbackTreeUri
             SafExporter.exportToSafTree(
@@ -2025,14 +2138,20 @@ class CloudTuneAppRuntime(
     internal fun enqueueDownloadWithExporter(
         track: TrackSummary,
         expectedAccount: String? = activeAccountKey,
+        exportTreeUri: String? = null,
         exporter: StagedFileExporter
     ) {
         val acct = expectedAccount ?: return
+        val expectedEpoch = authEpoch
         val threads = committedSettings.downloadThreads
+        val inMemoryTreeUri = committedSettings.exportTreeUri
         scope.launch {
-            if (!isAuthenticated || activeAccountKey != acct) return@launch
+            if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) return@launch
             val (taskId, snap) = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
+                val resolvedTreeUri = exportTreeUri?.takeIf { it.isNotBlank() }
+                    ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri?.takeIf { it.isNotBlank() }
+                    ?: inMemoryTreeUri?.takeIf { it.isNotBlank() }
                 val id = transferEngine.enqueueExportDownload(
                     accountId = acct,
                     track = track,
@@ -2040,11 +2159,12 @@ class CloudTuneAppRuntime(
                     parallelThreads = threads,
                     stagingRootDir = paths.stagingDir,
                     manifestsFile = paths.transfersFile,
+                    exportTreeUri = resolvedTreeUri,
                     exporter = exporter
                 )
                 id to transferEngine.snapshot()
             }
-            if (isAuthenticated && activeAccountKey == acct) {
+            if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
                 transferSnapshot = snap
                 statusMessage = "已添加下载任务 $taskId"
             }
@@ -2058,10 +2178,16 @@ class CloudTuneAppRuntime(
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val explicitTreeUri = treeUriString
+        val explicitTreeUri = treeUriString?.takeIf { it.isNotBlank() }
         val fallbackTreeUri = committedSettings.exportTreeUri
-        enqueueCurrentFolderDownloadWithExporter(pane = pane, expectedAccount = acct) { staged, subpath, _ ->
-            val effectiveTreeUri = explicitTreeUri
+        val pinnedTreeUri = explicitTreeUri ?: fallbackTreeUri?.takeIf { it.isNotBlank() }
+        enqueueCurrentFolderDownloadWithExporter(
+            pane = pane,
+            expectedAccount = acct,
+            exportTreeUri = pinnedTreeUri
+        ) { staged, subpath, _, manifestTreeUri ->
+            val effectiveTreeUri = manifestTreeUri?.takeIf { it.isNotBlank() }
+                ?: explicitTreeUri
                 ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
                 ?: fallbackTreeUri
             SafExporter.exportToSafTree(
@@ -2077,26 +2203,39 @@ class CloudTuneAppRuntime(
     internal fun enqueueCurrentFolderDownloadWithExporter(
         pane: BrowserPaneState = cloudBrowser,
         expectedAccount: String? = activeAccountKey,
+        exportTreeUri: String? = null,
         exporter: StagedFileExporter
     ) {
         val b = pane.payload ?: return
         val acct = expectedAccount ?: return
         val threads = committedSettings.downloadThreads
+        val inMemoryTreeUri = committedSettings.exportTreeUri
         val nonRootCrumbs = pane.breadcrumbs.filter { it.id != null && it.id != Cloud189Constants.ROOT_FOLDER_ID }
         val crumbPath = if (!b.isRoot && nonRootCrumbs.lastOrNull()?.id == b.currentFolderId) {
             nonRootCrumbs.map { it.name }.filter { it.isNotEmpty() }.joinToString("/").takeIf { it.isNotEmpty() }
         } else null
         val rootExportFolder = crumbPath ?: b.currentFolderName
+        val expectedEpoch: Int
+        val myBusyToken: Int
+        synchronized(bootstrapLock) {
+            expectedEpoch = authEpoch
+            operationBusyToken += 1
+            myBusyToken = operationBusyToken
+        }
 
         scope.launch {
             val assignedBusy = "扫描文件夹 ${b.currentFolderName}..."
             busyLabel = assignedBusy
             try {
                 val allFiles = cloudClient.scanAllFiles(b.currentFolderId, rootExportFolder)
-                if (!isAuthenticated || activeAccountKey != acct) return@launch
+                if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) return@launch
                 val snap = withContext(ioDispatcher) {
                     val paths = accountStore.paths(acct)
+                    val resolvedTreeUri = exportTreeUri?.takeIf { it.isNotBlank() }
+                        ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri?.takeIf { it.isNotBlank() }
+                        ?: inMemoryTreeUri?.takeIf { it.isNotBlank() }
                     for (item in allFiles) {
+                        if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) break
                         val rel = if (item.folderPath.startsWith(rootExportFolder)) {
                             "${item.folderPath}/${item.name}"
                         } else {
@@ -2109,23 +2248,24 @@ class CloudTuneAppRuntime(
                             parallelThreads = threads,
                             stagingRootDir = paths.stagingDir,
                             manifestsFile = paths.transfersFile,
+                            exportTreeUri = resolvedTreeUri,
                             exporter = exporter
                         )
                     }
                     transferEngine.snapshot()
                 }
-                if (isAuthenticated && activeAccountKey == acct) {
+                if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
                     transferSnapshot = snap
                     statusMessage = "目录下载已入队（共 ${allFiles.size} 个文件）"
                 }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                if (isAuthenticated && activeAccountKey == acct) {
+                if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
                     statusMessage = e.message
                 }
             } finally {
-                if (busyLabel == assignedBusy) {
+                if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
                     busyLabel = null
                 }
             }
@@ -2152,13 +2292,14 @@ class CloudTuneAppRuntime(
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val explicitTreeUri = treeUriString
+        val explicitTreeUri = treeUriString?.takeIf { it.isNotBlank() }
         val fallbackTreeUri = committedSettings.exportTreeUri
         scope.launch {
             val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
-                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _ ->
+                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _, manifestTreeUri ->
                     val effectiveTreeUri = explicitTreeUri
+                        ?: manifestTreeUri?.takeIf { it.isNotBlank() }
                         ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
                         ?: fallbackTreeUri
                     SafExporter.exportToSafTree(
@@ -2293,6 +2434,7 @@ class CloudTuneAppRuntime(
 
     private fun triggerUpcomingPrefetchNow() {
         val cm = cacheManager ?: return
+        val expectedAcct = activeAccountKey ?: return
         if (!isAuthenticated || loopMode == LoopMode.ONE || currentTrack == null) return
         val next = PlaybackQueueResolver.peekPrefetchCandidate(
             currentTrack = currentTrack,
@@ -2303,14 +2445,24 @@ class CloudTuneAppRuntime(
             loopMode = loopMode
         ) ?: return
         if (next.id == prefetchedTrackId || next.id == prefetchingTrackId) return
+        activePrefetchJob?.cancel()
+        activePrefetchJob = null
 
+        val expectedEpoch = authEpoch
+        val expectedPlayGen = playbackGeneration
         prefetchingTrackId = next.id
         val activeId = currentTrackId.orEmpty()
-        val accountHash = activeAccountKey?.let { Cloud189Protocol.accountBucketHash(it) }
-        scope.launch {
+        val accountHash = Cloud189Protocol.accountBucketHash(expectedAcct)
+        var launchedJob: Job? = null
+        val job = scope.launch {
             try {
                 withContext(ioDispatcher) {
-                    cm.setProtectedTrackIds(setOf(activeId, next.id))
+                    if (isAuthenticated && authEpoch == expectedEpoch && activeAccountKey == expectedAcct && cacheManager === cm) {
+                        cm.setProtectedTrackIds(setOf(activeId, next.id))
+                    }
+                }
+                if (!isActive || !isAuthenticated || authEpoch != expectedEpoch || playbackGeneration != expectedPlayGen || activeAccountKey != expectedAcct || cacheManager !== cm) {
+                    return@launch
                 }
                 transferEngine.downloadTrackToCache(
                     track = next,
@@ -2320,7 +2472,9 @@ class CloudTuneAppRuntime(
                     kind = "prefetch",
                     accountHash = accountHash
                 )
-                prefetchedTrackId = next.id
+                if (isActive && isAuthenticated && authEpoch == expectedEpoch && playbackGeneration == expectedPlayGen && activeAccountKey == expectedAcct && cacheManager === cm) {
+                    prefetchedTrackId = next.id
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
@@ -2329,7 +2483,14 @@ class CloudTuneAppRuntime(
                 if (prefetchingTrackId == next.id) {
                     prefetchingTrackId = null
                 }
+                if (launchedJob != null && activePrefetchJob === launchedJob) {
+                    activePrefetchJob = null
+                }
             }
+        }
+        if (!job.isCompleted) {
+            launchedJob = job
+            activePrefetchJob = job
         }
     }
 
@@ -2342,6 +2503,9 @@ class CloudTuneAppRuntime(
                 mediaController = controller
                 controller.addListener(object : Player.Listener {
                     override fun onIsPlayingChanged(playing: Boolean) {
+                        if (playing && (activeVideoUrl != null || videoPlayer != null)) {
+                            closeVideoPlayer()
+                        }
                         isPlaying = playing
                         updateUiProgressClock()
                         scheduleUpcomingPrefetch()
@@ -2419,6 +2583,12 @@ class CloudTuneAppRuntime(
         private val instanceLock = Any()
         @Volatile private var sharedInstance: CloudTuneAppRuntime? = null
 
+        internal fun setSharedInstanceForTest(instance: CloudTuneAppRuntime?) {
+            synchronized(instanceLock) {
+                sharedInstance = instance
+            }
+        }
+
         fun getOrCreate(context: Context): CloudTuneAppRuntime {
             sharedInstance?.let { return it }
             return synchronized(instanceLock) {
@@ -2440,7 +2610,9 @@ class CloudTuneViewModel(
         accountStore: AccountStore = AccountStore(
             appContext?.applicationContext?.filesDir ?: File(System.getProperty("java.io.tmpdir"), "cloudtune-android")
         ),
-        credentialStore: CredentialStore? = appContext?.applicationContext?.let { EncryptedCredentialStore(it) },
+        credentialStore: CredentialStore? = appContext?.applicationContext?.let {
+            runCatching { EncryptedCredentialStore(it) }.getOrNull()
+        },
         limiter: GlobalTransferLimiter = GlobalTransferLimiter(maxPermits = 8),
         enableLiveLoops: Boolean = true
     ) : this(

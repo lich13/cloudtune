@@ -27,7 +27,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 fun interface StagedFileExporter {
-    suspend fun export(stagedFile: File, relativeSubpath: String, accountId: String): String
+    suspend fun export(
+        stagedFile: File,
+        relativeSubpath: String,
+        accountId: String,
+        exportTreeUri: String?
+    ): String
 }
 
 data class StagedDownloadManifest(
@@ -38,7 +43,8 @@ data class StagedDownloadManifest(
     val relativeSubpath: String,
     val totalSize: Long,
     val partCount: Int,
-    val state: String
+    val state: String,
+    val exportTreeUri: String? = null
 )
 
 class TransferEngine(
@@ -144,7 +150,8 @@ class TransferEngine(
                     relativeSubpath = o.optString("relativeSubpath", o.getString("fileName")),
                     totalSize = o.optLong("totalSize", 0L),
                     partCount = o.optInt("partCount", 1).coerceAtLeast(1),
-                    state = restoredState
+                    state = restoredState,
+                    exportTreeUri = o.optString("exportTreeUri").takeIf { it.isNotEmpty() }
                 )
                 manifests[manifest.taskId] = manifest
                 manifestAccountKeys[manifest.taskId] = accountId
@@ -212,6 +219,13 @@ class TransferEngine(
             }
         }
         notifyActivityChanged(force = true)
+    }
+
+    fun hasInFlightCacheDownload(cacheFile: File): Boolean {
+        val cacheKey = runCatching { cacheFile.canonicalPath }.getOrDefault(cacheFile.absolutePath)
+        return synchronized(cacheDownloadLock) {
+            inFlightCacheDownloads[cacheKey]?.deferred?.isActive == true
+        }
     }
 
     suspend fun downloadTrackToCache(
@@ -355,6 +369,7 @@ class TransferEngine(
         parallelThreads: Int,
         stagingRootDir: File,
         manifestsFile: File,
+        exportTreeUri: String? = null,
         exporter: StagedFileExporter
     ): String {
         val taskId = "download:${UUID.randomUUID()}"
@@ -368,7 +383,8 @@ class TransferEngine(
             relativeSubpath = relativeSubpath,
             totalSize = track.sizeBytes,
             partCount = partCount,
-            state = "running"
+            state = "running",
+            exportTreeUri = exportTreeUri?.takeIf { it.isNotBlank() }
         )
         manifests[taskId] = manifest
         manifestAccountKeys[taskId] = accountId
@@ -469,7 +485,12 @@ class TransferEngine(
                 downloadParts(id, manifest.trackId, remoteUrl, totalSize, effectiveParts, partsDir)
                 ensureActive()
                 mergeParts(partsDir, effectiveParts, mergedFile, totalSize)
-                val exportedDisplay = exporter.export(mergedFile, manifest.relativeSubpath, accountKey)
+                val exportedDisplay = exporter.export(
+                    mergedFile,
+                    updatedManifest.relativeSubpath,
+                    accountKey,
+                    updatedManifest.exportTreeUri
+                )
 
                 mergedFile.delete()
                 partsDir.deleteRecursively()
@@ -718,16 +739,18 @@ class TransferEngine(
         synchronized(persistLock) {
             val arr = JSONArray()
             manifests.values.filter { it.accountHash == accountHash }.sortedBy { it.taskId }.forEach { m ->
-                arr.put(
-                    JSONObject()
-                        .put("taskId", m.taskId)
-                        .put("trackId", m.trackId)
-                        .put("fileName", m.fileName)
-                        .put("relativeSubpath", m.relativeSubpath)
-                        .put("totalSize", m.totalSize)
-                        .put("partCount", m.partCount)
-                        .put("state", m.state)
-                )
+                val obj = JSONObject()
+                    .put("taskId", m.taskId)
+                    .put("trackId", m.trackId)
+                    .put("fileName", m.fileName)
+                    .put("relativeSubpath", m.relativeSubpath)
+                    .put("totalSize", m.totalSize)
+                    .put("partCount", m.partCount)
+                    .put("state", m.state)
+                if (!m.exportTreeUri.isNullOrEmpty()) {
+                    obj.put("exportTreeUri", m.exportTreeUri)
+                }
+                arr.put(obj)
             }
             val parent = manifestsFile.parentFile
             parent?.mkdirs()

@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.os.Environment
 import android.os.Handler
@@ -27,8 +28,10 @@ import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.gosu.cloudtune.MainActivity
 import com.gosu.cloudtune.R
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.math.roundToInt
 
 object PlaybackSessionBridge {
     @Volatile var onSkipNext: (() -> Unit)? = null
@@ -54,6 +57,100 @@ data class ExtractedAudioMetadata(
 )
 
 object AudioMetadataHelper {
+    const val MAX_ARTWORK_DIMENSION_PX = 512
+    const val MAX_INLINE_ARTWORK_BYTES = 131_072
+
+    fun decodeSampledBitmap(
+        rawBytes: ByteArray?,
+        maxDimensionPx: Int = MAX_ARTWORK_DIMENSION_PX
+    ): Bitmap? {
+        if (rawBytes == null || rawBytes.isEmpty() || maxDimensionPx <= 0) return null
+        return try {
+            val boundsOpts = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, boundsOpts)
+            val outW = boundsOpts.outWidth
+            val outH = boundsOpts.outHeight
+            if (outW <= 0 || outH <= 0) return null
+
+            var sample = 1
+            while (outW / (sample * 2) >= maxDimensionPx || outH / (sample * 2) >= maxDimensionPx) {
+                sample *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOpts)
+                ?: return null
+            val maxDecoded = maxOf(decoded.width, decoded.height)
+            if (maxDecoded <= maxDimensionPx) {
+                decoded
+            } else {
+                val scale = maxDimensionPx.toFloat() / maxDecoded.toFloat()
+                val targetW = (decoded.width * scale).roundToInt().coerceIn(1, maxDimensionPx)
+                val targetH = (decoded.height * scale).roundToInt().coerceIn(1, maxDimensionPx)
+                val scaled = Bitmap.createScaledBitmap(decoded, targetW, targetH, true)
+                if (scaled !== decoded) {
+                    decoded.recycle()
+                }
+                scaled
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun compactArtworkBytes(
+        rawBytes: ByteArray?,
+        maxDimensionPx: Int = MAX_ARTWORK_DIMENSION_PX
+    ): ByteArray? {
+        if (rawBytes == null || rawBytes.isEmpty() || maxDimensionPx <= 0) return null
+        return try {
+            val boundsOpts = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, boundsOpts)
+            val outW = boundsOpts.outWidth
+            val outH = boundsOpts.outHeight
+            if (outW <= 0 || outH <= 0) {
+                return if (rawBytes.size <= MAX_INLINE_ARTWORK_BYTES) rawBytes else null
+            }
+            if (rawBytes.size <= MAX_INLINE_ARTWORK_BYTES && outW <= maxDimensionPx && outH <= maxDimensionPx) {
+                return rawBytes
+            }
+            val bitmap = decodeSampledBitmap(rawBytes, maxDimensionPx)
+                ?: return if (rawBytes.size <= MAX_INLINE_ARTWORK_BYTES) rawBytes else null
+            try {
+                if (bitmap.hasAlpha()) {
+                    val pngOut = ByteArrayOutputStream()
+                    if (bitmap.compress(Bitmap.CompressFormat.PNG, 100, pngOut) &&
+                        pngOut.size() in 1..MAX_INLINE_ARTWORK_BYTES
+                    ) {
+                        return pngOut.toByteArray()
+                    }
+                }
+                val jpegOut = ByteArrayOutputStream()
+                if (bitmap.compress(Bitmap.CompressFormat.JPEG, 85, jpegOut) && jpegOut.size() > 0) {
+                    if (jpegOut.size() <= MAX_INLINE_ARTWORK_BYTES) {
+                        return jpegOut.toByteArray()
+                    }
+                    val smallerOut = ByteArrayOutputStream()
+                    if (bitmap.compress(Bitmap.CompressFormat.JPEG, 70, smallerOut) && smallerOut.size() > 0) {
+                        return smallerOut.toByteArray()
+                    }
+                    return jpegOut.toByteArray()
+                }
+                if (rawBytes.size <= MAX_INLINE_ARTWORK_BYTES) rawBytes else null
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (_: Throwable) {
+            if (rawBytes.size <= MAX_INLINE_ARTWORK_BYTES) rawBytes else null
+        }
+    }
+
     fun extract(
         localFile: File?,
         fallbackTitle: String,
@@ -72,7 +169,7 @@ object AudioMetadataHelper {
                 ?.trim()?.takeIf { it.isNotEmpty() } ?: fallbackArtist
             val album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
                 ?.trim()?.takeIf { it.isNotEmpty() } ?: fallbackAlbum
-            val art = retriever.embeddedPicture?.takeIf { it.isNotEmpty() }
+            val art = compactArtworkBytes(retriever.embeddedPicture?.takeIf { it.isNotEmpty() })
             ExtractedAudioMetadata(title, artist, album, art)
         } catch (_: Throwable) {
             ExtractedAudioMetadata(fallbackTitle, fallbackArtist, fallbackAlbum, null)

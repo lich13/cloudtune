@@ -785,6 +785,7 @@ package struct TransferRowCardView: View {
     package let palette: CloudTunePalette
     package let onPause: () -> Void
     package let onResume: () -> Void
+    package let onPickDirectoryAndResume: (() -> Void)?
     package let onDelete: () -> Void
 
     package init(
@@ -792,12 +793,14 @@ package struct TransferRowCardView: View {
         palette: CloudTunePalette,
         onPause: @escaping () -> Void,
         onResume: @escaping () -> Void,
+        onPickDirectoryAndResume: (() -> Void)? = nil,
         onDelete: @escaping () -> Void
     ) {
         self.item = item
         self.palette = palette
         self.onPause = onPause
         self.onResume = onResume
+        self.onPickDirectoryAndResume = onPickDirectoryAndResume
         self.onDelete = onDelete
     }
 
@@ -907,6 +910,9 @@ package struct TransferRowCardView: View {
         }
         if item.canResume {
             SecondaryActionButton("继续", palette: palette, action: onResume)
+        }
+        if item.kind == "download", item.state.hasPrefix("failed"), let onPickDirectoryAndResume {
+            SecondaryActionButton("重选目录", palette: palette, action: onPickDirectoryAndResume)
         }
         if item.canDelete {
             SecondaryActionButton("删除", palette: palette, action: onDelete)

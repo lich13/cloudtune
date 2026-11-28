@@ -28,6 +28,19 @@ package struct AccountPaths: Equatable, Sendable {
     }
 }
 
+private final class ExportCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+}
+
 package actor AccountScopedStore {
     package let rootDirectory: URL
     private let fm = FileManager.default
@@ -309,20 +322,26 @@ package actor AccountScopedStore {
         folderURL: URL
     ) async throws -> URL {
         try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let result = try performCoordinatedPartExport(
-                        partURLs: partURLs,
-                        expectedTotalBytes: expectedTotalBytes,
-                        relativeSubpath: relativeSubpath,
-                        folderURL: folderURL
-                    )
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
+        let token = ExportCancellationToken()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let result = try performCoordinatedPartExport(
+                            partURLs: partURLs,
+                            expectedTotalBytes: expectedTotalBytes,
+                            relativeSubpath: relativeSubpath,
+                            folderURL: folderURL,
+                            cancellationToken: token
+                        )
+                        continuation.resume(returning: result)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
+        } onCancel: {
+            token.cancel()
         }
     }
 
@@ -330,8 +349,12 @@ package actor AccountScopedStore {
         partURLs: [URL],
         expectedTotalBytes: UInt64?,
         relativeSubpath: String,
-        folderURL: URL
+        folderURL: URL,
+        cancellationToken: ExportCancellationToken
     ) throws -> URL {
+        if cancellationToken.isCancelled {
+            throw CancellationError()
+        }
         let didStart = folderURL.startAccessingSecurityScopedResource()
         defer {
             if didStart { folderURL.stopAccessingSecurityScopedResource() }
@@ -377,6 +400,9 @@ package actor AccountScopedStore {
         let coordinator = NSFileCoordinator()
         coordinator.coordinate(writingItemAt: targetURL, options: .forReplacing, error: &coordinatorError) { coordinatedURL in
             do {
+                if cancellationToken.isCancelled {
+                    throw CancellationError()
+                }
                 let fm = FileManager.default
                 try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
                 if let linkVals = try? coordinatedURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
@@ -400,9 +426,15 @@ package actor AccountScopedStore {
                 var totalWritten: UInt64 = 0
                 do {
                     for partURL in partURLs {
+                        if cancellationToken.isCancelled {
+                            throw CancellationError()
+                        }
                         let inHandle = try FileHandle(forReadingFrom: partURL)
                         defer { try? inHandle.close() }
                         while let chunk = try inHandle.read(upToCount: 131_072), !chunk.isEmpty {
+                            if cancellationToken.isCancelled {
+                                throw CancellationError()
+                            }
                             try outHandle.write(contentsOf: chunk)
                             totalWritten += UInt64(chunk.count)
                         }
@@ -411,6 +443,10 @@ package actor AccountScopedStore {
                 } catch {
                     try? outHandle.close()
                     throw error
+                }
+
+                if cancellationToken.isCancelled {
+                    throw CancellationError()
                 }
 
                 if let expectedTotalBytes, expectedTotalBytes > 0, totalWritten != expectedTotalBytes {
@@ -432,14 +468,17 @@ package actor AccountScopedStore {
                 writeError = error
             }
         }
-        if let coordinatorError {
-            throw CloudTuneError.exportPermissionRevoked("写入导出目录被拒绝: \(coordinatorError.localizedDescription)")
-        }
         if let writeError {
+            if writeError is CancellationError {
+                throw CancellationError()
+            }
             if let ctError = writeError as? CloudTuneError {
                 throw ctError
             }
             throw CloudTuneError.exportPermissionRevoked("导出文件失败: \(writeError.localizedDescription)")
+        }
+        if let coordinatorError {
+            throw CloudTuneError.exportPermissionRevoked("写入导出目录被拒绝: \(coordinatorError.localizedDescription)")
         }
         return targetURL
     }

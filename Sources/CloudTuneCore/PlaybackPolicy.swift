@@ -169,7 +169,15 @@ package enum RangeHeaderValidator {
               end >= start else {
             return nil
         }
-        let total = slashParts[1] == "*" ? nil : UInt64(slashParts[1])
+        let total: UInt64?
+        if slashParts[1] == "*" {
+            total = nil
+        } else {
+            guard let parsedTotal = UInt64(slashParts[1]), parsedTotal > end else {
+                return nil
+            }
+            total = parsedTotal
+        }
         return ParsedContentRange(start: start, end: end, totalLength: total)
     }
 
@@ -234,7 +242,7 @@ package enum RangeHeaderValidator {
             throw CloudTuneError.protocolError("上游后缀 Range 响应缺少有效总长度")
         }
         let expectedStart = total > suffixLength ? (total - suffixLength) : 0
-        guard cr.end + 1 == total, cr.start == expectedStart else {
+        guard cr.end == total - 1, cr.start == expectedStart else {
             throw CloudTuneError.protocolError(
                 "上游后缀 Content-Range (\(cr.start)-\(cr.end)/\(total)) 与 bytes=-\(suffixLength) 不匹配"
             )

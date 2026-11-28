@@ -16,6 +16,7 @@ public struct IOSRootView: View {
     @State private var isShowingShareSheet = false
     @State private var pendingExportTrack: TrackSummary?
     @State private var pendingExportPane: BrowserPaneState?
+    @State private var pendingResumeTransferId: String?
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var hapticCounter: Int = 0
     @State private var pendingIPadSearchFocus: Bool = false
@@ -71,18 +72,23 @@ public struct IOSRootView: View {
         .sheet(isPresented: $isShowingFolderPicker, onDismiss: {
             pendingExportTrack = nil
             pendingExportPane = nil
+            pendingResumeTransferId = nil
         }) {
             IOSFolderPicker { pickedURL in
                 let trackToExport = pendingExportTrack
                 let paneToExport = pendingExportPane
+                let resumeId = pendingResumeTransferId
                 pendingExportTrack = nil
                 pendingExportPane = nil
+                pendingResumeTransferId = nil
                 Task {
                     guard await viewModel.saveExportDirectoryBookmark(pickedURL) else { return }
                     if let trackToExport {
                         await viewModel.enqueueTrackDownload(trackToExport, explicitDirectoryURL: pickedURL)
                     } else if let paneToExport {
                         await viewModel.enqueueFolderDownload(from: paneToExport, explicitDirectoryURL: pickedURL)
+                    } else if let resumeId {
+                        await viewModel.resumeTransfer(resumeId, explicitDirectoryURL: pickedURL)
                     }
                 }
             }
@@ -1061,6 +1067,10 @@ public struct IOSRootView: View {
                             palette: palette,
                             onPause: { Task { await viewModel.pauseTransfer(item.id) } },
                             onResume: { Task { await viewModel.resumeTransfer(item.id) } },
+                            onPickDirectoryAndResume: {
+                                pendingResumeTransferId = item.id
+                                isShowingFolderPicker = true
+                            },
                             onDelete: { Task { await viewModel.deleteTransfer(item.id) } }
                         )
                         .listRowInsets(EdgeInsets(top: 5, leading: 14, bottom: 5, trailing: 14))

@@ -622,9 +622,12 @@ class TransferEngine(
         id: String,
         stagingRootDir: File,
         manifestsFile: File,
+        updatedExportTreeUri: String? = null,
         exporter: StagedFileExporter
     ) {
-        val m = manifests[id]?.copy(state = "running") ?: return
+        val current = manifests[id] ?: return
+        val nextTreeUri = updatedExportTreeUri?.takeIf { it.isNotBlank() } ?: current.exportTreeUri
+        val m = current.copy(state = "running", exportTreeUri = nextTreeUri)
         val accountKey = manifestAccountKeys[id] ?: m.accountHash
         manifests[id] = m
         statusAccountHashes[id] = m.accountHash
@@ -682,35 +685,40 @@ class TransferEngine(
                         continue
                     }
                     jobs.remove(next.taskId)?.cancel()
-                    var launchedRef: Job? = null
-                    val taskJob = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                        try {
-                            runExportWorkflow(
-                                manifest = activeManifest,
-                                accountKey = next.accountKey,
-                                stagingRootDir = next.stagingRootDir,
-                                manifestsFile = next.manifestsFile,
-                                exporter = next.exporter
-                            )
-                        } finally {
-                            speedCounters.remove(next.taskId)
-                            if (launchedRef != null) {
-                                jobs.remove(next.taskId, launchedRef)
-                            }
+                    val permitReleased = java.util.concurrent.atomic.AtomicBoolean(false)
+                    fun releaseExportPermitOnce() {
+                        if (permitReleased.compareAndSet(false, true)) {
                             exportTaskSemaphore.release()
                             ensureExportPumpRunning()
                         }
                     }
+                    var launchedRef: Job? = null
+                    val taskJob = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                        runExportWorkflow(
+                            manifest = activeManifest,
+                            accountKey = next.accountKey,
+                            stagingRootDir = next.stagingRootDir,
+                            manifestsFile = next.manifestsFile,
+                            exporter = next.exporter
+                        )
+                    }
                     launchedRef = taskJob
+                    taskJob.invokeOnCompletion {
+                        speedCounters.remove(next.taskId)
+                        if (launchedRef != null) {
+                            jobs.remove(next.taskId, launchedRef)
+                        }
+                        releaseExportPermitOnce()
+                    }
                     jobs[next.taskId] = taskJob
                     val stillRunning = manifests[next.taskId]?.state == "running"
                     if (!stillRunning) {
                         jobs.remove(next.taskId, taskJob)
                         taskJob.cancel()
-                        exportTaskSemaphore.release()
+                        releaseExportPermitOnce()
                     } else if (!taskJob.start()) {
                         jobs.remove(next.taskId, taskJob)
-                        exportTaskSemaphore.release()
+                        releaseExportPermitOnce()
                     }
                 }
             } finally {

@@ -1955,10 +1955,17 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
 private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
     val context = LocalContext.current
+    var pendingResumeTaskId by remember { mutableStateOf<String?>(null) }
 
     val safLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val resumeId = pendingResumeTaskId
+        pendingResumeTaskId = null
         if (uri != null) {
-            runtime.onSafTreeSelected(context, uri)
+            runtime.onSafTreeSelected(context, uri) { savedTreeUri ->
+                if (resumeId != null) {
+                    runtime.resumeTransfer(context, resumeId, treeUriString = savedTreeUri)
+                }
+            }
         }
     }
 
@@ -2006,7 +2013,10 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                     }
                     NeutralOutlineButton(
                         text = "选择导出目录",
-                        onClick = { safLauncher.launch(null) }
+                        onClick = {
+                            pendingResumeTaskId = null
+                            safLauncher.launch(null)
+                        }
                     )
                 }
             }
@@ -2125,6 +2135,12 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                                 }
                                 if (item.canResume) {
                                     NeutralOutlineButton("继续") { runtime.resumeTransfer(context, item.id) }
+                                }
+                                if (item.kind == "download" && item.state.startsWith("failed")) {
+                                    NeutralOutlineButton("重选目录") {
+                                        pendingResumeTaskId = item.id
+                                        safLauncher.launch(null)
+                                    }
                                 }
                                 if (item.canDelete) {
                                     NeutralOutlineButton("移除") { runtime.deleteTransfer(item.id) }

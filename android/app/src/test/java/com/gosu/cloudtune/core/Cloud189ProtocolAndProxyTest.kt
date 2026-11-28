@@ -2288,4 +2288,125 @@ class Cloud189ProtocolAndProxyTest {
             tempRoot.deleteRecursively()
         }
     }
+
+    @Test
+    fun verifyAnonymousAccountSwitchBlocksCrossAccountRetryAndExportPermitNeverLeaks(): Unit = runBlocking {
+        // 1) Switching between two anonymous (loginName == null) accounts must NOT retry stale Account 1 request under Account 2
+        val firstListEntered = CompletableDeferred<Unit>()
+        val allowFirstListReturn = CompletableDeferred<Unit>()
+        val usedSessionKeys = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+        val client = Cloud189Client(transport = object : CloudHttpTransport {
+            override suspend fun send(
+                url: String,
+                method: String,
+                headers: Map<String, String>,
+                formBody: List<Pair<String, String>>?
+            ): CloudHttpResponse {
+                return when {
+                    url.contains("paras=anon1") -> CloudHttpResponse(
+                        statusCode = 200,
+                        headers = emptyMap(),
+                        body = """{"res_code":0,"accessToken":"at_anon1","refreshToken":"rt_anon1","sessionKey":"sk_anon1","sessionSecret":"ss_anon1"}""".toByteArray()
+                    )
+                    url.contains("paras=anon2") -> CloudHttpResponse(
+                        statusCode = 200,
+                        headers = emptyMap(),
+                        body = """{"res_code":0,"accessToken":"at_anon2","refreshToken":"rt_anon2","sessionKey":"sk_anon2","sessionSecret":"ss_anon2"}""".toByteArray()
+                    )
+                    url.contains("listFiles.action") -> {
+                        val sk = headers["SessionKey"].orEmpty()
+                        usedSessionKeys.add(sk)
+                        if (sk == "sk_anon1") {
+                            firstListEntered.complete(Unit)
+                            allowFirstListReturn.await()
+                            CloudHttpResponse(200, emptyMap(), """{"res_code":-1,"errorCode":"InvalidSessionKey"}""".toByteArray())
+                        } else {
+                            CloudHttpResponse(200, emptyMap(), """{"res_code":0,"fileListAO":{"folderList":[],"fileList":[]}}""".toByteArray())
+                        }
+                    }
+                    else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray())
+                }
+            }
+
+            override fun importCookieHeader(domainUrl: String, cookieHeader: String?) = Unit
+            override fun clearCookies() = Unit
+        })
+
+        val s1 = client.exchangeRedirectForSession("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=anon1")
+        assertNull(s1.activeSession.loginName)
+
+        val staleRequest = async(Dispatchers.IO) {
+            runCatching { client.listRemoteFolder(folderId = null) }
+        }
+        firstListEntered.await()
+
+        // Switch to a DIFFERENT anonymous account (also loginName == null) while staleRequest is in flight
+        client.clearSessionImmediate()
+        val s2 = client.exchangeRedirectForSession("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=anon2")
+        assertNull(s2.activeSession.loginName)
+
+        allowFirstListReturn.complete(Unit)
+        val staleOutcome = staleRequest.await()
+        assertTrue("Stale anonymous request must fail rather than retrying under Account 2", staleOutcome.isFailure)
+        assertEquals("Account 2 credentials must never be used by Account 1 retry", listOf("sk_anon1"), usedSessionKeys.toList())
+
+        // 2) Rapid enqueue + pause burst across 12 export tasks must never leak exportTaskSemaphore permits, and updatedExportTreeUri updates manifest
+        val tempRoot = Files.createTempDirectory("cloudtune-permit-test").toFile()
+        try {
+            val payload = ByteArray(1024) { 0x33 }
+            val engine = TransferEngine(
+                limiter = GlobalTransferLimiter(8),
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(206, mapOf("content-range" to "bytes 0-0/1024", "content-length" to "1"), ByteArrayInputStream(payload, 0, 1))
+                    } else {
+                        OpenedUpstreamStream(200, mapOf("content-length" to "1024"), ByteArrayInputStream(payload))
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/permit.flac" }
+            )
+            val store = AccountStore(tempRoot)
+            val acct = "permit@example.invalid"
+            val paths = store.paths(acct)
+            val batch = (1..12).map { idx ->
+                ExportDownloadItem(TrackSummary("p-$idx", "Permit$idx.flac", "M", 1024L), "Permit$idx.flac")
+            }
+            val ids = engine.enqueueExportDownloads(
+                accountId = acct,
+                items = batch,
+                parallelThreads = 1,
+                stagingRootDir = paths.stagingDir,
+                manifestsFile = paths.transfersFile,
+                exportTreeUri = "content://old.invalid/tree/1"
+            ) { staged, _, _, _ ->
+                Thread.sleep(25)
+                staged.absolutePath
+            }
+            // Immediately pause the first 8 tasks to exercise cancellation race around LAZY start()
+            ids.take(8).forEach { id -> engine.pauseTransfer(id, paths.transfersFile) }
+
+            // Resume all paused tasks with a newly selected SAF tree URI — all 12 must reach completed (proving 0 leaked permits!)
+            val observedTreeUris = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+            ids.take(8).forEach { id ->
+                if (engine.snapshot().items.firstOrNull { it.id == id }?.state != "completed") {
+                    engine.resumeTransfer(
+                        id = id,
+                        stagingRootDir = paths.stagingDir,
+                        manifestsFile = paths.transfersFile,
+                        updatedExportTreeUri = "content://new.invalid/tree/2"
+                    ) { staged, _, _, treeUri ->
+                        if (treeUri != null) observedTreeUris.add(treeUri)
+                        staged.absolutePath
+                    }
+                }
+            }
+            awaitUntil {
+                engine.snapshot().items.count { it.state == "completed" } == 12
+            }
+            assertTrue(observedTreeUris.contains("content://new.invalid/tree/2"))
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
 }

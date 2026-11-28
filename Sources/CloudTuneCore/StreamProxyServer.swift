@@ -126,7 +126,6 @@ private final class UpstreamTaskContext: @unchecked Sendable {
     func handleData(_ data: Data) {
         guard !data.isEmpty else { return }
         var waiterToResume: CheckedContinuation<Data?, Error>?
-        var taskToSuspend: URLSessionDataTask?
 
         lock.withLock {
             guard !isCancelled, !isFinished else { return }
@@ -139,14 +138,12 @@ private final class UpstreamTaskContext: @unchecked Sendable {
             queuedBytes += data.count
             if !isSuspended && queuedBytes >= highWaterMarkBytes {
                 isSuspended = true
-                taskToSuspend = task
+                task?.suspend()
             }
         }
 
         if let waiterToResume {
             waiterToResume.resume(returning: data)
-        } else if let taskToSuspend {
-            taskToSuspend.suspend()
         }
     }
 
@@ -189,7 +186,6 @@ private final class UpstreamTaskContext: @unchecked Sendable {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data?, Error>) in
                 var immediateResult: Result<Data?, Error>?
-                var taskToResume: URLSessionDataTask?
 
                 lock.withLock {
                     if isCancelled {
@@ -210,7 +206,7 @@ private final class UpstreamTaskContext: @unchecked Sendable {
                         }
                         if isSuspended && !isFinished && queuedBytes <= lowWaterMarkBytes {
                             isSuspended = false
-                            taskToResume = task
+                            task?.resume()
                         }
                         immediateResult = .success(chunk)
                         return
@@ -225,14 +221,11 @@ private final class UpstreamTaskContext: @unchecked Sendable {
                     }
                     if isSuspended {
                         isSuspended = false
-                        taskToResume = task
+                        task?.resume()
                     }
                     chunkContinuation = cont
                 }
 
-                if let taskToResume {
-                    taskToResume.resume()
-                }
                 if let immediateResult {
                     cont.resume(with: immediateResult)
                 }
@@ -243,8 +236,6 @@ private final class UpstreamTaskContext: @unchecked Sendable {
     }
 
     func cancel() {
-        var taskToCancel: URLSessionDataTask?
-        var shouldResumeBeforeCancel = false
         var respCont: CheckedContinuation<(Int, [String: String]), Error>?
         var chunkCont: CheckedContinuation<Data?, Error>?
 
@@ -256,13 +247,13 @@ private final class UpstreamTaskContext: @unchecked Sendable {
             queuedBytes = 0
             if !isFinished {
                 isFinished = true
-                taskToCancel = task
                 if hasStarted && isSuspended {
                     isSuspended = false
-                    shouldResumeBeforeCancel = true
+                    task?.resume()
                 } else {
                     isSuspended = false
                 }
+                task?.cancel()
             }
             respCont = responseContinuation
             responseContinuation = nil
@@ -270,10 +261,6 @@ private final class UpstreamTaskContext: @unchecked Sendable {
             chunkContinuation = nil
         }
 
-        if shouldResumeBeforeCancel {
-            taskToCancel?.resume()
-        }
-        taskToCancel?.cancel()
         respCont?.resume(throwing: CancellationError())
         chunkCont?.resume(throwing: CancellationError())
     }
@@ -308,7 +295,12 @@ private final class UpstreamSessionMultiplexer: NSObject, URLSessionDataDelegate
 
     private let lock = NSLock()
     private var contextsByTaskID: [Int: UpstreamTaskContext] = [:]
-    private lazy var session: URLSession = {
+    private var _session: URLSession?
+
+    private func ensureSessionLocked() -> URLSession {
+        if let existing = _session {
+            return existing
+        }
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -320,8 +312,10 @@ private final class UpstreamSessionMultiplexer: NSObject, URLSessionDataDelegate
         delegateQueue.name = "com.gosu.cloudtune.upstream.multiplexer"
         delegateQueue.qualityOfService = .userInitiated
         delegateQueue.maxConcurrentOperationCount = 4
-        return URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
-    }()
+        let created = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
+        _session = created
+        return created
+    }
 
     var activeTaskCount: Int {
         lock.withLock { contextsByTaskID.count }
@@ -347,15 +341,17 @@ private final class UpstreamSessionMultiplexer: NSObject, URLSessionDataDelegate
             req.setValue(rangeHeader, forHTTPHeaderField: "Range")
         }
 
-        let dataTask = session.dataTask(with: req)
-        let taskID = dataTask.taskIdentifier
-        let context = UpstreamTaskContext(
-            task: dataTask,
-            highWaterMarkBytes: highWaterMarkBytes,
-            lowWaterMarkBytes: lowWaterMarkBytes
-        )
-        lock.withLock {
-            contextsByTaskID[taskID] = context
+        let (taskID, context) = lock.withLock { () -> (Int, UpstreamTaskContext) in
+            let activeSession = ensureSessionLocked()
+            let dataTask = activeSession.dataTask(with: req)
+            let id = dataTask.taskIdentifier
+            let ctx = UpstreamTaskContext(
+                task: dataTask,
+                highWaterMarkBytes: highWaterMarkBytes,
+                lowWaterMarkBytes: lowWaterMarkBytes
+            )
+            contextsByTaskID[id] = ctx
+            return (id, ctx)
         }
 
         let (statusCode, headers): (Int, [String: String])

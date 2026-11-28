@@ -2230,6 +2230,154 @@ struct CloudTuneCoreTests {
         #expect(observedRun2Ranges.contains("bytes=990000-1199999"))
     }
 
+    @Test("Codex review hardening: UInt64.max Content-Range guard, concurrent pooled streams, manifest write rollback, export cancellation & directory re-pick resume")
+    func verifyReviewHardeningGuards() async throws {
+        // 1) UInt64.max Content-Range overflow protection
+        #expect(RangeHeaderValidator.parseContentRange("bytes 0-\(UInt64.max)/100") == nil)
+        #expect(RangeHeaderValidator.parseContentRange("bytes 0-100/100") == nil)
+        #expect(RangeHeaderValidator.parseContentRange("bytes \(UInt64.max)-\(UInt64.max)/\(UInt64.max)") == nil)
+        #expect(throws: CloudTuneError.self) {
+            _ = try RangeHeaderValidator.validateSuffixResponse(
+                suffixLength: 16,
+                statusCode: 206,
+                contentRangeHeader: "bytes 0-\(UInt64.max)/\(UInt64.max)"
+            )
+        }
+        let validSuffix = try RangeHeaderValidator.validateSuffixResponse(
+            suffixLength: 16,
+            statusCode: 206,
+            contentRangeHeader: "bytes 84-99/100"
+        )
+        #expect(validSuffix.start == 84 && validSuffix.end == 99 && validSuffix.totalLength == 100)
+
+        // 2) Concurrent URLSessionUpstreamStreamFetcher reads of two distinct loopback streams
+        let payloadA = Data((0..<65_536).map { UInt8(($0 &* 7) & 0xFF) })
+        let payloadB = Data((0..<65_536).map { UInt8((($0 &* 13) ^ 0x5A) & 0xFF) })
+        let serverA = try OneShotLoopbackServer { _ in
+            var resp = Data("HTTP/1.1 200 OK\r\nContent-Length: \(payloadA.count)\r\n\r\n".utf8)
+            resp.append(payloadA)
+            return resp
+        }
+        let serverB = try OneShotLoopbackServer { _ in
+            var resp = Data("HTTP/1.1 200 OK\r\nContent-Length: \(payloadB.count)\r\n\r\n".utf8)
+            resp.append(payloadB)
+            return resp
+        }
+        defer {
+            serverA.close()
+            serverB.close()
+        }
+
+        let urlA = URL(string: "http://127.0.0.1:\(serverA.port)/a.bin")!
+        let urlB = URL(string: "http://127.0.0.1:\(serverB.port)/b.bin")!
+        let fetcher = URLSessionUpstreamStreamFetcher(highWaterMarkBytes: 16 * 1024, lowWaterMarkBytes: 4 * 1024)
+        async let readA: Data = {
+            let opened = try await fetcher.openStream(url: urlA, rangeHeader: nil)
+            var out = Data()
+            for try await chunk in opened.chunks { out.append(chunk) }
+            return out
+        }()
+        async let readB: Data = {
+            let opened = try await fetcher.openStream(url: urlB, rangeHeader: nil)
+            var out = Data()
+            for try await chunk in opened.chunks { out.append(chunk) }
+            return out
+        }()
+        let (gotA, gotB) = try await (readA, readB)
+        #expect(gotA == payloadA)
+        #expect(gotB == payloadB)
+
+        // 3) enqueueExportDownloads rolls back memory state if transfers.json cannot be persisted
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-rev-\(UUID().uuidString)")
+        let exportDir1 = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-exp1-\(UUID().uuidString)")
+        let exportDir2 = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-exp2-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir1)
+            try? FileManager.default.removeItem(at: exportDir2)
+        }
+        try FileManager.default.createDirectory(at: exportDir1, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: exportDir2, withIntermediateDirectories: true)
+
+        let store = try AccountScopedStore(rootDirectory: root)
+        let badAccount = "unwritable_manifest@example.invalid"
+        let badPaths = try await store.paths(for: badAccount)
+        try FileManager.default.createDirectory(at: badPaths.transfersURL, withIntermediateDirectories: true)
+
+        let engine = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 4),
+            fetcher: MockUpstreamFetcher { _, _ in
+                (200, ["content-length": "32"], AsyncThrowingStream { $0.yield(Data(repeating: 0x22, count: 32)); $0.finish() })
+            },
+            urlResolver: { _ in URL(string: "https://media.example.invalid/t.flac")! }
+        )
+        await #expect(throws: Error.self) {
+            _ = try await engine.enqueueExportDownload(
+                accountId: badAccount,
+                track: TrackSummary(id: "t-fail", name: "Fail.flac", folderPath: "M", sizeBytes: 32),
+                relativeExportSubpath: "Fail.flac",
+                parallelThreads: 1,
+                explicitDirectoryURL: exportDir1,
+                accountStore: store
+            )
+        }
+        #expect(await engine.snapshot().items.isEmpty)
+
+        // 4) Pre-cancelled exportStagedParts never overwrites destination; deleted pinned folder recovers via explicitDirectoryURL on resumeTransfer
+        let goodAccount = "repick_export@example.invalid"
+        let preExisting = exportDir2.appendingPathComponent("Keep.flac")
+        let preciousBytes = Data("precious-existing-content".utf8)
+        try preciousBytes.write(to: preExisting)
+        let dummyPart = root.appendingPathComponent("dummy.part")
+        try Data(repeating: 0x7F, count: 512 * 1024).write(to: dummyPart)
+
+        let cancelledTask = Task {
+            try await store.exportStagedParts(
+                partURLs: [dummyPart],
+                expectedTotalBytes: 512 * 1024,
+                relativeSubpath: "Keep.flac",
+                explicitDirectoryURL: exportDir2,
+                for: goodAccount
+            )
+        }
+        cancelledTask.cancel()
+        await #expect(throws: CancellationError.self) {
+            _ = try await cancelledTask.value
+        }
+        #expect(try Data(contentsOf: preExisting) == preciousBytes)
+
+        // Enqueue with exportDir1 bookmark, delete exportDir1 before export, then resume with exportDir2
+        _ = try await store.saveExportDirectoryBookmarkAndSettings(exportDir1, for: goodAccount)
+        try FileManager.default.removeItem(at: exportDir1)
+        // Create a file at exportDir1's path so createDirectory fails deterministically during export
+        try Data("blocker".utf8).write(to: exportDir1)
+
+        let repickTaskId = try await engine.enqueueExportDownload(
+            accountId: goodAccount,
+            track: TrackSummary(id: "t-repick", name: "Recovered.flac", folderPath: "M", sizeBytes: 32),
+            relativeExportSubpath: "Recovered.flac",
+            parallelThreads: 1,
+            explicitDirectoryURL: nil,
+            accountStore: store
+        )
+        let failDeadline = ContinuousClock.now + .seconds(5)
+        while await engine.snapshot().hasActiveItems && ContinuousClock.now < failDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let failedItem = try #require(await engine.snapshot().items.first { $0.id == repickTaskId })
+        #expect(failedItem.state.hasPrefix("failed"))
+        #expect(failedItem.canResume == true)
+
+        await engine.resumeTransfer(id: repickTaskId, explicitDirectoryURL: exportDir2, accountStore: store)
+        let okDeadline = ContinuousClock.now + .seconds(5)
+        while await engine.snapshot().hasActiveItems && ContinuousClock.now < okDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let recoveredItem = try #require(await engine.snapshot().items.first { $0.id == repickTaskId })
+        #expect(recoveredItem.state == "completed")
+        #expect(try Data(contentsOf: exportDir2.appendingPathComponent("Recovered.flac")) == Data(repeating: 0x22, count: 32))
+    }
+
     private static func makeSyntheticPNGData(width: Int, height: Int, includeAlpha: Bool) throws -> Data {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let bitmapInfo: UInt32 = includeAlpha

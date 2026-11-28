@@ -310,6 +310,9 @@ class CloudTuneSnapshotTest {
         }
 
         override fun renameDocument(documentId: String, displayName: String): String {
+            if (failRenames) {
+                throw UnsupportedOperationException("Simulated provider without rename support")
+            }
             val source = resolveFile(documentId)
             if (!source.exists()) throw FileNotFoundException("Missing document: $documentId")
             val dest = File(source.parentFile, displayName)
@@ -371,6 +374,7 @@ class CloudTuneSnapshotTest {
 
         companion object {
             const val AUTHORITY = "com.gosu.cloudtune.test.saf"
+            @Volatile var failRenames: Boolean = false
             private val DEFAULT_COLUMNS = arrayOf(
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -486,6 +490,36 @@ class CloudTuneSnapshotTest {
             }
             assertArrayEquals("Pre-existing SAF file must remain 100% intact on mid-stream failure", oldBytes, existingFile.readBytes())
             assertEquals("Sibling temp document must be deleted on failure", listOf("Existing.flac"), albumDir.list().orEmpty().sorted())
+
+            // 2b) Consecutive renameDocument failure + fallback backup/overwrite failure MUST still preserve existing target file intact
+            MockSafDocumentsProvider.failRenames = true
+            try {
+                assertThrows(CloudTuneException::class.java) {
+                    SafExporter.exportPartsToSafTree(
+                        context = activity,
+                        treeUriString = treeUriStr,
+                        partFiles = listOf(part0, part1),
+                        expectedTotalBytes = newBytes.size.toLong(),
+                        relativeSubpath = "CD 1/Existing.flac",
+                        mimeType = "audio/flac",
+                        openOutputStreamOverride = { docUri ->
+                            val backing = MockSafDocumentsProvider.resolveFile(DocumentsContract.getDocumentId(docUri))
+                            if (!backing.name.startsWith(".cloudtune-tmp-")) {
+                                throw IOException("simulated fallback/backup stream failure after temp staged")
+                            }
+                            FileOutputStream(backing)
+                        }
+                    )
+                }
+                assertArrayEquals(
+                    "Pre-existing SAF file must survive when both renameDocument and fallback writes fail",
+                    oldBytes,
+                    existingFile.readBytes()
+                )
+                assertEquals(listOf("Existing.flac"), albumDir.list().orEmpty().sorted())
+            } finally {
+                MockSafDocumentsProvider.failRenames = false
+            }
 
             // 3) Valid multi-part replacement writes via sibling temp document, verifies byte count, and replaces cleanly
             SafExporter.exportPartsToSafTree(

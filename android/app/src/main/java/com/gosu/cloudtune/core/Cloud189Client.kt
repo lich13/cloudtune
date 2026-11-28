@@ -245,6 +245,7 @@ class Cloud189Client(
     private val sessionLock = Any()
     @Volatile var sessionEpoch: Int = 0
         private set
+    @Volatile private var authCycleId: Long = 0L
     @Volatile var activeSession: ActiveCloudSession? = null
         private set
     @Volatile var persistedCredential: PersistedRefreshCredential? = null
@@ -260,6 +261,7 @@ class Cloud189Client(
                 return
             }
             sessionEpoch += 1
+            authCycleId += 1L
             activeSession = null
             persistedCredential = null
             pendingQr = null
@@ -320,6 +322,7 @@ class Cloud189Client(
                 throw CloudTuneException("登录会话已变更，请重试")
             }
             sessionEpoch += 1
+            authCycleId += 1L
             activeSession = parsed.activeSession
             persistedCredential = parsed.persistedCredential
             sessionEpoch
@@ -621,6 +624,7 @@ class Cloud189Client(
                 throw CloudTuneException("登录会话已变更，请重试")
             }
             sessionEpoch += 1
+            authCycleId += 1L
             activeSession = parsed.activeSession
             persistedCredential = parsed.persistedCredential
             sessionEpoch
@@ -665,8 +669,9 @@ class Cloud189Client(
 
     private suspend fun signedGetJson(path: String, query: List<Pair<String, String>>): JSONObject {
         for (attempt in 0 until 2) {
-            val (session, requestEpoch) = synchronized(sessionLock) {
-                (activeSession ?: throw CloudTuneException("请先登录天翼云盘")) to sessionEpoch
+            val (session, requestEpoch, requestAuthCycle) = synchronized(sessionLock) {
+                val active = activeSession ?: throw CloudTuneException("请先登录天翼云盘")
+                Triple(active, sessionEpoch, authCycleId)
             }
             val fullQuery = buildQuery(clientSuffix() + query)
             val fullUrl = "${Cloud189Constants.API_URL}$path?$fullQuery"
@@ -695,11 +700,20 @@ class Cloud189Client(
                 if (attempt == 0 && session.accessToken.isNotEmpty()) {
                     var shouldRetry = false
                     mutex.withLock {
-                        val (currentEpoch, currentActive, fallbackCred) = synchronized(sessionLock) {
-                            Triple(sessionEpoch, activeSession, persistedCredential)
+                        var currentEpoch = 0
+                        var currentAuthCycle = 0L
+                        var currentActive: ActiveCloudSession? = null
+                        var fallbackCred: PersistedRefreshCredential? = null
+                        synchronized(sessionLock) {
+                            currentEpoch = sessionEpoch
+                            currentAuthCycle = authCycleId
+                            currentActive = activeSession
+                            fallbackCred = persistedCredential
                         }
-                        if (currentEpoch != requestEpoch) {
-                            shouldRetry = currentActive != null && currentActive.loginName == session.loginName
+                        if (currentAuthCycle != requestAuthCycle || currentActive == null) {
+                            shouldRetry = false
+                        } else if (currentEpoch != requestEpoch) {
+                            shouldRetry = true
                         } else {
                             val refreshed = exchangeAccessTokenUnlocked(
                                 accessToken = session.accessToken,
@@ -708,7 +722,7 @@ class Cloud189Client(
                                 fallbackAccountKey = fallbackCred?.accountKey
                             )
                             synchronized(sessionLock) {
-                                if (sessionEpoch != requestEpoch) {
+                                if (sessionEpoch != requestEpoch || authCycleId != requestAuthCycle) {
                                     throw CloudTuneException("天翼云盘会话已失效，请重新登录", isSessionExpired = true)
                                 }
                                 sessionEpoch += 1

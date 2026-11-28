@@ -2466,8 +2466,8 @@ public final class CloudTuneViewModel {
         transferSnapshot = await transferEngine.snapshot()
     }
 
-    package func resumeTransfer(_ id: String) async {
-        await transferEngine.resumeTransfer(id: id, accountStore: accountStore)
+    package func resumeTransfer(_ id: String, explicitDirectoryURL: URL? = nil) async {
+        await transferEngine.resumeTransfer(id: id, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
         transferSnapshot = await transferEngine.snapshot()
     }
 

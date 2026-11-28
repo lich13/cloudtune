@@ -2438,7 +2438,13 @@ class CloudTuneAppRuntime(
         scope.launch {
             val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
-                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile, safExporter)
+                transferEngine.resumeTransfer(
+                    id = id,
+                    stagingRootDir = paths.stagingDir,
+                    manifestsFile = paths.transfersFile,
+                    updatedExportTreeUri = explicitTreeUri,
+                    exporter = safExporter
+                )
                 transferEngine.snapshot()
             }
             if (isAuthenticated && activeAccountKey == acct) {

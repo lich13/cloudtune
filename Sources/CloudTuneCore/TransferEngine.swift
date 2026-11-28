@@ -135,6 +135,7 @@ package actor TransferEngine {
     private var manifests: [String: StagedDownloadManifest] = [:]
     private var manifestAccountKeys: [String: String] = [:]
     private var runningTasks: [String: Task<Void, Error>] = [:]
+    private var runningTaskTokens: [String: UUID] = [:]
     private var inFlightCacheDownloads: [String: InFlightCacheDownload] = [:]
     private var speedSamples: [String: TaskSpeedSample] = [:]
     private var aggregateMonotonicBytes: UInt64 = 0
@@ -390,6 +391,7 @@ package actor TransferEngine {
         for (id, manifest) in manifests where manifest.accountHash == targetHash {
             runningTasks[id]?.cancel()
             runningTasks.removeValue(forKey: id)
+            runningTaskTokens.removeValue(forKey: id)
             clearSpeedTracking(for: id)
             statuses.removeValue(forKey: id)
             statusAccountHashes.removeValue(forKey: id)
@@ -406,6 +408,7 @@ package actor TransferEngine {
         for (id, ownerHash) in statusAccountHashes where ownerHash == targetHash {
             runningTasks[id]?.cancel()
             runningTasks.removeValue(forKey: id)
+            runningTaskTokens.removeValue(forKey: id)
             clearSpeedTracking(for: id)
             statuses.removeValue(forKey: id)
             statusAccountHashes.removeValue(forKey: id)
@@ -666,7 +669,18 @@ package actor TransferEngine {
             taskIds.append(taskId)
         }
 
-        await persistManifests(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
+        do {
+            try await persistManifestsChecked(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
+        } catch {
+            for taskId in taskIds {
+                clearSpeedTracking(for: taskId)
+                manifests.removeValue(forKey: taskId)
+                manifestAccountKeys.removeValue(forKey: taskId)
+                statusAccountHashes.removeValue(forKey: taskId)
+                statuses.removeValue(forKey: taskId)
+            }
+            throw error
+        }
         notifyActivityChanged(force: true)
         for manifest in createdManifests {
             spawnExportTask(
@@ -702,6 +716,7 @@ package actor TransferEngine {
     package func pauseTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
+        runningTaskTokens.removeValue(forKey: id)
         clearSpeedTracking(for: id)
         if var m = manifests[id] {
             m.state = "paused"
@@ -747,6 +762,7 @@ package actor TransferEngine {
     package func deleteTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
+        runningTaskTokens.removeValue(forKey: id)
         clearSpeedTracking(for: id)
         let manifest = manifests.removeValue(forKey: id)
         let accountKey = manifestAccountKeys.removeValue(forKey: id)
@@ -769,9 +785,12 @@ package actor TransferEngine {
     ) {
         let id = manifest.taskId
         runningTasks[id]?.cancel()
+        let runToken = UUID()
+        runningTaskTokens[id] = runToken
         let task = Task<Void, Error> {
             await self.runExportWorkflow(
                 manifest: manifest,
+                runToken: runToken,
                 accountKey: accountKey,
                 explicitDirectoryURL: explicitDirectoryURL,
                 accountStore: accountStore
@@ -785,14 +804,20 @@ package actor TransferEngine {
         runningTasks[id] = task
     }
 
+    private func isActiveExportRun(id: String, runToken: UUID) -> Bool {
+        runningTaskTokens[id] == runToken && manifests[id]?.state == "running"
+    }
+
     private func runExportWorkflow(
         manifest: StagedDownloadManifest,
+        runToken: UUID,
         accountKey: String,
         explicitDirectoryURL: URL?,
         accountStore: AccountScopedStore
     ) async {
         let id = manifest.taskId
         do {
+            guard isActiveExportRun(id: id, runToken: runToken) else { return }
             let paths = try await accountStore.paths(for: accountKey)
             let safeKey = Cloud189Protocol.sanitizeFileName(id)
             let partsDir = paths.stagingDir.appendingPathComponent("\(safeKey).parts", isDirectory: true)
@@ -803,8 +828,11 @@ package actor TransferEngine {
             let totalSize = max(probe.totalSize, manifest.totalSize)
             let effectiveParts = (probe.supportsRange && totalSize >= 524_288) ? manifest.partCount : 1
 
-            guard manifests[id] != nil else { return }
-            var updatedManifest = manifest
+            guard isActiveExportRun(id: id, runToken: runToken) else {
+                clearSpeedTracking(for: id)
+                return
+            }
+            var updatedManifest = manifests[id] ?? manifest
             updatedManifest.totalSize = totalSize
             updatedManifest.partCount = effectiveParts
             manifests[id] = updatedManifest
@@ -826,6 +854,10 @@ package actor TransferEngine {
                 partsDir: partsDir
             )
             try Task.checkCancellation()
+            guard isActiveExportRun(id: id, runToken: runToken) else {
+                clearSpeedTracking(for: id)
+                return
+            }
 
             let orderedPartURLs = (0..<max(1, effectiveParts)).map { idx in
                 partsDir.appendingPathComponent(String(format: "%02d.part", idx))
@@ -838,9 +870,14 @@ package actor TransferEngine {
                 manifestBookmarkData: updatedManifest.exportBookmarkData,
                 for: accountKey
             )
+            guard isActiveExportRun(id: id, runToken: runToken) else {
+                clearSpeedTracking(for: id)
+                return
+            }
             try? fm.removeItem(at: partsDir)
 
-            guard manifests[id] != nil else { return }
+            runningTasks.removeValue(forKey: id)
+            runningTaskTokens.removeValue(forKey: id)
             clearSpeedTracking(for: id)
             manifests.removeValue(forKey: id)
             manifestAccountKeys.removeValue(forKey: id)
@@ -861,9 +898,14 @@ package actor TransferEngine {
             await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
             notifyActivityChanged(force: true)
         } catch is CancellationError {
-            clearSpeedTracking(for: id)
+            if runningTaskTokens[id] == runToken {
+                clearSpeedTracking(for: id)
+            }
             return
         } catch {
+            guard isActiveExportRun(id: id, runToken: runToken) else { return }
+            runningTasks.removeValue(forKey: id)
+            runningTaskTokens.removeValue(forKey: id)
             clearSpeedTracking(for: id)
             if var m = manifests[id] {
                 m.state = "paused"
@@ -1125,11 +1167,18 @@ package actor TransferEngine {
         return manifest.totalSize > 0 ? min(sum, manifest.totalSize) : sum
     }
 
-    private func persistManifests(forAccountKey accountKey: String, accountHash: String, accountStore: AccountScopedStore) async {
-        guard let paths = try? await accountStore.paths(for: accountKey) else { return }
+    private func persistManifestsChecked(
+        forAccountKey accountKey: String,
+        accountHash: String,
+        accountStore: AccountScopedStore
+    ) async throws {
+        let paths = try await accountStore.paths(for: accountKey)
         let items = manifests.values.filter { $0.accountHash == accountHash }.sorted { $0.taskId < $1.taskId }
-        if let data = try? JSONEncoder().encode(items) {
-            try? data.write(to: paths.transfersURL, options: .atomic)
-        }
+        let data = try JSONEncoder().encode(items)
+        try data.write(to: paths.transfersURL, options: .atomic)
+    }
+
+    private func persistManifests(forAccountKey accountKey: String, accountHash: String, accountStore: AccountScopedStore) async {
+        try? await persistManifestsChecked(forAccountKey: accountKey, accountHash: accountHash, accountStore: accountStore)
     }
 }

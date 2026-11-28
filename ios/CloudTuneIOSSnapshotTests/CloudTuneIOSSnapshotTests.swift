@@ -3,6 +3,7 @@ import CloudTuneUI
 import Foundation
 import XCTest
 
+#if DEBUG
 final class CloudTuneIOSSnapshotTests: XCTestCase {
     @MainActor
     func testRenderIPhoneAndIPadLightDarkSnapshots() throws {
@@ -41,3 +42,4 @@ final class CloudTuneIOSSnapshotTests: XCTestCase {
         }
     }
 }
+#endif

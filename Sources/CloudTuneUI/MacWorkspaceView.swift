@@ -934,6 +934,14 @@ package struct MacWorkspaceView: View {
                                     palette: palette,
                                     onPause: { Task { await viewModel.pauseTransfer(item.id) } },
                                     onResume: { Task { await viewModel.resumeTransfer(item.id) } },
+                                    onPickDirectoryAndResume: {
+                                        Task {
+                                            if let dir = await pickDirectoryViaOpenPanel(),
+                                               await viewModel.saveExportDirectoryBookmark(dir) {
+                                                await viewModel.resumeTransfer(item.id, explicitDirectoryURL: dir)
+                                            }
+                                        }
+                                    },
                                     onDelete: { Task { await viewModel.deleteTransfer(item.id) } }
                                 )
                             }

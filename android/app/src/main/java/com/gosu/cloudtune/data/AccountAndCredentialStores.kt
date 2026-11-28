@@ -21,6 +21,7 @@ import com.gosu.cloudtune.core.PlaybackMode
 import com.gosu.cloudtune.core.TrackSummary
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -547,47 +548,158 @@ object SafExporter {
             }
 
             // Only AFTER temp sibling is 100% written & verified, replace any pre-existing target document
+            // WITHOUT deleting the existing document before its replacement (or a verified backup) is in place.
             val currentExisting = findChildByName(resolver, treeUri, parentDirDocId, targetName)
-            if (currentExisting != null && currentExisting.documentId != tempDocId) {
-                if (currentExisting.isDirectory) {
-                    throw CloudTuneException("导出目标路径已存在同名文件夹：$targetName")
-                }
-                val existingDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentExisting.documentId)
-                val deleted = runCatching { DocumentsContract.deleteDocument(resolver, existingDocUri) }.getOrDefault(false)
-                if (!deleted) {
-                    throw CloudTuneException("无法替换已有导出文件 $targetName")
-                }
+            if (currentExisting == null || currentExisting.documentId == tempDocId) {
+                return promoteTempToVacantTarget(
+                    resolver = resolver,
+                    treeUri = treeUri,
+                    parentDirUri = parentDirUri,
+                    tempDocId = tempDocId,
+                    tempDocUri = tempDocUri,
+                    targetName = targetName,
+                    mimeType = mimeType,
+                    partFiles = partFiles,
+                    expectedBytes = expectedBytes,
+                    openOutputStream = openOutputStream,
+                    onTempPromoted = { tempPromoted = true }
+                )
             }
 
-            val renamedUri = runCatching {
-                DocumentsContract.renameDocument(resolver, tempDocUri, targetName)
+            if (currentExisting.isDirectory) {
+                throw CloudTuneException("导出目标路径已存在同名文件夹：$targetName")
+            }
+            val existingDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentExisting.documentId)
+            val backupName = ".cloudtune-bak-${UUID.randomUUID()}"
+            val backupRenamedUri = runCatching {
+                DocumentsContract.renameDocument(resolver, existingDocUri, backupName)
             }.getOrNull()
-            if (renamedUri != null) {
-                tempPromoted = true
-                val finalDocId = runCatching { DocumentsContract.getDocumentId(renamedUri) }.getOrDefault(tempDocId)
-                return DocumentsContract.buildDocumentUriUsingTree(treeUri, finalDocId).toString()
+
+            if (backupRenamedUri != null) {
+                val backupDocId = runCatching { DocumentsContract.getDocumentId(backupRenamedUri) }.getOrNull()
+                val backupDocUri = if (backupDocId != null) {
+                    DocumentsContract.buildDocumentUriUsingTree(treeUri, backupDocId)
+                } else {
+                    backupRenamedUri
+                }
+                try {
+                    val promotedUri = promoteTempToVacantTarget(
+                        resolver = resolver,
+                        treeUri = treeUri,
+                        parentDirUri = parentDirUri,
+                        tempDocId = tempDocId,
+                        tempDocUri = tempDocUri,
+                        targetName = targetName,
+                        mimeType = mimeType,
+                        partFiles = partFiles,
+                        expectedBytes = expectedBytes,
+                        openOutputStream = openOutputStream,
+                        onTempPromoted = { tempPromoted = true }
+                    )
+                    runCatching { DocumentsContract.deleteDocument(resolver, backupDocUri) }
+                    return promotedUri
+                } catch (e: Exception) {
+                    runCatching { DocumentsContract.renameDocument(resolver, backupDocUri, targetName) }
+                    throw e
+                }
             }
 
-            val rawFallbackUri = runCatching {
-                DocumentsContract.createDocument(resolver, parentDirUri, mimeType, targetName)
-            }.getOrNull() ?: throw CloudTuneException("无法创建导出文件 $targetName")
-            val fallbackDocUri = DocumentsContract.buildDocumentUriUsingTree(
+            // Provider does not support renameDocument: stage a verified backup copy BEFORE overwriting existingDocUri in-place
+            val rawBackupCopyUri = runCatching {
+                DocumentsContract.createDocument(resolver, parentDirUri, "application/octet-stream", backupName)
+            }.getOrNull() ?: runCatching {
+                DocumentsContract.createDocument(resolver, parentDirUri, mimeType, backupName)
+            }.getOrNull() ?: throw CloudTuneException("无法创建导出备份文件 $targetName")
+            val backupCopyDocUri = DocumentsContract.buildDocumentUriUsingTree(
                 treeUri,
-                DocumentsContract.getDocumentId(rawFallbackUri)
+                DocumentsContract.getDocumentId(rawBackupCopyUri)
             )
             try {
-                val fallbackWritten = streamPartsToUri(partFiles, fallbackDocUri, openOutputStream)
-                if (fallbackWritten != expectedBytes) {
-                    throw CloudTuneException("导出文件写入长度不完整：$fallbackWritten != $expectedBytes")
-                }
-                return fallbackDocUri.toString()
+                copyUriBytesChecked(resolver, existingDocUri, backupCopyDocUri, openOutputStream)
             } catch (e: Exception) {
-                runCatching { DocumentsContract.deleteDocument(resolver, fallbackDocUri) }
+                runCatching { DocumentsContract.deleteDocument(resolver, backupCopyDocUri) }
+                throw CloudTuneException("无法备份已有导出文件 $targetName：${e.message ?: "IO 错误"}")
+            }
+
+            try {
+                val overwrittenBytes = streamPartsToUri(partFiles, existingDocUri, openOutputStream)
+                if (overwrittenBytes != expectedBytes) {
+                    throw CloudTuneException("导出文件写入长度不完整：$overwrittenBytes != $expectedBytes")
+                }
+                runCatching { DocumentsContract.deleteDocument(resolver, backupCopyDocUri) }
+                return existingDocUri.toString()
+            } catch (e: Exception) {
+                runCatching { copyUriBytesChecked(resolver, backupCopyDocUri, existingDocUri, openOutputStream) }
+                runCatching { DocumentsContract.deleteDocument(resolver, backupCopyDocUri) }
                 throw e
             }
         } finally {
             if (!tempPromoted) {
                 runCatching { DocumentsContract.deleteDocument(resolver, tempDocUri) }
+            }
+        }
+    }
+
+    private fun promoteTempToVacantTarget(
+        resolver: ContentResolver,
+        treeUri: Uri,
+        parentDirUri: Uri,
+        tempDocId: String,
+        tempDocUri: Uri,
+        targetName: String,
+        mimeType: String,
+        partFiles: List<File>,
+        expectedBytes: Long,
+        openOutputStream: (Uri) -> OutputStream?,
+        onTempPromoted: () -> Unit
+    ): String {
+        val renamedUri = runCatching {
+            DocumentsContract.renameDocument(resolver, tempDocUri, targetName)
+        }.getOrNull()
+        if (renamedUri != null) {
+            onTempPromoted()
+            val finalDocId = runCatching { DocumentsContract.getDocumentId(renamedUri) }.getOrDefault(tempDocId)
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, finalDocId).toString()
+        }
+
+        val rawFallbackUri = runCatching {
+            DocumentsContract.createDocument(resolver, parentDirUri, mimeType, targetName)
+        }.getOrNull() ?: throw CloudTuneException("无法创建导出文件 $targetName")
+        val fallbackDocUri = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getDocumentId(rawFallbackUri)
+        )
+        try {
+            val fallbackWritten = streamPartsToUri(partFiles, fallbackDocUri, openOutputStream)
+            if (fallbackWritten != expectedBytes) {
+                throw CloudTuneException("导出文件写入长度不完整：$fallbackWritten != $expectedBytes")
+            }
+            return fallbackDocUri.toString()
+        } catch (e: Exception) {
+            runCatching { DocumentsContract.deleteDocument(resolver, fallbackDocUri) }
+            throw e
+        }
+    }
+
+    private fun copyUriBytesChecked(
+        resolver: ContentResolver,
+        sourceUri: Uri,
+        destUri: Uri,
+        openOutputStream: (Uri) -> OutputStream?
+    ) {
+        val input = resolver.openInputStream(sourceUri)
+            ?: throw IOException("无法读取原导出文件")
+        input.use { src ->
+            val output = openOutputStream(destUri)
+                ?: throw IOException("无法打开导出流")
+            output.use { dst ->
+                val buf = ByteArray(131_072)
+                while (true) {
+                    val n = src.read(buf)
+                    if (n < 0) break
+                    if (n > 0) dst.write(buf, 0, n)
+                }
+                dst.flush()
             }
         }
     }

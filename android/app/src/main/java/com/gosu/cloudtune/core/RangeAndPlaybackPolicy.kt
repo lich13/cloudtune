@@ -176,7 +176,7 @@ object RangeHeaderValidator {
             ?: throw CloudTuneException("上游缺少有效的 Content-Range 响应头")
         val total = cr.totalLength
             ?: throw CloudTuneException("上游后缀 Range 响应缺少总字节长度")
-        if (total <= 0L || cr.end + 1L != total) {
+        if (total <= 0L || cr.end != total - 1L) {
             throw CloudTuneException("上游后缀 Content-Range 终点不匹配: $contentRangeHeader")
         }
         val expectedStart = if (total > suffixLength) total - suffixLength else 0L

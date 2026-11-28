@@ -155,6 +155,101 @@ class CloudTuneSnapshotTest {
         renderAndAssertAllScenes(formFactor = "tablet", widthPx = 1024, heightPx = 768)
     }
 
+    @Test
+    @Config(qualifiers = "w360dp-h780dp-mdpi")
+    fun verifyNarrow360dpAdaptiveRenderWithoutTruncationOrCrash() {
+        val fixture = locateFixture()
+        val widthPx = 360
+        val heightPx = 780
+
+        fun assertBitmapContrast(bitmap: Bitmap, label: String, expectDark: Boolean) {
+            val pixels = IntArray(widthPx * heightPx)
+            bitmap.getPixels(pixels, 0, widthPx, 0, 0, widthPx, heightPx)
+            var count = 0
+            var sum = 0.0
+            var sumSq = 0.0
+            var edges = 0
+            for (y in 0 until heightPx step 2) {
+                val row = y * widthPx
+                var prev: Double? = null
+                for (x in 0 until widthPx step 2) {
+                    val c = pixels[row + x]
+                    val r = ((c shr 16) and 0xFF) / 255.0
+                    val g = ((c shr 8) and 0xFF) / 255.0
+                    val b = (c and 0xFF) / 255.0
+                    val lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    count += 1
+                    sum += lum
+                    sumSq += lum * lum
+                    if (prev != null && abs(lum - prev) >= 0.20) edges += 1
+                    prev = lum
+                }
+            }
+            val mean = sum / count
+            val stdDev = sqrt((sumSq / count - mean * mean).coerceAtLeast(0.0))
+            assertTrue("narrow360 $label stdDev=$stdDev too flat", stdDev > 0.03)
+            assertTrue("narrow360 $label edges=$edges too low", edges > 80)
+            if (expectDark) {
+                assertTrue("narrow360 dark $label mean=$mean too bright", mean < 0.42)
+            } else {
+                assertTrue("narrow360 light $label mean=$mean too dark", mean > 0.52)
+            }
+        }
+
+        for ((themeName, themeMode, expectDark) in listOf(
+            Triple("light", AppearanceMode.LIGHT, false),
+            Triple("dark", AppearanceMode.DARK, true)
+        )) {
+            for (scene in SnapshotScene.entries) {
+                val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+                try {
+                    val activity = controller.get()
+                    activity.enableEdgeToEdge()
+                    val rt = CloudTuneAppRuntime.fixture(scene, fixture, appearanceMode = themeMode)
+                    if (scene == SnapshotScene.SETTINGS) {
+                        rt.cacheLimitDraft = "4096"
+                        rt.downloadThreadsDraft = "12"
+                        assertTrue(rt.hasUncommittedCacheDraft)
+                        assertTrue(rt.hasUncommittedThreadDrafts)
+                    } else if (scene == SnapshotScene.DOWNLOAD) {
+                        val completedItem = rt.transferSnapshot.items.first().copy(
+                            state = "completed",
+                            transferredBytes = 62_914_560L,
+                            totalBytes = 62_914_560L,
+                            canPause = false,
+                            canResume = false,
+                            canDelete = true
+                        )
+                        rt.transferSnapshot = rt.transferSnapshot.copy(
+                            items = listOf(completedItem) + rt.transferSnapshot.items.drop(1)
+                        )
+                    }
+                    val vm = CloudTuneViewModel(runtime = rt)
+                    activity.setContent {
+                        CloudTuneRootApp(viewModel = vm)
+                    }
+                    val decor = activity.window.decorView
+                    repeat(3) {
+                        Shadows.shadowOf(Looper.getMainLooper()).idle()
+                        decor.measure(
+                            View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+                            View.MeasureSpec.makeMeasureSpec(heightPx, View.MeasureSpec.EXACTLY)
+                        )
+                        decor.layout(0, 0, widthPx, heightPx)
+                    }
+                    Shadows.shadowOf(Looper.getMainLooper()).idle()
+
+                    val bitmap = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
+                    decor.draw(Canvas(bitmap))
+                    assertBitmapContrast(bitmap, "$themeName-${scene.fileStem}", expectDark)
+                    bitmap.recycle()
+                } finally {
+                    controller.pause().stop().destroy()
+                }
+            }
+        }
+    }
+
     class MockSafDocumentsProvider : DocumentsProvider() {
         override fun onCreate(): Boolean = true
 

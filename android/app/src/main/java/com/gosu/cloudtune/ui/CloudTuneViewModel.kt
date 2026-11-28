@@ -7,6 +7,8 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.webkit.CookieManager
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -60,6 +62,7 @@ import com.gosu.cloudtune.media.PlaybackService
 import com.gosu.cloudtune.media.PlaybackSessionBridge
 import com.gosu.cloudtune.media.QrCodeHelper
 import java.io.File
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
@@ -102,6 +105,7 @@ internal enum class DraftSyncScope {
  * Application/service-scoped runtime keeping `LocalStreamServer`, `MediaController`,
  * unified queue state, lifecycle-safe video `ExoPlayer`, and lockscreen callbacks alive.
  */
+@Stable
 class CloudTuneAppRuntime(
     appContext: Context? = null,
     val cloudClient: Cloud189Client = Cloud189Client(),
@@ -126,9 +130,13 @@ class CloudTuneAppRuntime(
         get() = committedSettings.dynamicColorEnabled
     var activeModule by mutableStateOf(ModuleTab.MUSIC)
     var isBootstrapping by mutableStateOf(false)
+        internal set
     var busyLabel by mutableStateOf<String?>(null)
+        internal set
     var statusMessage by mutableStateOf<String?>(null)
+        internal set
     var statusKind by mutableStateOf(StatusKind.INFO)
+        internal set
 
     internal fun setStatus(message: String?, kind: StatusKind = StatusKind.INFO) {
         statusMessage = message
@@ -136,7 +144,9 @@ class CloudTuneAppRuntime(
     }
 
     var isAuthenticated by mutableStateOf(false)
+        internal set
     var accountName by mutableStateOf<String?>(null)
+        internal set
     var accountStorageKey by mutableStateOf<String?>(null)
         internal set
 
@@ -147,60 +157,87 @@ class CloudTuneAppRuntime(
     var downloadThreadsDraft by mutableStateOf("8")
     var cacheThreadsDraft by mutableStateOf("4")
     var settingsValidationError by mutableStateOf<String?>(null)
+        internal set
 
     var cacheUsageBytes by mutableLongStateOf(0L)
+        internal set
 
     // Login state
     var qrContent by mutableStateOf<String?>(null)
+        internal set
     var qrBitmap by mutableStateOf<Bitmap?>(null)
+        internal set
     var qrHint by mutableStateOf<String?>(null)
+        internal set
     var isShowingWebLoginDialog by mutableStateOf(false)
 
     // Decoupled Cloud & Video folder browsers + Music library
     var cloudBrowser by mutableStateOf(BrowserPaneState())
+        internal set
     var videoBrowser by mutableStateOf(BrowserPaneState())
+        internal set
     var tracks by mutableStateOf<List<TrackSummary>>(emptyList())
+        internal set
     var searchQuery by mutableStateOf("")
 
     var breadcrumbs: List<BreadcrumbItem>
         get() = cloudBrowser.breadcrumbs
-        set(value) { cloudBrowser = cloudBrowser.copy(breadcrumbs = value) }
+        internal set(value) { cloudBrowser = cloudBrowser.copy(breadcrumbs = value) }
 
     var browser: FolderBrowsePayload?
         get() = cloudBrowser.payload
-        set(value) { cloudBrowser = cloudBrowser.copy(payload = value) }
+        internal set(value) { cloudBrowser = cloudBrowser.copy(payload = value) }
 
     // Playback & unified queue state
     var activeTrack by mutableStateOf<TrackSummary?>(null)
+        internal set
     var currentTrackId by mutableStateOf<String?>(null)
+        internal set
     var nowPlayingTitle by mutableStateOf<String?>(null)
+        internal set
     var nowPlayingArtist by mutableStateOf<String?>(null)
+        internal set
     var nowPlayingAlbum by mutableStateOf<String?>(null)
+        internal set
     var nowPlayingArtwork by mutableStateOf<Bitmap?>(null)
+        internal set
     var isPlaying by mutableStateOf(false)
+        internal set
     var loadingTrackId by mutableStateOf<String?>(null)
+        internal set
     var shuffle by mutableStateOf(true)
+        internal set
     var loopMode by mutableStateOf(LoopMode.ALL)
+        internal set
     var currentTime by mutableDoubleStateOf(0.0)
+        internal set
     var duration by mutableDoubleStateOf(0.0)
+        internal set
     var upNextQueue by mutableStateOf<List<TrackSummary>>(emptyList())
+        internal set
     var shuffleOrderIds by mutableStateOf<List<String>>(emptyList())
+        internal set
     var isShowingNowPlayingSheet by mutableStateOf(false)
     var isUserScrubbing by mutableStateOf(false)
 
     // Lifecycle-safe Video player state
     var activeVideoTrack by mutableStateOf<TrackSummary?>(null)
+        internal set
     var activeVideoTitle by mutableStateOf<String?>(null)
+        internal set
     var activeVideoUrl by mutableStateOf<String?>(null)
+        internal set
     var isVideoPlaying by mutableStateOf(false)
+        internal set
     var videoPlayer by mutableStateOf<ExoPlayer?>(null)
         private set
     var pendingExternalVideoAction by mutableStateOf<PendingExternalVideoAction?>(null)
 
     // Transfers
     var transferSnapshot by mutableStateOf(TransferSnapshotPayload())
+        internal set
 
-    var retryBaseDelayMs: Long = 1500L
+    internal var retryBaseDelayMs: Long = 1500L
 
     val transferEngine = TransferEngine(limiter = limiter) { trackId ->
         cloudClient.resolveDownloadUrl(trackId)
@@ -340,59 +377,122 @@ class CloudTuneAppRuntime(
             return null
         }
 
-    val visibleTracks: List<TrackSummary>
-        get() {
-            val q = searchQuery.trim().lowercase()
-            if (q.isEmpty()) return tracks
-            return tracks.filter {
-                it.name.lowercase().contains(q) || it.folderPath.lowercase().contains(q)
+    internal val tracksById: Map<String, TrackSummary> by derivedStateOf {
+        if (tracks.isEmpty()) {
+            emptyMap()
+        } else {
+            val map = LinkedHashMap<String, TrackSummary>(tracks.size)
+            for (track in tracks) {
+                map.putIfAbsent(track.id, track)
+            }
+            map
+        }
+    }
+
+    val orderedBaseTracks: List<TrackSummary> by derivedStateOf {
+        PlaybackQueueResolver.orderedBaseTracks(
+            libraryTracks = tracks,
+            shuffle = shuffle,
+            shuffleOrderIds = shuffleOrderIds,
+            tracksById = tracksById
+        )
+    }
+
+    internal val trackIndexById: Map<String, Int> by derivedStateOf {
+        val ordered = orderedBaseTracks
+        if (ordered.isEmpty()) {
+            emptyMap()
+        } else {
+            val indexMap = HashMap<String, Int>(ordered.size * 2)
+            for (idx in ordered.indices) {
+                indexMap.putIfAbsent(ordered[idx].id, idx)
+            }
+            indexMap
+        }
+    }
+
+    val visibleTracks: List<TrackSummary> by derivedStateOf {
+        val q = searchQuery.trim().lowercase(Locale.ROOT)
+        if (q.isEmpty()) {
+            tracks
+        } else {
+            tracks.filter {
+                it.name.lowercase(Locale.ROOT).contains(q) || it.folderPath.lowercase(Locale.ROOT).contains(q)
             }
         }
+    }
 
-    val currentTrack: TrackSummary?
-        get() {
-            val held = activeTrack
-            if (held != null && (held.id == currentTrackId || currentTrackId == null)) {
-                return held
+    val currentTrack: TrackSummary? by derivedStateOf {
+        val held = activeTrack
+        if (held != null && (held.id == currentTrackId || currentTrackId == null)) {
+            held
+        } else {
+            val id = currentTrackId
+            if (id == null) {
+                null
+            } else {
+                tracksById[id]
+                    ?: cloudBrowser.payload?.audioFiles?.firstOrNull { it.id == id }
+                    ?: held
             }
-            val id = currentTrackId ?: return null
-            return tracks.firstOrNull { it.id == id }
-                ?: cloudBrowser.payload?.audioFiles?.firstOrNull { it.id == id }
-                ?: held
         }
+    }
 
-    val upcomingTracks: List<TrackSummary>
-        get() = PlaybackQueueResolver.upcomingPreview(
+    val upcomingTracks: List<TrackSummary> by derivedStateOf {
+        PlaybackQueueResolver.upcomingPreview(
             currentTrack = currentTrack,
             libraryTracks = tracks,
             upNextQueue = upNextQueue,
             shuffle = shuffle,
             shuffleOrderIds = shuffleOrderIds,
             loopMode = loopMode,
-            limit = 20
+            limit = 20,
+            precomputedOrdered = orderedBaseTracks,
+            orderedIndexById = trackIndexById
         )
+    }
 
-    val canSkipNext: Boolean
-        get() = PlaybackQueueResolver.canSkipNext(
+    val canSkipNext: Boolean by derivedStateOf {
+        PlaybackQueueResolver.canSkipNext(
             currentTrack = currentTrack,
             libraryTracks = tracks,
             upNextQueue = upNextQueue,
             shuffle = shuffle,
             shuffleOrderIds = shuffleOrderIds,
-            loopMode = loopMode
+            loopMode = loopMode,
+            precomputedOrdered = orderedBaseTracks,
+            orderedIndexById = trackIndexById
         )
+    }
 
-    val canSkipPrevious: Boolean
-        get() = PlaybackQueueResolver.canSkipPrevious(
+    val canSkipPrevious: Boolean by derivedStateOf {
+        PlaybackQueueResolver.canSkipPrevious(
             currentTrack = currentTrack,
             libraryTracks = tracks,
             shuffle = shuffle,
             shuffleOrderIds = shuffleOrderIds,
-            loopMode = loopMode
+            loopMode = loopMode,
+            precomputedOrdered = orderedBaseTracks,
+            orderedIndexById = trackIndexById
         )
+    }
 
-    val downloadTransfers: List<TransferStatus>
-        get() = transferSnapshot.items.filter { it.kind == "download" }
+    val canTogglePlayback: Boolean by derivedStateOf {
+        !(currentTrack == null && upNextQueue.isEmpty() && tracks.isEmpty())
+    }
+
+    val downloadTransfers: List<TransferStatus> by derivedStateOf {
+        transferSnapshot.items.filter { it.kind == "download" }
+    }
+
+    val hasUncommittedCacheDraft: Boolean by derivedStateOf {
+        cacheLimitDraft.trim() != committedSettings.cacheLimitMb.toString()
+    }
+
+    val hasUncommittedThreadDrafts: Boolean by derivedStateOf {
+        downloadThreadsDraft.trim() != committedSettings.downloadThreads.toString() ||
+            cacheThreadsDraft.trim() != committedSettings.cacheThreads.toString()
+    }
 
     private fun syncQueueAvailabilityToBridge() {
         if (!enableLiveLoops) return
@@ -1385,7 +1485,7 @@ class CloudTuneAppRuntime(
         }
         scheduledPrefetchJob?.cancel()
         scheduledPrefetchJob = null
-        if (shuffle && track.id !in shuffleOrderIds && tracks.any { it.id == track.id }) {
+        if (shuffle && track.id !in shuffleOrderIds && tracksById.containsKey(track.id)) {
             shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks, track.id)
         }
         syncQueueAvailabilityToBridge()
@@ -1769,7 +1869,9 @@ class CloudTuneAppRuntime(
                 shuffle = shuffle,
                 shuffleOrderIds = shuffleOrderIds,
                 loopMode = loopMode,
-                autoAdvanceAtEnd = autoAdvanceAtEnd
+                autoAdvanceAtEnd = autoAdvanceAtEnd,
+                precomputedOrdered = orderedBaseTracks,
+                orderedIndexById = trackIndexById
             )
         } else {
             PlaybackQueueResolver.resolvePrevious(
@@ -1778,7 +1880,9 @@ class CloudTuneAppRuntime(
                 upNextQueue = upNextQueue,
                 shuffle = shuffle,
                 shuffleOrderIds = shuffleOrderIds,
-                loopMode = loopMode
+                loopMode = loopMode,
+                precomputedOrdered = orderedBaseTracks,
+                orderedIndexById = trackIndexById
             )
         }
         upNextQueue = step.remainingUpNext
@@ -2467,7 +2571,9 @@ class CloudTuneAppRuntime(
             upNextQueue = upNextQueue,
             shuffle = shuffle,
             shuffleOrderIds = shuffleOrderIds,
-            loopMode = loopMode
+            loopMode = loopMode,
+            precomputedOrdered = orderedBaseTracks,
+            orderedIndexById = trackIndexById
         ) ?: return
         if (next.id == prefetchedTrackId || next.id == prefetchingTrackId) return
         activePrefetchJob?.cancel()

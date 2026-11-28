@@ -60,11 +60,16 @@ android {
         getByName("release") {
             signingConfigs.findByName("release")?.let { signingConfig = it }
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
+    }
+
+    androidResources {
+        localeFilters += listOf("zh", "zh-rCN", "en")
     }
 
     compileOptions {
@@ -74,12 +79,20 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true
+        buildConfig = false
     }
 
     packaging {
         jniLibs {
             useLegacyPackaging = false
+        }
+        resources {
+            excludes += setOf(
+                "META-INF/*.version",
+                "DebugProbesKt.bin",
+                "kotlin-tooling-metadata.json",
+                "META-INF/com.android.tools/**"
+            )
         }
     }
 

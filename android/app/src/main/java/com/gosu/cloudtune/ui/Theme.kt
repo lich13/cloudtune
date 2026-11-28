@@ -15,7 +15,11 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
 import androidx.core.view.WindowCompat
+
+/** Preserves Material 3 typography metrics (including `lineHeight`) while enabling tabular numerals. */
+fun TextStyle.tabularNums(): TextStyle = copy(fontFeatureSettings = "tnum")
 
 @Immutable
 data class CloudTuneColors(

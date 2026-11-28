@@ -35,6 +35,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -48,6 +49,20 @@ class Cloud189ProtocolAndProxyTest {
             dir = dir.parentFile
         }
         error("Could not locate contracts/$name from ${System.getProperty("user.dir")}")
+    }
+
+    private suspend fun awaitUntil(
+        timeoutMs: Long = 3_000L,
+        stepMs: Long = 15L,
+        predicate: () -> Boolean
+    ) {
+        val deadlineNs = System.nanoTime() + timeoutMs.coerceAtLeast(1L) * 1_000_000L
+        while (!predicate()) {
+            if (System.nanoTime() >= deadlineNs) {
+                throw AssertionError("Condition was not satisfied within ${timeoutMs}ms")
+            }
+            delay(stepMs.coerceAtLeast(1L))
+        }
     }
 
     @Test
@@ -64,6 +79,10 @@ class Cloud189ProtocolAndProxyTest {
             dateHeader = hmac.getString("date")
         )
         assertEquals(hmac.getString("expectedRequestUri"), reqUri)
+        assertEquals(
+            hmac.getString("expectedPayload"),
+            "SessionKey=${hmac.getString("sessionKey")}&Operate=${hmac.getString("method")}&RequestURI=$reqUri&Date=${hmac.getString("date")}"
+        )
         assertEquals(hmac.getString("expectedSignature"), sig)
 
         // 2) Login HTML extraction avoiding alt="二维码登录成功"
@@ -72,6 +91,23 @@ class Cloud189ProtocolAndProxyTest {
         assertEquals(htmlBlock.getString("expectedLt"), extracted.lt)
         assertEquals(htmlBlock.getString("expectedParamId"), extracted.paramId)
         assertEquals(htmlBlock.getString("expectedReqId"), extracted.reqId)
+
+        // 2b) QR poll timestamp formatting vector
+        val qrDate = root.getJSONObject("qrPollDateFormat")
+        val qrInstant = java.time.ZonedDateTime.of(
+            qrDate.getInt("year"),
+            qrDate.getInt("month"),
+            qrDate.getInt("day"),
+            qrDate.getInt("hour"),
+            qrDate.getInt("minute"),
+            qrDate.getInt("second"),
+            qrDate.getInt("millisecond") * 1_000_000,
+            java.time.ZoneOffset.UTC
+        ).toInstant()
+        assertEquals(
+            qrDate.getString("expected"),
+            Cloud189Protocol.formatQrPollDate(qrInstant, java.time.ZoneOffset.UTC)
+        )
 
         // 3) QR poll payloads
         val qrArr = root.getJSONArray("qrPollPayloads")
@@ -174,14 +210,60 @@ class Cloud189ProtocolAndProxyTest {
         }
         assertNull(RangeHeaderValidator.parseRequestRange("bytes=-0"))
 
-        // 7) Account SHA-256 bucket isolation
-        val acctArr = root.getJSONArray("accountIsolation")
-        for (i in 0 until acctArr.length()) {
-            val entry = acctArr.getJSONObject(i)
-            assertEquals(
-                entry.getString("expectedBucketHash"),
-                Cloud189Protocol.accountBucketHash(entry.getString("rawAccountId"))
+        // 6b) Playback fallback policy & global remote permit cap vectors
+        val fallbackPolicy = root.getJSONObject("playbackFallbackPolicy")
+        val expectedLargeThreshold = fallbackPolicy.getLong("largeTrackThresholdBytes")
+        val expectedMaxPermits = fallbackPolicy.getInt("globalMaxRemotePermits")
+        val sampleLargeBytes = fallbackPolicy.getLong("sampleLargeTrackBytes")
+        val sampleSmallBytes = fallbackPolicy.getLong("sampleSmallTrackBytes")
+        assertEquals(expectedLargeThreshold, PlaybackDecisionPolicy.LARGE_TRACK_THRESHOLD_BYTES)
+        assertEquals(expectedMaxPermits, GlobalTransferLimiter().maxPermits)
+        assertTrue(
+            PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                mode = PlaybackMode.STREAM_CACHE,
+                sizeBytes = sampleLargeBytes,
+                forceStreamProxy = false
             )
+        )
+        assertFalse(
+            PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                mode = PlaybackMode.STREAM_CACHE,
+                sizeBytes = sampleLargeBytes,
+                forceStreamProxy = true
+            )
+        )
+        assertFalse(
+            PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                mode = PlaybackMode.STREAM_CACHE,
+                sizeBytes = sampleSmallBytes,
+                forceStreamProxy = false
+            )
+        )
+        assertTrue(
+            PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                mode = PlaybackMode.DOWNLOAD_FIRST,
+                sizeBytes = sampleSmallBytes,
+                forceStreamProxy = false
+            )
+        )
+
+        // 7) Account SHA-256 bucket isolation
+        val acctTempRoot = Files.createTempDirectory("cloudtune-acct-vectors").toFile()
+        try {
+            val acctStore = AccountStore(acctTempRoot)
+            val acctArr = root.getJSONArray("accountIsolation")
+            for (i in 0 until acctArr.length()) {
+                val entry = acctArr.getJSONObject(i)
+                val rawAcct = entry.getString("rawAccountId")
+                val paths = acctStore.paths(rawAcct)
+                assertEquals(entry.getString("normalizedAccountId"), paths.accountId)
+                assertEquals(
+                    entry.getString("expectedBucketHash"),
+                    Cloud189Protocol.accountBucketHash(rawAcct)
+                )
+            }
+        } finally {
+            acctTempRoot.deleteRecursively()
         }
 
         // 7) Unified media format table (.aiff/.aif/.dsf/.dff lossless parity & MIME types) + AtomicFileIO
@@ -525,9 +607,8 @@ class Cloud189ProtocolAndProxyTest {
                 exportedOut.absolutePath
             }
 
-            repeat(40) {
-                if (engine.snapshot().items.firstOrNull { it.id == taskId }?.state == "completed") return@repeat
-                delay(40L)
+            awaitUntil {
+                engine.snapshot().items.firstOrNull { it.id == taskId }?.state == "completed"
             }
             val finished = engine.snapshot().items.first { it.id == taskId }
             assertEquals("completed", finished.state)
@@ -685,9 +766,8 @@ class Cloud189ProtocolAndProxyTest {
                 assertFalse(raw.contains("alice_private"))
                 assertFalse(raw.contains("13800138000"))
             }
-            repeat(40) {
-                if (engine.snapshot().items.firstOrNull { it.id == dlId }?.state == "completed") return@repeat
-                delay(30L)
+            awaitUntil {
+                engine.snapshot().items.firstOrNull { it.id == dlId }?.state == "completed"
             }
             assertEquals("completed", engine.snapshot().items.first { it.id == dlId }.state)
             engine.cancelAll(aliceId)
@@ -778,10 +858,7 @@ class Cloud189ProtocolAndProxyTest {
                         (URL(liveUrl).openConnection() as HttpURLConnection).inputStream.use { it.readBytes().size }
                     }.getOrDefault(0)
                 }
-                repeat(50) {
-                    if (firstChunkRead.get()) return@repeat
-                    delay(20L)
-                }
+                awaitUntil { firstChunkRead.get() }
                 val t0 = System.currentTimeMillis()
                 server.revokeAllSources("acctLive")
                 val received = readerJob.await()
@@ -859,7 +936,7 @@ class Cloud189ProtocolAndProxyTest {
             // 1) Two accounts omitting loginName get display "天翼云盘用户" with distinct storage keys
             sessionIdx.set(1)
             runtime.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=1", emptyMap())
-            repeat(40) { if (runtime.isAuthenticated && runtime.browser != null) return@repeat; delay(15L) }
+            awaitUntil { runtime.isAuthenticated && runtime.browser != null }
             assertEquals("天翼云盘用户", runtime.accountName)
             val key1 = runtime.accountStorageKey
             assertNotNull("key1 should be assigned", key1)
@@ -869,7 +946,7 @@ class Cloud189ProtocolAndProxyTest {
             runtime.logout()
             sessionIdx.set(2)
             runtime.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=2", emptyMap())
-            repeat(40) { if (runtime.isAuthenticated && runtime.browser != null) return@repeat; delay(15L) }
+            awaitUntil { runtime.isAuthenticated && runtime.browser != null }
             val key2 = runtime.accountStorageKey
             assertNotNull("key2 should be assigned", key2)
             assertFalse("key1 and key2 must differ: $key1 vs $key2", key1 == key2)
@@ -877,23 +954,17 @@ class Cloud189ProtocolAndProxyTest {
 
             // 2) Real subfolder names & distinct relative export subpaths
             runtime.browseTo("cd1", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd1", "CD 1")))
-            repeat(40) { if (runtime.browser?.currentFolderId == "cd1") return@repeat; delay(15L) }
+            awaitUntil { runtime.browser?.currentFolderId == "cd1" }
             assertEquals("CD 1", runtime.browser?.currentFolderName)
             assertEquals("CD 1", runtime.browser?.audioFiles?.firstOrNull()?.folderPath)
 
             runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
-            repeat(40) {
-                if (runtime.downloadTransfers.any { it.path == "CD 1/01. Song.flac" }) return@repeat
-                delay(20L)
-            }
+            awaitUntil { runtime.downloadTransfers.any { it.path == "CD 1/01. Song.flac" } }
             runtime.browseTo("cd2", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd2", "CD 2")))
-            repeat(40) { if (runtime.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
+            awaitUntil { runtime.browser?.currentFolderId == "cd2" }
             assertEquals("CD 2", runtime.browser?.currentFolderName)
             runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
-            repeat(40) {
-                if (runtime.downloadTransfers.any { it.path == "CD 2/01. Song.flac" }) return@repeat
-                delay(20L)
-            }
+            awaitUntil { runtime.downloadTransfers.any { it.path == "CD 2/01. Song.flac" } }
             val queuedPaths = runtime.downloadTransfers.mapNotNull { it.path }.toSet()
             assertTrue("Expected CD 1 subpath in $queuedPaths", queuedPaths.contains("CD 1/01. Song.flac"))
             assertTrue("Expected CD 2 subpath in $queuedPaths", queuedPaths.contains("CD 2/01. Song.flac"))
@@ -904,10 +975,7 @@ class Cloud189ProtocolAndProxyTest {
             downloadUrlCalls.set(0)
             val transientTrack = TrackSummary("t-fail", "Transient.mp3", "CD 2", 1024L)
             runtime.playTrack(transientTrack)
-            repeat(80) {
-                if (runtime.statusMessage?.contains("已停止自动重试") == true) return@repeat
-                delay(20L)
-            }
+            awaitUntil { runtime.statusMessage?.contains("已停止自动重试") == true }
             assertEquals(1 + PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS, downloadUrlCalls.get())
             assertTrue("Expected retry stop status, got: ${runtime.statusMessage}", runtime.statusMessage?.contains("已停止自动重试") == true)
 
@@ -925,7 +993,7 @@ class Cloud189ProtocolAndProxyTest {
             runtime.tracks = listOf(q1, q2)
             runtime.shuffle = false
             runtime.playTrack(q1)
-            repeat(40) { if (runtime.currentTrackId == "q1") return@repeat; delay(15L) }
+            awaitUntil { runtime.currentTrackId == "q1" }
 
             primaryVm.onCleared()
             assertNotNull("SkipNext callback must survive ViewModel.onCleared()", PlaybackSessionBridge.onSkipNext)
@@ -935,7 +1003,7 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(404, probeAfterClear.responseCode)
 
             PlaybackSessionBridge.onSkipNext?.invoke()
-            repeat(40) { if (runtime.currentTrackId == "q2") return@repeat; delay(15L) }
+            awaitUntil { runtime.currentTrackId == "q2" }
             assertEquals("q2", runtime.currentTrackId)
             assertTrue(
                 "Expected loopback URL, got ${runtime.lastPreparedPlaybackUrl}",
@@ -1025,19 +1093,18 @@ class Cloud189ProtocolAndProxyTest {
             // 2) Cloud & Video browsers stay decoupled; playing ad-hoc cloud track survives folder changes and NEVER uses accountName as artist
             runtime.browseTo(BrowserScope.CLOUD, "jazz", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("jazz", "Jazz")))
             runtime.browseTo(BrowserScope.VIDEO, "video", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("video", "Video")))
-            repeat(40) {
-                if (runtime.cloudBrowser.payload?.currentFolderId == "jazz" && runtime.videoBrowser.payload?.currentFolderId == "video") return@repeat
-                delay(15L)
+            awaitUntil {
+                runtime.cloudBrowser.payload?.currentFolderId == "jazz" && runtime.videoBrowser.payload?.currentFolderId == "video"
             }
             val jazzTrack = runtime.cloudBrowser.payload!!.audioFiles.first()
             runtime.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
             runtime.playTrack(jazzTrack)
-            repeat(40) { if (runtime.currentTrackId == "cloud-jazz") return@repeat; delay(15L) }
+            awaitUntil { runtime.currentTrackId == "cloud-jazz" }
             assertEquals("cloud-jazz", runtime.currentTrack?.id)
             assertNull("Account email must never be used as artist fallback", runtime.nowPlayingArtist)
 
             runtime.browseTo(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT))
-            repeat(40) { if (runtime.cloudBrowser.payload?.isRoot == true) return@repeat; delay(15L) }
+            awaitUntil { runtime.cloudBrowser.payload?.isRoot == true }
             assertEquals("Active track must survive cloud folder navigation", "cloud-jazz", runtime.currentTrack?.id)
             assertEquals("Video browser must stay on video folder", "video", runtime.videoBrowser.payload?.currentFolderId)
 
@@ -1048,7 +1115,7 @@ class Cloud189ProtocolAndProxyTest {
             runtime.shuffle = false
             runtime.loopMode = LoopMode.OFF
             runtime.playTrack(s2)
-            repeat(40) { if (runtime.currentTrackId == "s2") return@repeat; delay(15L) }
+            awaitUntil { runtime.currentTrackId == "s2" }
             assertFalse("End of queue with LoopMode.OFF must disable skip next", PlaybackSessionBridge.canSkipNext)
             assertTrue("Second item must allow skip previous", PlaybackSessionBridge.canSkipPrevious)
             runtime.playNext(s1)
@@ -1207,7 +1274,7 @@ class Cloud189ProtocolAndProxyTest {
                 "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=relogin",
                 emptyMap()
             )
-            repeat(60) { if (ioRuntime.isAuthenticated) return@repeat; delay(20L) }
+            awaitUntil { ioRuntime.isAuthenticated }
             runCatching { supersededBoot.await() }
             ioRuntime.cookieCleanupDeferred?.await()
             assertTrue("Rapid re-login after logout must stay authenticated", ioRuntime.isAuthenticated)
@@ -1228,8 +1295,7 @@ class Cloud189ProtocolAndProxyTest {
                 "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=warn",
                 emptyMap()
             )
-            repeat(40) { if (rt.isAuthenticated) return@repeat; delay(15L) }
-            assertTrue(rt.isAuthenticated)
+            awaitUntil { rt.isAuthenticated }
             assertTrue("Expected login success prefix, got: ${rt.statusMessage}", rt.statusMessage?.contains("天翼官方网页一键登录成功") == true)
             assertTrue("Expected credential warning in statusMessage, got: ${rt.statusMessage}", rt.statusMessage?.contains("登录凭据保存异常") == true)
             failSave.set(false)
@@ -1260,7 +1326,7 @@ class Cloud189ProtocolAndProxyTest {
                 "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=ok",
                 emptyMap()
             )
-            repeat(40) { if (rt.isAuthenticated) return@repeat; delay(15L) }
+            awaitUntil { rt.isAuthenticated }
             val acctKey = rt.accountStorageKey!!
 
             // Issue 5: handleWriteThroughCompleted refreshes cacheUsageBytes & metadata for active track, and rejects stale track/generation
@@ -1268,7 +1334,7 @@ class Cloud189ProtocolAndProxyTest {
             val songB = TrackSummary("wt-b", "CurrentSongB.flac", "AlbumB", 1024L)
             rt.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
             rt.playTrack(songA)
-            repeat(40) { if (rt.currentTrackId == "wt-a") return@repeat; delay(15L) }
+            awaitUntil { rt.currentTrackId == "wt-a" }
             rt.cacheUsageBytes = 999_999L
             val missingOrRawFile = File(tempRoot, "wt-a.flac")
             rt.handleWriteThroughCompleted(
@@ -1280,7 +1346,7 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals("SongA.flac", rt.nowPlayingTitle)
 
             rt.playTrack(songB)
-            repeat(40) { if (rt.currentTrackId == "wt-b") return@repeat; delay(15L) }
+            awaitUntil { rt.currentTrackId == "wt-b" }
             rt.handleWriteThroughCompleted(
                 accountHash = Cloud189Protocol.accountBucketHash(acctKey),
                 trackId = "wt-a",
@@ -1303,17 +1369,17 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(listOf("q-cloud", "manual-2"), rt.upNextQueue.map { it.id })
 
             rt.togglePlayback()
-            repeat(40) { if (rt.currentTrackId == "q-cloud") return@repeat; delay(15L) }
+            awaitUntil { rt.currentTrackId == "q-cloud" }
             assertEquals("q-cloud", rt.currentTrack?.id)
             assertEquals(listOf("manual-2"), rt.upNextQueue.map { it.id })
 
             rt.playFromUpcomingQueue(manual2)
-            repeat(40) { if (rt.currentTrackId == "manual-2") return@repeat; delay(15L) }
+            awaitUntil { rt.currentTrackId == "manual-2" }
             assertEquals("manual-2", rt.currentTrack?.id)
             assertTrue(rt.upNextQueue.isEmpty())
 
             rt.playAdjacent(1)
-            repeat(40) { if (rt.currentTrackId == "lib-1") return@repeat; delay(15L) }
+            awaitUntil { rt.currentTrackId == "lib-1" }
             assertEquals("lib-1", rt.currentTrack?.id)
             Unit
         } finally {
@@ -1485,10 +1551,8 @@ class Cloud189ProtocolAndProxyTest {
                 effective
             }
 
-            var waitAttempts = 0
-            while (waitAttempts < 50 && engine2.snapshot().items.firstOrNull { it.id == taskId }?.state != "completed") {
-                delay(30L)
-                waitAttempts += 1
+            awaitUntil {
+                engine2.snapshot().items.firstOrNull { it.id == taskId }?.state == "completed"
             }
             assertEquals("completed", engine2.snapshot().items.first { it.id == taskId }.state)
             assertEquals("Resumed task must keep its pinned exportTreeUri", pinnedUri, observedUri.get())
@@ -1901,9 +1965,8 @@ class Cloud189ProtocolAndProxyTest {
                 }
             )
             assertEquals(3, batchIds.size)
-            repeat(50) {
-                if (batchIds.all { id -> batchEngine.snapshot().items.firstOrNull { it.id == id }?.state == "completed" }) return@repeat
-                delay(25L)
+            awaitUntil {
+                batchIds.all { id -> batchEngine.snapshot().items.firstOrNull { it.id == id }?.state == "completed" }
             }
             assertEquals(3, exportedFiles.size)
             exportedFiles.values.forEach { assertArrayEquals(batchPayload, it) }
@@ -1920,6 +1983,307 @@ class Cloud189ProtocolAndProxyTest {
             musicFixtureRt.cacheLimitDraft = "10"
             assertFalse(musicFixtureRt.commitCacheLimitDraftAsync())
             assertEquals(StatusKind.ERROR, musicFixtureRt.statusKind)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyRapidPlayTrackSwitchLogoutRaceAndDerivedStateIsolation(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-slice3-race").toFile()
+        try {
+            val gateByTrackId = ConcurrentHashMap<String, Pair<CompletableDeferred<Unit>, CompletableDeferred<Unit>>>()
+            val transport = object : CloudHttpTransport {
+                override suspend fun send(
+                    url: String,
+                    method: String,
+                    headers: Map<String, String>,
+                    formBody: List<Pair<String, String>>?
+                ): CloudHttpResponse {
+                    return when {
+                        url.contains("refreshToken.do") -> {
+                            val b = """{"res_code":0,"accessToken":"at_s3","refreshToken":"rt_s3"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
+                        }
+                        url.contains("getSessionForPC.action") -> {
+                            val b = """{"res_code":0,"loginName":"race@example.invalid","sessionKey":"sk_s3","sessionSecret":"ss_s3","refreshToken":"rt_s3"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
+                        }
+                        url.contains("listFiles.action") -> {
+                            val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
+                        }
+                        url.contains("getFileDownloadUrl.action") -> {
+                            val fileId = url.substringAfter("fileId=").substringBefore("&")
+                            gateByTrackId[fileId]?.let { (entered, release) ->
+                                entered.complete(Unit)
+                                release.await()
+                            }
+                            val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/$fileId.flac"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
+                        }
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
+                    }
+                }
+                override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
+                override fun clearCookies() {}
+            }
+
+            var savedCred = PersistedRefreshCredential.createOrNull("rt_s3_init", "race@example.invalid")
+            val memCredStore = object : CredentialStore {
+                override fun loadCredential(): PersistedRefreshCredential? = savedCred
+                override fun saveCredential(credential: PersistedRefreshCredential) { savedCred = credential }
+                override fun clearCredential() { savedCred = null }
+            }
+            val runtime = CloudTuneAppRuntime(
+                appContext = null,
+                cloudClient = Cloud189Client(transport),
+                accountStore = AccountStore(tempRoot),
+                credentialStore = memCredStore,
+                limiter = GlobalTransferLimiter(8),
+                enableLiveLoops = true,
+                ioDispatcher = Dispatchers.IO
+            )
+            try {
+                runtime.bootstrap().await()
+                assertTrue(runtime.isAuthenticated)
+                runtime.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
+
+                val tracks = (1..4).map { idx ->
+                    TrackSummary("rapid-$idx", "0$idx. Rapid.flac", "Album", 2048L)
+                }
+                runtime.tracks = tracks
+                runtime.shuffle = true
+                runtime.shuffleOrderIds = listOf("rapid-3", "rapid-1", "rapid-4", "rapid-2")
+
+                // 1) derivedStateOf memoization: 5 Hz currentTime ticks never rebuild visibleTracks/orderedBaseTracks/upcomingTracks
+                val visibleBefore = runtime.visibleTracks
+                val orderedBefore = runtime.orderedBaseTracks
+                val upcomingBefore = runtime.upcomingTracks
+                for (tick in 1..20) {
+                    runtime.currentTime = tick * 0.2
+                }
+                assertSame(visibleBefore, runtime.visibleTracks)
+                assertSame(orderedBefore, runtime.orderedBaseTracks)
+                assertSame(upcomingBefore, runtime.upcomingTracks)
+                assertFalse(runtime.hasUncommittedCacheDraft)
+                assertFalse(runtime.hasUncommittedThreadDrafts)
+                runtime.cacheLimitDraft = "2048"
+                assertTrue(runtime.hasUncommittedCacheDraft)
+                runtime.downloadThreadsDraft = "12"
+                assertTrue(runtime.hasUncommittedThreadDrafts)
+                runtime.syncDraftsFromCommitted()
+                assertFalse(runtime.hasUncommittedCacheDraft)
+                assertFalse(runtime.hasUncommittedThreadDrafts)
+
+                // 2) Rapid playTrack(t1..t4) switching while earlier URL resolutions finish out-of-order
+                val g1 = CompletableDeferred<Unit>() to CompletableDeferred<Unit>()
+                val g2 = CompletableDeferred<Unit>() to CompletableDeferred<Unit>()
+                val g3 = CompletableDeferred<Unit>() to CompletableDeferred<Unit>()
+                gateByTrackId["rapid-1"] = g1
+                gateByTrackId["rapid-2"] = g2
+                gateByTrackId["rapid-3"] = g3
+
+                runtime.playTrack(tracks[0])
+                withTimeout(3_000L) { g1.first.await() }
+                runtime.playTrack(tracks[1])
+                withTimeout(3_000L) { g2.first.await() }
+                runtime.playTrack(tracks[2])
+                withTimeout(3_000L) { g3.first.await() }
+                runtime.playTrack(tracks[3])
+
+                awaitUntil { runtime.nowPlayingTitle == "04. Rapid.flac" && runtime.loadingTrackId == null }
+                // Now release stale tracks 1..3 in reverse order; none may overwrite track 4 or leak stream sources
+                g3.second.complete(Unit)
+                g2.second.complete(Unit)
+                g1.second.complete(Unit)
+                delay(40L)
+                assertEquals("rapid-4", runtime.currentTrackId)
+                assertEquals("04. Rapid.flac", runtime.nowPlayingTitle)
+                assertEquals(1, runtime.streamServer!!.registeredSourceCount())
+
+                // 3) Rapid playTrack switch immediately racing against logout()
+                val gLogout = CompletableDeferred<Unit>() to CompletableDeferred<Unit>()
+                gateByTrackId["rapid-logout"] = gLogout
+                val raceTrack = TrackSummary("rapid-logout", "LogoutRace.flac", "Album", 2048L)
+                runtime.playTrack(tracks[0])
+                runtime.playTrack(raceTrack)
+                withTimeout(3_000L) { gLogout.first.await() }
+                runtime.logout()
+                gLogout.second.complete(Unit)
+                runtime.cookieCleanupDeferred?.await()
+                delay(40L)
+
+                assertFalse(runtime.isAuthenticated)
+                assertNull(runtime.currentTrack)
+                assertNull(runtime.currentTrackId)
+                assertNull(runtime.activeTrack)
+                assertNull(runtime.nowPlayingTitle)
+                assertNull(runtime.loadingTrackId)
+                assertFalse(runtime.isPlaying)
+                assertFalse(runtime.canTogglePlayback)
+                assertEquals(0, runtime.streamServer!!.registeredSourceCount())
+                assertEquals("已退出登录并清理当前会话", runtime.statusMessage)
+            } finally {
+                runtime.streamServer?.close()
+            }
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyCrossRestartFourPartMidwayPauseAndByteExactResume(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-4part-resume").toFile()
+        try {
+            val store = AccountStore(tempRoot)
+            val accountId = "multipart@example.invalid"
+            val paths = store.paths(accountId)
+            val totalBytes = 800_000
+            val fullData = ByteArray(totalBytes) { idx ->
+                ((idx * 73 + (idx ushr 8) * 19 + 11) and 0xFF).toByte()
+            }
+            val midwayReachedCount = AtomicInteger(0)
+            val closedPartsCount = AtomicInteger(0)
+            val releaseBlockedParts = CompletableDeferred<Unit>()
+
+            val engine1 = TransferEngine(
+                limiter = GlobalTransferLimiter(8),
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/$totalBytes", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(fullData.copyOfRange(0, 1))
+                        )
+                    } else {
+                        val parsed = RangeHeaderValidator.parseRequestRange(rangeHeader)!!
+                        val start = parsed.start.toInt()
+                        val end = (parsed.end ?: (totalBytes - 1).toLong()).toInt()
+                        val slice = fullData.copyOfRange(start, end + 1)
+                        if (start == 0) {
+                            // Part 0 completes fully before pause
+                            OpenedUpstreamStream(
+                                statusCode = 206,
+                                headers = mapOf(
+                                    "content-range" to "bytes $start-$end/$totalBytes",
+                                    "content-length" to slice.size.toString()
+                                ),
+                                bodyStream = ByteArrayInputStream(slice)
+                            )
+                        } else {
+                            // Parts 1, 2, 3 each flush 75_000 bytes to disk then stall mid-way until paused
+                            OpenedUpstreamStream(
+                                statusCode = 206,
+                                headers = mapOf(
+                                    "content-range" to "bytes $start-$end/$totalBytes",
+                                    "content-length" to slice.size.toString()
+                                ),
+                                bodyStream = object : InputStream() {
+                                    private var pos = 0
+                                    private var counted = false
+                                    override fun read(): Int {
+                                        val single = ByteArray(1)
+                                        val n = read(single, 0, 1)
+                                        return if (n <= 0) -1 else (single[0].toInt() and 0xFF)
+                                    }
+                                    override fun read(b: ByteArray, off: Int, len: Int): Int {
+                                        if (pos >= 75_000) {
+                                            if (!counted) {
+                                                counted = true
+                                                midwayReachedCount.incrementAndGet()
+                                            }
+                                            runBlocking {
+                                                withTimeout(5_000L) { releaseBlockedParts.await() }
+                                            }
+                                            throw IOException("paused mid-part")
+                                        }
+                                        val allowed = minOf(len, 75_000 - pos, slice.size - pos)
+                                        if (allowed <= 0) return -1
+                                        System.arraycopy(slice, pos, b, off, allowed)
+                                        pos += allowed
+                                        return allowed
+                                    }
+                                },
+                                onClose = { closedPartsCount.incrementAndGet() }
+                            )
+                        }
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/4part.flac" }
+            )
+
+            val track = TrackSummary("trk-4p", "Symphony_4Part.flac", "Classical", totalBytes.toLong())
+            val taskId = engine1.enqueueExportDownload(
+                accountId = accountId,
+                track = track,
+                relativeSubpath = "Classical/Symphony_4Part.flac",
+                parallelThreads = 4,
+                stagingRootDir = paths.stagingDir,
+                manifestsFile = paths.transfersFile
+            ) { staged, _, _, _ -> staged.absolutePath }
+
+            awaitUntil {
+                midwayReachedCount.get() == 3 &&
+                    (engine1.snapshot().items.firstOrNull { it.id == taskId }?.transferredBytes ?: 0L) >= 425_000L
+            }
+            engine1.pauseTransfer(taskId, paths.transfersFile)
+            releaseBlockedParts.complete(Unit)
+            awaitUntil { closedPartsCount.get() == 3 }
+            assertEquals("paused", engine1.snapshot().items.first { it.id == taskId }.state)
+
+            // Simulate process restart with a brand-new TransferEngine
+            val resumedRanges = Collections.synchronizedList(mutableListOf<String>())
+            val engine2 = TransferEngine(
+                limiter = GlobalTransferLimiter(8),
+                opener = { _, rangeHeader ->
+                    if (rangeHeader != null) resumedRanges += rangeHeader
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/$totalBytes", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(fullData.copyOfRange(0, 1))
+                        )
+                    } else {
+                        val parsed = RangeHeaderValidator.parseRequestRange(rangeHeader)!!
+                        val start = parsed.start.toInt()
+                        val end = (parsed.end ?: (totalBytes - 1).toLong()).toInt()
+                        val slice = fullData.copyOfRange(start, end + 1)
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf(
+                                "content-range" to "bytes $start-$end/$totalBytes",
+                                "content-length" to slice.size.toString()
+                            ),
+                            bodyStream = ByteArrayInputStream(slice)
+                        )
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/4part-resumed.flac" }
+            )
+
+            engine2.restorePersistedDownloads(accountId, paths.stagingDir, paths.transfersFile)
+            val restored = engine2.snapshot().items.first { it.id == taskId }
+            assertEquals("paused", restored.state)
+            assertTrue(restored.canResume)
+            assertEquals(425_000L, restored.transferredBytes)
+
+            val exportedFile = File(tempRoot, "Symphony_4Part_Exported.flac")
+            engine2.resumeTransfer(taskId, paths.stagingDir, paths.transfersFile) { staged, _, _, _ ->
+                staged.copyTo(exportedFile, overwrite = true)
+                exportedFile.absolutePath
+            }
+
+            awaitUntil {
+                engine2.snapshot().items.firstOrNull { it.id == taskId }?.state == "completed"
+            }
+            assertArrayEquals("4-part cross-restart resume must produce byte-exact output", fullData, exportedFile.readBytes())
+            assertFalse("Completed part 0 must not be re-downloaded", resumedRanges.contains("bytes=0-199999"))
+            assertTrue(resumedRanges.contains("bytes=275000-399999"))
+            assertTrue(resumedRanges.contains("bytes=475000-599999"))
+            assertTrue(resumedRanges.contains("bytes=675000-799999"))
+            val safeKey = Cloud189Protocol.sanitizeFileName(taskId)
+            assertFalse("Staging .parts must be removed after export", File(paths.stagingDir, "$safeKey.parts").exists())
         } finally {
             tempRoot.deleteRecursively()
         }

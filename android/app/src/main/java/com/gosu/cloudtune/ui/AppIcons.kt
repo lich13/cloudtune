@@ -170,6 +170,23 @@ object AppIcons {
         }.build()
     }
 
+    val RepeatOne: ImageVector by lazy {
+        ImageVector.Builder("RepeatOne", 24.dp, 24.dp, 24f, 24f).apply {
+            path(
+                stroke = SolidColor(Color.Black),
+                strokeLineWidth = 2f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(17f, 4f); lineTo(20f, 7f); lineTo(17f, 10f)
+                moveTo(4f, 11f); lineTo(4f, 9f); curveTo(4f, 7.9f, 4.9f, 7f, 6f, 7f); lineTo(20f, 7f)
+                moveTo(7f, 20f); lineTo(4f, 17f); lineTo(7f, 14f)
+                moveTo(20f, 13f); lineTo(20f, 15f); curveTo(20f, 16.1f, 19.1f, 17f, 18f, 17f); lineTo(4f, 17f)
+                moveTo(11f, 10.5f); lineTo(12.6f, 9.5f); lineTo(12.6f, 14.5f)
+            }
+        }.build()
+    }
+
     val SpeakerWave: ImageVector by lazy {
         ImageVector.Builder("SpeakerWave", 24.dp, 24.dp, 24f, 24f).apply {
             path(

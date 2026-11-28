@@ -227,12 +227,14 @@ object PlaybackQueueResolver {
     fun orderedBaseTracks(
         libraryTracks: List<TrackSummary>,
         shuffle: Boolean,
-        shuffleOrderIds: List<String>
+        shuffleOrderIds: List<String>,
+        tracksById: Map<String, TrackSummary>? = null
     ): List<TrackSummary> {
         if (!shuffle || libraryTracks.size <= 1) return libraryTracks
-        val byId = LinkedHashMap<String, TrackSummary>(libraryTracks.size)
-        for (track in libraryTracks) {
-            byId.putIfAbsent(track.id, track)
+        val byId = tracksById ?: LinkedHashMap<String, TrackSummary>(libraryTracks.size).apply {
+            for (track in libraryTracks) {
+                putIfAbsent(track.id, track)
+            }
         }
         val result = ArrayList<TrackSummary>(libraryTracks.size)
         val seen = HashSet<String>(libraryTracks.size)
@@ -265,13 +267,15 @@ object PlaybackQueueResolver {
         upNextQueue: List<TrackSummary>,
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): Boolean {
         if (upNextQueue.isNotEmpty()) return true
-        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        val ordered = precomputedOrdered ?: orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
         if (ordered.isEmpty()) return currentTrack != null && loopMode == LoopMode.ONE
         val currentId = currentTrack?.id ?: return true
-        val idx = ordered.indexOfFirst { it.id == currentId }
+        val idx = orderedIndexById?.let { it[currentId] ?: -1 } ?: ordered.indexOfFirst { it.id == currentId }
         if (idx < 0) return true
         if (idx + 1 < ordered.size) return true
         return loopMode != LoopMode.OFF
@@ -282,12 +286,14 @@ object PlaybackQueueResolver {
         libraryTracks: List<TrackSummary>,
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): Boolean {
-        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        val ordered = precomputedOrdered ?: orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
         if (ordered.isEmpty()) return currentTrack != null && loopMode == LoopMode.ONE
         val currentId = currentTrack?.id ?: return true
-        val idx = ordered.indexOfFirst { it.id == currentId }
+        val idx = orderedIndexById?.let { it[currentId] ?: -1 } ?: ordered.indexOfFirst { it.id == currentId }
         if (idx < 0) return true
         if (idx > 0) return true
         return loopMode != LoopMode.OFF
@@ -300,7 +306,9 @@ object PlaybackQueueResolver {
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
         loopMode: LoopMode,
-        autoAdvanceAtEnd: Boolean = false
+        autoAdvanceAtEnd: Boolean = false,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): QueueStepResult {
         if (autoAdvanceAtEnd && loopMode == LoopMode.ONE) {
             return QueueStepResult(currentTrack, upNextQueue)
@@ -308,12 +316,14 @@ object PlaybackQueueResolver {
         if (upNextQueue.isNotEmpty()) {
             return QueueStepResult(upNextQueue.first(), upNextQueue.drop(1))
         }
-        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        val ordered = precomputedOrdered ?: orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
         if (ordered.isEmpty()) {
             return QueueStepResult(if (loopMode == LoopMode.ONE) currentTrack else null, upNextQueue)
         }
         val currentId = currentTrack?.id
-        val idx = if (currentId != null) ordered.indexOfFirst { it.id == currentId } else -1
+        val idx = if (currentId != null) {
+            orderedIndexById?.let { it[currentId] ?: -1 } ?: ordered.indexOfFirst { it.id == currentId }
+        } else -1
         if (idx < 0) {
             return QueueStepResult(ordered.firstOrNull(), upNextQueue)
         }
@@ -333,14 +343,18 @@ object PlaybackQueueResolver {
         upNextQueue: List<TrackSummary>,
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): QueueStepResult {
-        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        val ordered = precomputedOrdered ?: orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
         if (ordered.isEmpty()) {
             return QueueStepResult(if (loopMode == LoopMode.ONE) currentTrack else null, upNextQueue)
         }
         val currentId = currentTrack?.id
-        val idx = if (currentId != null) ordered.indexOfFirst { it.id == currentId } else -1
+        val idx = if (currentId != null) {
+            orderedIndexById?.let { it[currentId] ?: -1 } ?: ordered.indexOfFirst { it.id == currentId }
+        } else -1
         if (idx < 0) {
             return QueueStepResult(ordered.lastOrNull() ?: ordered.firstOrNull(), upNextQueue)
         }
@@ -360,7 +374,9 @@ object PlaybackQueueResolver {
         upNextQueue: List<TrackSummary>,
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): TrackSummary? {
         if (loopMode == LoopMode.ONE) return null
         return resolveNext(
@@ -370,7 +386,9 @@ object PlaybackQueueResolver {
             shuffle = shuffle,
             shuffleOrderIds = shuffleOrderIds,
             loopMode = loopMode,
-            autoAdvanceAtEnd = true
+            autoAdvanceAtEnd = true,
+            precomputedOrdered = precomputedOrdered,
+            orderedIndexById = orderedIndexById
         ).track
     }
 
@@ -381,14 +399,16 @@ object PlaybackQueueResolver {
         shuffle: Boolean,
         shuffleOrderIds: List<String>,
         loopMode: LoopMode,
-        limit: Int = 20
+        limit: Int = 20,
+        precomputedOrdered: List<TrackSummary>? = null,
+        orderedIndexById: Map<String, Int>? = null
     ): List<TrackSummary> {
         if (limit <= 0) return emptyList()
         val out = ArrayList<TrackSummary>(minOf(limit, upNextQueue.size + libraryTracks.size))
         out.addAll(upNextQueue.take(limit))
         if (out.size >= limit) return out
 
-        val ordered = orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
+        val ordered = precomputedOrdered ?: orderedBaseTracks(libraryTracks, shuffle, shuffleOrderIds)
         if (ordered.isEmpty()) return out
 
         val seen = out.mapTo(HashSet()) { it.id }
@@ -396,7 +416,7 @@ object PlaybackQueueResolver {
 
         val anchorId = upNextQueue.lastOrNull()?.id ?: currentTrack?.id
         val startIndex = anchorId?.let { id ->
-            val idx = ordered.indexOfFirst { it.id == id }
+            val idx = orderedIndexById?.let { it[id] ?: -1 } ?: ordered.indexOfFirst { it.id == id }
             if (idx >= 0) idx + 1 else 0
         } ?: 0
 

@@ -664,7 +664,7 @@ class Cloud189Client(
     }
 
     private suspend fun signedGetJson(path: String, query: List<Pair<String, String>>): JSONObject {
-        repeat(2) { attempt ->
+        for (attempt in 0 until 2) {
             val (session, requestEpoch) = synchronized(sessionLock) {
                 (activeSession ?: throw CloudTuneException("请先登录天翼云盘")) to sessionEpoch
             }
@@ -719,7 +719,7 @@ class Cloud189Client(
                         }
                     }
                     if (shouldRetry) {
-                        return@repeat
+                        continue
                     }
                 }
                 throw CloudTuneException("天翼云盘会话已失效，请重新登录", isSessionExpired = true)

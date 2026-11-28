@@ -2,5 +2,5 @@
 -renamesourcefileattribute SourceFile
 -keepattributes SourceFile,LineNumberTable
 
--keep class com.gosu.cloudtune.media.PlaybackService { *; }
+-keep class com.gosu.cloudtune.media.PlaybackService { public <init>(); }
 -dontwarn com.google.zxing.**

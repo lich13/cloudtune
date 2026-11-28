@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep pine medallion centered at (54, 54) strictly within 66dp safe zone [21..87] -->
+    <path
+        android:fillColor="#163329"
+        android:pathData="M54,25A29,29 0 1,1 54,83A29,29 0 1,1 54,25Z" />
+    <path
+        android:strokeColor="#58A88F"
+        android:strokeAlpha="0.28"
+        android:strokeWidth="1.5"
+        android:pathData="M54,30A24,24 0 1,1 54,78A24,24 0 1,1 54,30Z" />
+    <!-- Warm cream cloud (#F6F1E8) strictly within [31..69, 41..64] -->
+    <path
+        android:fillColor="#F6F1E8"
+        android:pathData="M39.5,63.5L60.5,63.5C65.2,63.5 68.5,60.4 68.5,56.2C68.5,52.4 65.8,49.4 62.0,49.0C60.7,43.8 56.0,40.2 50.4,40.2C44.3,40.2 39.3,44.7 38.6,50.5C35.2,51.2 33.0,54.0 33.0,57.2C33.0,60.8 35.8,63.5 39.5,63.5Z" />
+    <!-- Crisp mineral pine eighth-note (#58A88F) strictly within [48..73, 34..74] -->
+    <path
+        android:fillColor="#58A88F"
+        android:pathData="M60.0,37.0C60.0,35.3 61.3,34.0 63.0,34.0L70.5,34.0C71.9,34.0 73.0,35.1 73.0,36.5L73.0,42.2C73.0,43.4 72.1,44.4 70.9,44.6L64.2,45.8L64.2,64.8C64.2,69.6 60.3,73.5 55.5,73.5C51.4,73.5 48.0,70.4 48.0,66.5C48.0,62.6 51.4,59.5 55.5,59.5C57.2,59.5 58.8,60.0 60.0,60.9L60.0,37.0Z" />
+    <path
+        android:fillColor="#F6F1E8"
+        android:pathData="M55.5,64.0A2.5,2.5 0 1,1 55.5,69.0A2.5,2.5 0 1,1 55.5,64.0Z" />
+</vector>

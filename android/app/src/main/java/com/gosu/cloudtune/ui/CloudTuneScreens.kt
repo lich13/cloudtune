@@ -25,6 +25,8 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -36,6 +38,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
@@ -54,12 +57,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -74,10 +81,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -88,15 +97,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -124,7 +136,6 @@ import com.gosu.cloudtune.core.TrackSummary
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 
-private val TabularNumStyle = TextStyle(fontFeatureSettings = "tnum")
 private val PhonePrimaryTabs = listOf(ModuleTab.MUSIC, ModuleTab.VIDEO, ModuleTab.CLOUD, ModuleTab.TRANSFERS)
 
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -312,7 +323,9 @@ private fun PineActionButton(
             color = colors.accentForeground,
             fontSize = 13.5.sp,
             fontWeight = FontWeight.SemiBold,
-            maxLines = 1
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
@@ -343,7 +356,30 @@ private fun NeutralOutlineButton(
             color = fg,
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            maxLines = 1
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun UncommittedDraftBadge(label: String = "未保存草稿") {
+    val colors = LocalCloudTuneColors.current
+    Box(
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(colors.accentSoft)
+            .border(0.5.dp, colors.rowActiveBorder, CircleShape)
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+    ) {
+        Text(
+            text = label,
+            color = colors.accent,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -363,7 +399,9 @@ private fun LosslessTag(track: TrackSummary?) {
             color = colors.accent,
             fontSize = 10.sp,
             fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -373,13 +411,15 @@ private fun MineralArtworkCover(
     bitmap: android.graphics.Bitmap?,
     seedText: String,
     size: Dp,
-    cornerRadius: Dp = 12.dp
+    cornerRadius: Dp = 12.dp,
+    isVideo: Boolean = false
 ) {
     val colors = LocalCloudTuneColors.current
     val shape = RoundedCornerShape(cornerRadius)
     if (bitmap != null) {
+        val imageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
         Image(
-            bitmap = bitmap.asImageBitmap(),
+            bitmap = imageBitmap,
             contentDescription = null,
             contentScale = ContentScale.Crop,
             modifier = Modifier
@@ -427,7 +467,7 @@ private fun MineralArtworkCover(
                 )
             }
             Icon(
-                imageVector = AppIcons.Music,
+                imageVector = if (isVideo) AppIcons.Video else AppIcons.Music,
                 contentDescription = null,
                 tint = colors.accent,
                 modifier = Modifier.size(size * 0.36f)
@@ -438,15 +478,18 @@ private fun MineralArtworkCover(
 
 @Composable
 private fun InteractivePlayerSlider(
-    currentTime: Double,
-    duration: Double,
+    currentTimeProvider: () -> Double,
+    durationProvider: () -> Double,
     onScrubStateChanged: (Boolean) -> Unit,
     onSeekCommitted: (Double) -> Unit
 ) {
     val colors = LocalCloudTuneColors.current
+    val currentTime = currentTimeProvider()
+    val duration = durationProvider()
     val safeDuration = duration.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
     var scrubbingValue by remember { mutableStateOf<Float?>(null) }
     val shownSeconds = scrubbingValue?.toDouble() ?: currentTime.coerceIn(0.0, maxOf(0.0, safeDuration))
+    val clockStyle = MaterialTheme.typography.labelSmall.tabularNums()
 
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Slider(
@@ -479,15 +522,19 @@ private fun InteractivePlayerSlider(
         ) {
             Text(
                 CloudTuneFormatters.formatClock(shownSeconds),
-                style = TabularNumStyle,
+                style = clockStyle,
                 color = colors.inkTertiary,
-                fontSize = 11.5.sp
+                fontSize = 11.5.sp,
+                maxLines = 1,
+                softWrap = false
             )
             Text(
                 CloudTuneFormatters.formatClock(safeDuration),
-                style = TabularNumStyle,
+                style = clockStyle,
                 color = colors.inkTertiary,
-                fontSize = 11.5.sp
+                fontSize = 11.5.sp,
+                maxLines = 1,
+                softWrap = false
             )
         }
     }
@@ -538,7 +585,7 @@ private fun LoginStageScreen(runtime: CloudTuneAppRuntime) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            item {
+            item(key = "login-header", contentType = "header") {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -561,15 +608,15 @@ private fun LoginStageScreen(runtime: CloudTuneAppRuntime) {
             }
 
             if (!(runtime.statusMessage ?: runtime.busyLabel).isNullOrBlank()) {
-                item { StatusNoticeBanner(runtime) }
+                item(key = "login-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
             }
 
-            item {
+            item(key = "login-qr-card", contentType = "qr_card") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(18.dp),
                     color = colors.surface,
-                    border = BorderStroke(1.dp, colors.separator)
+                    border = BorderStroke(0.5.dp, colors.separator)
                 ) {
                     Column(
                         modifier = Modifier
@@ -584,15 +631,17 @@ private fun LoginStageScreen(runtime: CloudTuneAppRuntime) {
                                 .size(212.dp)
                                 .clip(RoundedCornerShape(16.dp))
                                 .background(colors.qrSubstrate)
-                                .border(1.dp, colors.separator, RoundedCornerShape(16.dp))
+                                .border(0.5.dp, colors.separator, RoundedCornerShape(16.dp))
                                 .padding(12.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             val bmp = runtime.qrBitmap
                             if (bmp != null) {
+                                val qrImageBitmap = remember(bmp) { bmp.asImageBitmap() }
                                 Image(
-                                    bitmap = bmp.asImageBitmap(),
+                                    bitmap = qrImageBitmap,
                                     contentDescription = "天翼云盘二维码",
+                                    filterQuality = FilterQuality.None,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             } else {
@@ -698,7 +747,9 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                             color = colors.inkPrimary,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold,
-                            maxLines = 1
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis
                         )
                         val sub = when (runtime.activeModule) {
                             ModuleTab.MUSIC -> "${runtime.committedSettings.musicFolder?.name ?: "未设曲库"} · ${runtime.tracks.size} 首"
@@ -709,7 +760,7 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                         }
                         Text(
                             text = sub,
-                            style = TabularNumStyle,
+                            style = MaterialTheme.typography.bodySmall.tabularNums(),
                             color = colors.inkTertiary,
                             fontSize = 11.5.sp,
                             maxLines = 1,
@@ -726,7 +777,7 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                         }
                     }
                 }
-                HorizontalDivider(color = colors.separator)
+                HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
             }
         },
         bottomBar = {
@@ -744,7 +795,7 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                     runtime = runtime,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                 )
-                HorizontalDivider(color = colors.separator)
+                HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
                 NavigationBar(
                     containerColor = colors.surface,
                     tonalElevation = 0.dp,
@@ -762,7 +813,15 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                             selected = runtime.activeModule == tab,
                             onClick = { runtime.activeModule = tab },
                             icon = { Icon(icon, contentDescription = tab.title) },
-                            label = { Text(tab.title, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold) },
+                            label = {
+                                Text(
+                                    tab.title,
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            },
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = colors.accent,
                                 selectedTextColor = colors.accent,
@@ -797,10 +856,11 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
 @Composable
 private fun TabletWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
-    val railInsets = WindowInsets.systemBars.union(WindowInsets.displayCutout)
-        .only(WindowInsetsSides.Vertical + WindowInsetsSides.Start)
-    val contentInsets = WindowInsets.systemBars.union(WindowInsets.displayCutout)
-        .only(WindowInsetsSides.Vertical + WindowInsetsSides.End)
+    val safeInsets = WindowInsets.systemBars.union(WindowInsets.displayCutout)
+    val railInsets = safeInsets.only(WindowInsetsSides.Vertical + WindowInsetsSides.Start)
+    val topInsets = safeInsets.only(WindowInsetsSides.Top)
+    val centerBottomInsets = safeInsets.only(WindowInsetsSides.Bottom)
+    val rightPaneInsets = safeInsets.only(WindowInsetsSides.Vertical + WindowInsetsSides.End)
 
     Row(modifier = Modifier.fillMaxSize()) {
         NavigationRail(
@@ -820,14 +880,22 @@ private fun TabletWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                     selected = runtime.activeModule == tab,
                     onClick = { runtime.activeModule = tab },
                     icon = { Icon(icon, contentDescription = tab.title) },
-                    label = { Text(tab.title, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold) }
+                    label = {
+                        Text(
+                            tab.title,
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 )
             }
         }
 
         Box(
             modifier = Modifier
-                .width(1.dp)
+                .width(0.5.dp)
                 .fillMaxHeight()
                 .background(colors.separator)
         )
@@ -836,7 +904,6 @@ private fun TabletWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight()
-                .windowInsetsPadding(contentInsets)
                 .imePadding()
         ) {
             Column(
@@ -844,36 +911,53 @@ private fun TabletWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                     .weight(0.62f)
                     .fillMaxHeight()
             ) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(colors.surface)
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .windowInsetsPadding(topInsets)
                 ) {
-                    Text(
-                        text = runtime.activeModule.title,
-                        color = colors.inkPrimary,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text(
-                        text = "${runtime.accountName ?: ""} · 缓存 ${CloudTuneFormatters.formatBytes(runtime.cacheUsageBytes)}",
-                        style = TabularNumStyle,
-                        color = colors.inkTertiary,
-                        fontSize = 12.sp
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = runtime.activeModule.title,
+                            color = colors.inkPrimary,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "${runtime.accountName ?: ""} · 缓存 ${CloudTuneFormatters.formatBytes(runtime.cacheUsageBytes)}",
+                            style = MaterialTheme.typography.bodySmall.tabularNums(),
+                            color = colors.inkTertiary,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
                 }
-                HorizontalDivider(color = colors.separator)
-                Box(modifier = Modifier.weight(1f)) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .windowInsetsPadding(centerBottomInsets)
+                ) {
                     ActiveModuleContent(runtime)
                 }
             }
 
             Box(
                 modifier = Modifier
-                    .width(1.dp)
+                    .width(0.5.dp)
                     .fillMaxHeight()
                     .background(colors.separator)
             )
@@ -884,6 +968,7 @@ private fun TabletWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                     .weight(0.38f)
                     .fillMaxHeight()
                     .background(colors.surface)
+                    .windowInsetsPadding(rightPaneInsets)
             )
         }
     }
@@ -905,13 +990,12 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
     val colors = LocalCloudTuneColors.current
     val track = runtime.currentTrack
     val title = runtime.nowPlayingTitle ?: track?.name ?: "选择曲目开始播放"
-    val subtitle = runtime.nowPlayingArtist
-        ?: runtime.nowPlayingAlbum
-        ?: track?.folderPath
-        ?: "${CloudTuneFormatters.formatClock(runtime.currentTime)} / ${CloudTuneFormatters.formatClock(runtime.duration)}"
-    val pct = if (runtime.duration > 0.0) {
-        (runtime.currentTime / runtime.duration).coerceIn(0.0, 1.0).toFloat()
-    } else 0f
+    val subtitle = runtime.nowPlayingArtist?.takeIf { it.isNotBlank() }
+        ?: runtime.nowPlayingAlbum?.takeIf { it.isNotBlank() }
+        ?: track?.folderPath?.takeIf { it.isNotBlank() }
+        ?: if (track != null) "正在播放" else "轻触曲目即可开始播放"
+    val canPlayPause = !(runtime.currentTrack == null && runtime.upNextQueue.isEmpty() && runtime.tracks.isEmpty())
+    val hasDuration by remember(runtime) { derivedStateOf { runtime.duration > 0.0 } }
 
     Surface(
         modifier = modifier
@@ -919,7 +1003,7 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
             .clickable { runtime.isShowingNowPlayingSheet = true },
         shape = RoundedCornerShape(14.dp),
         color = colors.surfaceElevated,
-        border = BorderStroke(1.dp, colors.separator)
+        border = BorderStroke(0.5.dp, colors.separator)
     ) {
         Column {
             Row(
@@ -953,7 +1037,7 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
                     }
                     Text(
                         text = subtitle,
-                        style = TabularNumStyle,
+                        style = MaterialTheme.typography.bodySmall.tabularNums(),
                         color = colors.inkTertiary,
                         fontSize = 11.5.sp,
                         maxLines = 1,
@@ -963,19 +1047,20 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
 
                 IconButton(
                     onClick = { runtime.togglePlayback() },
+                    enabled = canPlayPause,
                     modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
                 ) {
                     Box(
                         modifier = Modifier
                             .size(36.dp)
                             .clip(CircleShape)
-                            .background(colors.accent),
+                            .background(if (canPlayPause) colors.accent else colors.accent.copy(alpha = 0.4f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             if (runtime.isPlaying) AppIcons.Pause else AppIcons.Play,
                             contentDescription = if (runtime.isPlaying) "暂停" else "播放",
-                            tint = colors.accentForeground,
+                            tint = if (canPlayPause) colors.accentForeground else colors.accentForeground.copy(alpha = 0.7f),
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -994,9 +1079,12 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
                     )
                 }
             }
-            if (runtime.duration > 0.0) {
+            if (hasDuration) {
                 LinearProgressIndicator(
-                    progress = { pct },
+                    progress = {
+                        val dur = runtime.duration
+                        if (dur > 0.0) (runtime.currentTime / dur).coerceIn(0.0, 1.0).toFloat() else 0f
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(2.dp),
@@ -1028,6 +1116,7 @@ private fun NowPlayingFullSheetContent(
     } else {
         Modifier.fillMaxSize()
     }
+    val canPlayPause = runtime.canTogglePlayback
 
     LazyColumn(
         modifier = listModifier,
@@ -1035,7 +1124,7 @@ private fun NowPlayingFullSheetContent(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        item {
+        item(key = "np-top-bar", contentType = "top_bar") {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -1052,6 +1141,8 @@ private fun NowPlayingFullSheetContent(
                     fontSize = 13.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    softWrap = false,
                     modifier = Modifier.weight(1f)
                 )
                 IconButton(
@@ -1063,7 +1154,7 @@ private fun NowPlayingFullSheetContent(
             }
         }
 
-        item {
+        item(key = "np-artwork", contentType = "artwork") {
             MineralArtworkCover(
                 bitmap = runtime.nowPlayingArtwork,
                 seedText = title,
@@ -1072,7 +1163,7 @@ private fun NowPlayingFullSheetContent(
             )
         }
 
-        item {
+        item(key = "np-meta", contentType = "metadata") {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -1103,16 +1194,21 @@ private fun NowPlayingFullSheetContent(
             }
         }
 
-        item {
+        item(key = "np-slider", contentType = "slider") {
             InteractivePlayerSlider(
-                currentTime = runtime.currentTime,
-                duration = runtime.duration,
+                currentTimeProvider = { runtime.currentTime },
+                durationProvider = { runtime.duration },
                 onScrubStateChanged = { runtime.isUserScrubbing = it },
                 onSeekCommitted = { runtime.seekTo(it) }
             )
         }
 
-        item {
+        item(key = "np-controls", contentType = "controls") {
+            val loopContentDesc = when (runtime.loopMode) {
+                LoopMode.OFF -> "不循环"
+                LoopMode.ALL -> "列表循环"
+                LoopMode.ONE -> "单曲循环"
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
@@ -1144,8 +1240,8 @@ private fun NowPlayingFullSheetContent(
                     modifier = Modifier
                         .size(60.dp)
                         .clip(CircleShape)
-                        .background(colors.accent)
-                        .clickable { runtime.togglePlayback() },
+                        .background(if (canPlayPause) colors.accent else colors.accent.copy(alpha = 0.4f))
+                        .clickable(enabled = canPlayPause) { runtime.togglePlayback() },
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
@@ -1167,41 +1263,51 @@ private fun NowPlayingFullSheetContent(
                         modifier = Modifier.size(28.dp)
                     )
                 }
-                val loopLabel = when (runtime.loopMode) {
-                    LoopMode.OFF -> "不循环"
-                    LoopMode.ALL -> "列表"
-                    LoopMode.ONE -> "单曲"
+                IconButton(
+                    onClick = { runtime.cycleLoopMode() },
+                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                ) {
+                    Icon(
+                        imageVector = if (runtime.loopMode == LoopMode.ONE) AppIcons.RepeatOne else AppIcons.Repeat,
+                        contentDescription = loopContentDesc,
+                        tint = if (runtime.loopMode != LoopMode.OFF) colors.accent else colors.inkTertiary
+                    )
                 }
-                NeutralOutlineButton(
-                    text = loopLabel,
-                    isActive = runtime.loopMode != LoopMode.OFF,
-                    onClick = { runtime.cycleLoopMode() }
-                )
             }
         }
 
-        item {
+        item(key = "np-queue-divider", contentType = "divider") {
+            HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
+        }
+
+        item(key = "np-queue-header", contentType = "section_header") {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     "待播队列 (${runtime.upcomingTracks.size})",
-                    style = TabularNumStyle,
+                    style = MaterialTheme.typography.titleSmall.tabularNums(),
                     color = colors.inkPrimary,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false,
                     modifier = Modifier.weight(1f)
                 )
                 if (runtime.upNextQueue.isNotEmpty()) {
                     TextButton(onClick = { runtime.clearUpNextQueue() }) {
-                        Text("清空插播", color = colors.accent, fontSize = 12.5.sp)
+                        Text("清空插播", color = colors.accent, fontSize = 12.5.sp, maxLines = 1, softWrap = false)
                     }
                 }
             }
         }
 
-        items(runtime.upcomingTracks, key = { "sheet-q-${it.id}" }) { upcoming ->
+        items(
+            items = runtime.upcomingTracks,
+            key = { "sheet-q-${it.id}" },
+            contentType = { "track_row" }
+        ) { upcoming ->
             val isManualUpNext = runtime.upNextQueue.any { it.id == upcoming.id }
             TrackListRow(
                 track = upcoming,
@@ -1228,6 +1334,7 @@ private fun TabletNowPlayingQueuePane(
         runtime.nowPlayingArtist?.takeIf { it.isNotBlank() },
         (runtime.nowPlayingAlbum ?: track?.folderPath)?.takeIf { it.isNotBlank() }
     ).joinToString(" · ").ifBlank { "选择左侧曲目即可播放" }
+    val canPlayPause = runtime.canTogglePlayback
 
     Column(
         modifier = modifier.padding(16.dp),
@@ -1285,12 +1392,17 @@ private fun TabletNowPlayingQueuePane(
         }
 
         InteractivePlayerSlider(
-            currentTime = runtime.currentTime,
-            duration = runtime.duration,
+            currentTimeProvider = { runtime.currentTime },
+            durationProvider = { runtime.duration },
             onScrubStateChanged = { runtime.isUserScrubbing = it },
             onSeekCommitted = { runtime.seekTo(it) }
         )
 
+        val loopDesc = when (runtime.loopMode) {
+            LoopMode.OFF -> "不循环"
+            LoopMode.ALL -> "列表循环"
+            LoopMode.ONE -> "单曲循环"
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1321,8 +1433,8 @@ private fun TabletNowPlayingQueuePane(
                 modifier = Modifier
                     .size(48.dp)
                     .clip(CircleShape)
-                    .background(colors.accent)
-                    .clickable { runtime.togglePlayback() },
+                    .background(if (canPlayPause) colors.accent else colors.accent.copy(alpha = 0.4f))
+                    .clickable(enabled = canPlayPause) { runtime.togglePlayback() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
@@ -1343,19 +1455,19 @@ private fun TabletNowPlayingQueuePane(
                     tint = if (runtime.canSkipNext) colors.inkPrimary else colors.inkTertiary.copy(alpha = 0.4f)
                 )
             }
-            val loopText = when (runtime.loopMode) {
-                LoopMode.OFF -> "不循环"
-                LoopMode.ALL -> "列表"
-                LoopMode.ONE -> "单曲"
+            IconButton(
+                onClick = { runtime.cycleLoopMode() },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            ) {
+                Icon(
+                    imageVector = if (runtime.loopMode == LoopMode.ONE) AppIcons.RepeatOne else AppIcons.Repeat,
+                    contentDescription = loopDesc,
+                    tint = if (runtime.loopMode != LoopMode.OFF) colors.accent else colors.inkTertiary
+                )
             }
-            NeutralOutlineButton(
-                text = loopText,
-                isActive = runtime.loopMode != LoopMode.OFF,
-                onClick = { runtime.cycleLoopMode() }
-            )
         }
 
-        HorizontalDivider(color = colors.separator)
+        HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1363,15 +1475,17 @@ private fun TabletNowPlayingQueuePane(
         ) {
             Text(
                 "待播队列 (${runtime.upcomingTracks.size})",
-                style = TabularNumStyle,
+                style = MaterialTheme.typography.titleSmall.tabularNums(),
                 color = colors.inkPrimary,
                 fontSize = 13.5.sp,
                 fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false,
                 modifier = Modifier.weight(1f)
             )
             if (runtime.upNextQueue.isNotEmpty()) {
                 TextButton(onClick = { runtime.clearUpNextQueue() }) {
-                    Text("清空插播", color = colors.accent, fontSize = 12.sp)
+                    Text("清空插播", color = colors.accent, fontSize = 12.sp, maxLines = 1, softWrap = false)
                 }
             }
         }
@@ -1380,7 +1494,11 @@ private fun TabletNowPlayingQueuePane(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(runtime.upcomingTracks, key = { "tab-q-${it.id}" }) { upcoming ->
+            items(
+                items = runtime.upcomingTracks,
+                key = { "tab-q-${it.id}" },
+                contentType = { "track_row" }
+            ) { upcoming ->
                 val isManual = runtime.upNextQueue.any { it.id == upcoming.id }
                 TrackListRow(
                     track = upcoming,
@@ -1395,6 +1513,7 @@ private fun TabletNowPlayingQueuePane(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
@@ -1419,10 +1538,10 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (!(runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage).isNullOrBlank()) {
-            item { StatusNoticeBanner(runtime) }
+            item(key = "music-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
         }
 
-        item {
+        item(key = "music-search", contentType = "search_bar") {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1432,7 +1551,7 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
                     value = runtime.searchQuery,
                     onValueChange = { runtime.searchQuery = it },
                     leadingIcon = { Icon(AppIcons.Search, contentDescription = null, tint = colors.inkTertiary) },
-                    placeholder = { Text("搜索曲目或专辑目录", fontSize = 13.sp) },
+                    placeholder = { Text("搜索曲目或专辑目录", fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.weight(1f)
@@ -1444,11 +1563,11 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
             }
         }
 
-        item {
-            Row(
+        item(key = "music-actions", contentType = "action_bar") {
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 NeutralOutlineButton(
                     text = "随机播放",
@@ -1465,7 +1584,6 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
                     isActive = runtime.loopMode != LoopMode.OFF,
                     onClick = { runtime.cycleLoopMode() }
                 )
-                Spacer(Modifier.weight(1f))
                 NeutralOutlineButton(
                     text = "选择目录",
                     onClick = { runtime.activeModule = ModuleTab.CLOUD }
@@ -1474,12 +1592,12 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
         }
 
         if (runtime.visibleTracks.isEmpty()) {
-            item {
+            item(key = "music-empty", contentType = "empty_state") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
                     color = colors.surface,
-                    border = BorderStroke(1.dp, colors.separator)
+                    border = BorderStroke(0.5.dp, colors.separator)
                 ) {
                     Column(
                         modifier = Modifier.padding(20.dp),
@@ -1491,7 +1609,11 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
                 }
             }
         } else {
-            items(runtime.visibleTracks, key = { it.id }) { track ->
+            items(
+                items = runtime.visibleTracks,
+                key = { it.id },
+                contentType = { "track_row" }
+            ) { track ->
                 TrackListRow(
                     track = track,
                     isActive = track.id == runtime.currentTrackId,
@@ -1553,6 +1675,16 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
         }
     }
 
+    val requestFileDownload: (TrackSummary) -> Unit = { target ->
+        if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
+            pendingFolderPane = null
+            pendingFile = target
+            safLauncher.launch(null)
+        } else {
+            runtime.enqueueDownload(context, target)
+        }
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1564,10 +1696,10 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (!(runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage).isNullOrBlank()) {
-            item { StatusNoticeBanner(runtime) }
+            item(key = "cloud-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
         }
 
-        item {
+        item(key = "cloud-breadcrumbs", contentType = "breadcrumbs") {
             BreadcrumbAndFolderActionsBar(
                 breadcrumbs = pane.breadcrumbs,
                 onNavigateCrumb = { idx, crumb ->
@@ -1593,7 +1725,11 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
 
         val folders = payload?.folders.orEmpty()
         if (folders.isNotEmpty()) {
-            items(folders, key = { "cloud-dir-${it.id}" }) { folder ->
+            items(
+                items = folders,
+                key = { "cloud-dir-${it.id}" },
+                contentType = { "folder_row" }
+            ) { folder ->
                 FolderListRow(
                     name = folder.name,
                     onClick = {
@@ -1609,17 +1745,21 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
 
         val audioFiles = payload?.audioFiles.orEmpty()
         if (audioFiles.isNotEmpty()) {
-            item {
+            item(key = "cloud-audio-header", contentType = "section_header") {
                 Text(
                     "目录音频 (${audioFiles.size})",
-                    style = TabularNumStyle,
+                    style = MaterialTheme.typography.labelLarge.tabularNums(),
                     color = colors.inkSecondary,
                     fontSize = 12.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(top = 4.dp)
                 )
             }
-            items(audioFiles, key = { "cloud-aud-${it.id}" }) { track ->
+            items(
+                items = audioFiles,
+                key = { "cloud-aud-${it.id}" },
+                contentType = { "track_row" }
+            ) { track ->
                 TrackListRow(
                     track = track,
                     isActive = track.id == runtime.currentTrackId,
@@ -1627,51 +1767,48 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
                     onPlay = { runtime.playTrack(track) },
                     onPlayNext = { runtime.playNext(track) },
                     playNextActionTitle = "下一首",
-                    onDownload = {
-                        if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
-                            pendingFolderPane = null
-                            pendingFile = track
-                            safLauncher.launch(null)
-                        } else {
-                            runtime.enqueueDownload(context, track)
-                        }
-                    }
+                    onDownload = { requestFileDownload(track) }
                 )
             }
         }
 
         val nonAudio = payload?.let { it.videoFiles + it.otherFiles }.orEmpty()
         if (nonAudio.isNotEmpty()) {
-            item {
+            item(key = "cloud-other-header", contentType = "section_header") {
                 Text(
                     "视频与附件 (${nonAudio.size})",
-                    style = TabularNumStyle,
+                    style = MaterialTheme.typography.labelLarge.tabularNums(),
                     color = colors.inkSecondary,
                     fontSize = 12.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(top = 4.dp)
                 )
             }
-            items(nonAudio, key = { "cloud-other-${it.id}" }) { file ->
+            items(
+                items = nonAudio,
+                key = { "cloud-other-${it.id}" },
+                contentType = { "track_row" }
+            ) { file ->
+                val isVideo = Cloud189Protocol.isVideoFile(file.name)
                 TrackListRow(
                     track = file,
-                    isActive = false,
-                    trailingLabel = "导出",
+                    isActive = isVideo && runtime.activeVideoTrack?.id == file.id,
+                    trailingLabel = if (isVideo) "播放" else "导出",
                     onPlay = {
-                        if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
-                            pendingFolderPane = null
-                            pendingFile = file
-                            safLauncher.launch(null)
+                        if (isVideo) {
+                            runtime.openVideoInApp(file)
                         } else {
-                            runtime.enqueueDownload(context, file)
+                            requestFileDownload(file)
                         }
-                    }
+                    },
+                    onDownload = { requestFileDownload(file) }
                 )
             }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
@@ -1706,10 +1843,10 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (!(runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage).isNullOrBlank()) {
-            item { StatusNoticeBanner(runtime) }
+            item(key = "video-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
         }
 
-        item {
+        item(key = "video-breadcrumbs", contentType = "breadcrumbs") {
             BreadcrumbAndFolderActionsBar(
                 breadcrumbs = pane.breadcrumbs,
                 onNavigateCrumb = { idx, crumb ->
@@ -1721,7 +1858,11 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
             )
         }
 
-        items(folders, key = { "vid-dir-${it.id}" }) { folder ->
+        items(
+            items = folders,
+            key = { "vid-dir-${it.id}" },
+            contentType = { "folder_row" }
+        ) { folder ->
             FolderListRow(
                 name = folder.name,
                 onClick = {
@@ -1734,10 +1875,10 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
             )
         }
 
-        item {
+        item(key = "video-header", contentType = "section_header") {
             Text(
                 "当前目录视频 (${videos.size})",
-                style = TabularNumStyle,
+                style = MaterialTheme.typography.labelLarge.tabularNums(),
                 color = colors.inkSecondary,
                 fontSize = 12.5.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -1746,7 +1887,7 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
         }
 
         if (videos.isEmpty()) {
-            item {
+            item(key = "video-empty", contentType = "empty_state") {
                 Text(
                     "当前目录暂无视频文件，可进入子文件夹查找。",
                     color = colors.inkTertiary,
@@ -1755,12 +1896,16 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
                 )
             }
         } else {
-            items(videos, key = { "vid-item-${it.id}" }) { video ->
+            items(
+                items = videos,
+                key = { "vid-item-${it.id}" },
+                contentType = { "video_card" }
+            ) { video ->
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
                     color = colors.surface,
-                    border = BorderStroke(1.dp, colors.separator)
+                    border = BorderStroke(0.5.dp, colors.separator)
                 ) {
                     Column(
                         modifier = Modifier.padding(14.dp),
@@ -1776,13 +1921,17 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
                         )
                         Text(
                             text = "${video.folderPath} · ${CloudTuneFormatters.formatBytes(video.sizeBytes)}",
-                            style = TabularNumStyle,
+                            style = MaterialTheme.typography.bodySmall.tabularNums(),
                             color = colors.inkTertiary,
                             fontSize = 12.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             PineActionButton(
                                 text = "应用内播放",
                                 modifier = Modifier.weight(1f),
@@ -1801,6 +1950,7 @@ private fun VideoWorkspaceContent(runtime: CloudTuneAppRuntime) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
@@ -1818,15 +1968,15 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (!(runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage).isNullOrBlank()) {
-            item { StatusNoticeBanner(runtime) }
+            item(key = "transfers-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
         }
 
-        item {
+        item(key = "transfers-summary", contentType = "summary_card") {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
                 color = colors.surface,
-                border = BorderStroke(1.dp, colors.separator)
+                border = BorderStroke(0.5.dp, colors.separator)
             ) {
                 Row(
                     modifier = Modifier
@@ -1838,10 +1988,13 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             "总速率 ${CloudTuneFormatters.formatBytes(runtime.transferSnapshot.totalSpeedBytesPerSecond)}/s",
-                            style = TabularNumStyle,
+                            style = MaterialTheme.typography.titleSmall.tabularNums(),
                             color = colors.inkPrimary,
                             fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false,
+                            modifier = Modifier.widthIn(min = 44.dp)
                         )
                         Text(
                             "导出目录：${runtime.committedSettings.exportFolderDisplayName ?: "尚未授权"}",
@@ -1861,7 +2014,7 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
 
         val allItems = runtime.transferSnapshot.items
         if (allItems.isEmpty()) {
-            item {
+            item(key = "transfers-empty", contentType = "empty_state") {
                 Text(
                     "暂无传输任务。可在「曲库」或「云盘」中将文件加入导出队列。",
                     color = colors.inkTertiary,
@@ -1870,13 +2023,20 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                 )
             }
         } else {
-            items(allItems, key = { it.id }) { item ->
+            items(
+                items = allItems,
+                key = { it.id },
+                contentType = { "transfer_card" }
+            ) { item ->
                 val pct = CloudTuneFormatters.formatPercent(item.transferredBytes, item.totalBytes)
+                val pctLabel = pct?.let {
+                    if (it >= 99.95) "100%" else String.format(Locale.US, "%.1f%%", it)
+                }
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
                     color = colors.surface,
-                    border = BorderStroke(1.dp, colors.separator)
+                    border = BorderStroke(0.5.dp, colors.separator)
                 ) {
                     Column(
                         modifier = Modifier.padding(14.dp),
@@ -1897,9 +2057,13 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                             )
                             Text(
                                 text = "${CloudTuneFormatters.formatBytes(item.bytesPerSecond)}/s",
-                                style = TabularNumStyle,
+                                style = MaterialTheme.typography.labelMedium.tabularNums(),
                                 color = colors.inkSecondary,
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                softWrap = false,
+                                textAlign = TextAlign.End,
+                                modifier = Modifier.widthIn(min = 44.dp)
                             )
                         }
 
@@ -1928,22 +2092,43 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                             val pathSuffix = item.path?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
                             val baseMeta = "$kindTag · ${item.localizedStateLabel}$pathSuffix"
                             Text(
-                                text = pct?.let { "$baseMeta · ${String.format(Locale.US, "%.1f%%", it)}" } ?: baseMeta,
-                                style = TabularNumStyle,
+                                text = baseMeta,
+                                style = MaterialTheme.typography.bodySmall.tabularNums(),
                                 color = colors.inkTertiary,
                                 fontSize = 12.sp,
                                 modifier = Modifier.weight(1f),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            if (item.canPause) {
-                                NeutralOutlineButton("暂停") { runtime.pauseTransfer(item.id) }
+                            if (pctLabel != null) {
+                                Text(
+                                    text = pctLabel,
+                                    style = MaterialTheme.typography.labelMedium.tabularNums(),
+                                    color = colors.inkSecondary,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    textAlign = TextAlign.End,
+                                    modifier = Modifier.widthIn(min = 44.dp)
+                                )
                             }
-                            if (item.canResume) {
-                                NeutralOutlineButton("继续") { runtime.resumeTransfer(context, item.id) }
-                            }
-                            if (item.canDelete) {
-                                NeutralOutlineButton("移除") { runtime.deleteTransfer(item.id) }
+                        }
+
+                        if (item.canPause || item.canResume || item.canDelete) {
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (item.canPause) {
+                                    NeutralOutlineButton("暂停") { runtime.pauseTransfer(item.id) }
+                                }
+                                if (item.canResume) {
+                                    NeutralOutlineButton("继续") { runtime.resumeTransfer(context, item.id) }
+                                }
+                                if (item.canDelete) {
+                                    NeutralOutlineButton("移除") { runtime.deleteTransfer(item.id) }
+                                }
                             }
                         }
                     }
@@ -1953,9 +2138,19 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
+    val focusManager = LocalFocusManager.current
+    val isCompactScreen = LocalConfiguration.current.screenWidthDp < 390
+    val numericKeyboardOptions = remember {
+        KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done)
+    }
+    val numericKeyboardActions = remember(focusManager) {
+        KeyboardActions(onDone = { focusManager.clearFocus() })
+    }
+    val numericInputStyle = LocalTextStyle.current.tabularNums()
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1963,22 +2158,26 @@ private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         if (!(runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage).isNullOrBlank()) {
-            item { StatusNoticeBanner(runtime) }
+            item(key = "settings-banner", contentType = "banner") { StatusNoticeBanner(runtime) }
         }
 
-        item {
+        item(key = "settings-appearance", contentType = "settings_card") {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
                 color = colors.surface,
-                border = BorderStroke(1.dp, colors.separator)
+                border = BorderStroke(0.5.dp, colors.separator)
             ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text("外观与主题", color = colors.inkPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         AppearanceMode.entries.forEach { mode ->
                             NeutralOutlineButton(
                                 text = mode.title,
@@ -1990,7 +2189,8 @@ private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Material You 壁纸动态取色", color = colors.inkPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
@@ -2005,25 +2205,48 @@ private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
             }
         }
 
-        item {
+        item(key = "settings-playback-cache", contentType = "settings_card") {
+            val cacheDraftDirty = runtime.hasUncommittedCacheDraft
+            val threadsDraftDirty = runtime.hasUncommittedThreadDrafts
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
                 color = colors.surface,
-                border = BorderStroke(1.dp, colors.separator)
+                border = BorderStroke(0.5.dp, if (cacheDraftDirty || threadsDraftDirty) colors.rowActiveBorder else colors.separator)
             ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text("播放与缓存配额", color = colors.inkPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            "播放与缓存配额",
+                            color = colors.inkPrimary,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (cacheDraftDirty) {
+                            UncommittedDraftBadge("缓存上限未保存")
+                        }
+                        if (threadsDraftDirty) {
+                            UncommittedDraftBadge("分片参数未保存")
+                        }
+                    }
                     Text(
                         "当前缓存占用：${CloudTuneFormatters.formatBytes(runtime.cacheUsageBytes)} / ${runtime.committedSettings.cacheLimitMb} MB",
-                        style = TabularNumStyle,
+                        style = MaterialTheme.typography.bodyMedium.tabularNums(),
                         color = colors.inkSecondary,
                         fontSize = 13.sp
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         NeutralOutlineButton(
                             text = "优先缓存",
                             isActive = runtime.committedSettings.playbackMode == PlaybackMode.DOWNLOAD_FIRST,
@@ -2044,45 +2267,118 @@ private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
                         OutlinedTextField(
                             value = runtime.cacheLimitDraft,
                             onValueChange = { runtime.cacheLimitDraft = it; runtime.noteDraftEdited() },
-                            label = { Text("缓存上限 (MB)") },
+                            label = { Text("缓存上限 (MB)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
                             singleLine = true,
-                            textStyle = TabularNumStyle,
+                            textStyle = numericInputStyle,
+                            keyboardOptions = numericKeyboardOptions,
+                            keyboardActions = numericKeyboardActions,
                             modifier = Modifier.weight(1f)
                         )
-                        NeutralOutlineButton("应用") { runtime.commitCacheLimitDraft() }
+                        if (cacheDraftDirty) {
+                            PineActionButton("应用") {
+                                focusManager.clearFocus()
+                                runtime.commitCacheLimitDraft()
+                            }
+                        } else {
+                            NeutralOutlineButton("应用") {
+                                focusManager.clearFocus()
+                                runtime.commitCacheLimitDraft()
+                            }
+                        }
                     }
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedTextField(
-                            value = runtime.downloadThreadsDraft,
-                            onValueChange = { runtime.downloadThreadsDraft = it; runtime.noteDraftEdited() },
-                            label = { Text("下载分片") },
-                            singleLine = true,
-                            textStyle = TabularNumStyle,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = runtime.cacheThreadsDraft,
-                            onValueChange = { runtime.cacheThreadsDraft = it; runtime.noteDraftEdited() },
-                            label = { Text("预取分片") },
-                            singleLine = true,
-                            textStyle = TabularNumStyle,
-                            modifier = Modifier.weight(1f)
-                        )
-                        NeutralOutlineButton("应用") { runtime.commitTransferThreadsDraft() }
+                    if (isCompactScreen) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedTextField(
+                                    value = runtime.downloadThreadsDraft,
+                                    onValueChange = { runtime.downloadThreadsDraft = it; runtime.noteDraftEdited() },
+                                    label = { Text("下载分片", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                                    singleLine = true,
+                                    textStyle = numericInputStyle,
+                                    keyboardOptions = numericKeyboardOptions,
+                                    keyboardActions = numericKeyboardActions,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                OutlinedTextField(
+                                    value = runtime.cacheThreadsDraft,
+                                    onValueChange = { runtime.cacheThreadsDraft = it; runtime.noteDraftEdited() },
+                                    label = { Text("预取分片", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                                    singleLine = true,
+                                    textStyle = numericInputStyle,
+                                    keyboardOptions = numericKeyboardOptions,
+                                    keyboardActions = numericKeyboardActions,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            if (threadsDraftDirty) {
+                                PineActionButton(
+                                    text = "应用分片参数",
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    focusManager.clearFocus()
+                                    runtime.commitTransferThreadsDraft()
+                                }
+                            } else {
+                                NeutralOutlineButton(
+                                    text = "应用分片参数",
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    focusManager.clearFocus()
+                                    runtime.commitTransferThreadsDraft()
+                                }
+                            }
+                        }
+                    } else {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = runtime.downloadThreadsDraft,
+                                onValueChange = { runtime.downloadThreadsDraft = it; runtime.noteDraftEdited() },
+                                label = { Text("下载分片", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                                singleLine = true,
+                                textStyle = numericInputStyle,
+                                keyboardOptions = numericKeyboardOptions,
+                                keyboardActions = numericKeyboardActions,
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = runtime.cacheThreadsDraft,
+                                onValueChange = { runtime.cacheThreadsDraft = it; runtime.noteDraftEdited() },
+                                label = { Text("预取分片", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                                singleLine = true,
+                                textStyle = numericInputStyle,
+                                keyboardOptions = numericKeyboardOptions,
+                                keyboardActions = numericKeyboardActions,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (threadsDraftDirty) {
+                                PineActionButton("应用") {
+                                    focusManager.clearFocus()
+                                    runtime.commitTransferThreadsDraft()
+                                }
+                            } else {
+                                NeutralOutlineButton("应用") {
+                                    focusManager.clearFocus()
+                                    runtime.commitTransferThreadsDraft()
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        item {
+        item(key = "settings-account", contentType = "settings_card") {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
                 color = colors.surface,
-                border = BorderStroke(1.dp, colors.separator)
+                border = BorderStroke(0.5.dp, colors.separator)
             ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
@@ -2102,6 +2398,7 @@ private fun SettingsWorkspaceContent(runtime: CloudTuneAppRuntime) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BreadcrumbAndFolderActionsBar(
     breadcrumbs: List<BreadcrumbItem>,
@@ -2117,41 +2414,56 @@ private fun BreadcrumbAndFolderActionsBar(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
         color = colors.surface,
-        border = BorderStroke(1.dp, colors.separator)
+        border = BorderStroke(0.5.dp, colors.separator)
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                itemsIndexed(breadcrumbs) { idx, crumb ->
+                itemsIndexed(
+                    items = breadcrumbs,
+                    key = { idx, crumb -> "crumb-$idx-${crumb.id ?: "root"}" },
+                    contentType = { _, _ -> "breadcrumb_chip" }
+                ) { idx, crumb ->
                     val isCurrent = idx == breadcrumbs.lastIndex
                     Box(
                         modifier = Modifier
-                            .sizeIn(minHeight = 36.dp)
+                            .heightIn(min = 48.dp)
+                            .minimumInteractiveComponentSize()
                             .clip(CircleShape)
-                            .background(if (isCurrent) colors.accentSoft else colors.surfaceSecondary)
                             .clickable(enabled = !isCurrent) { onNavigateCrumb(idx, crumb) }
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                            .padding(vertical = 6.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = crumb.name,
-                            color = if (isCurrent) colors.accent else colors.inkPrimary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1
-                        )
+                        Box(
+                            modifier = Modifier
+                                .heightIn(min = 36.dp)
+                                .clip(CircleShape)
+                                .background(if (isCurrent) colors.accentSoft else colors.surfaceSecondary)
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = crumb.name,
+                                color = if (isCurrent) colors.accent else colors.inkPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
                     }
                 }
             }
 
-            Row(
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 NeutralOutlineButton("根目录", onClick = onResetRoot)
                 if (secondaryActionLabel != null && onSecondaryAction != null) {
@@ -2175,7 +2487,7 @@ private fun FolderListRow(name: String, onClick: () -> Unit) {
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
         color = colors.surface,
-        border = BorderStroke(1.dp, colors.separator)
+        border = BorderStroke(0.5.dp, colors.separator)
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
@@ -2192,7 +2504,7 @@ private fun FolderListRow(name: String, onClick: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            Text("打开", color = colors.inkTertiary, fontSize = 12.sp)
+            Text("打开", color = colors.inkTertiary, fontSize = 12.sp, maxLines = 1, softWrap = false)
         }
     }
 }
@@ -2208,6 +2520,7 @@ private fun TrackListRow(
     onDownload: (() -> Unit)? = null
 ) {
     val colors = LocalCloudTuneColors.current
+    val isVideo = Cloud189Protocol.isVideoFile(track.name)
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -2215,7 +2528,7 @@ private fun TrackListRow(
             .clickable(onClick = onPlay),
         shape = RoundedCornerShape(12.dp),
         color = if (isActive) colors.rowActiveSurface else colors.surface,
-        border = BorderStroke(1.dp, if (isActive) colors.rowActiveBorder else colors.separator)
+        border = BorderStroke(if (isActive) 1.dp else 0.5.dp, if (isActive) colors.rowActiveBorder else colors.separator)
     ) {
         Row(
             modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
@@ -2226,7 +2539,8 @@ private fun TrackListRow(
                 bitmap = null,
                 seedText = track.name,
                 size = 38.dp,
-                cornerRadius = 8.dp
+                cornerRadius = 8.dp,
+                isVideo = isVideo
             )
             Column(modifier = Modifier.weight(1f)) {
                 Row(
@@ -2246,7 +2560,7 @@ private fun TrackListRow(
                 }
                 Text(
                     text = "${track.folderPath} · ${CloudTuneFormatters.formatBytes(track.sizeBytes)}",
-                    style = TabularNumStyle,
+                    style = MaterialTheme.typography.bodySmall.tabularNums(),
                     color = colors.inkTertiary,
                     fontSize = 11.5.sp,
                     maxLines = 1,
@@ -2259,7 +2573,9 @@ private fun TrackListRow(
                     text = trailingLabel,
                     color = if (isActive) colors.accent else colors.inkSecondary,
                     fontSize = 11.5.sp,
-                    fontWeight = FontWeight.SemiBold
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    softWrap = false
                 )
             }
 
@@ -2268,7 +2584,7 @@ private fun TrackListRow(
                     onClick = onPlayNext,
                     modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
                 ) {
-                    Text(playNextActionTitle, color = colors.inkSecondary, fontSize = 11.5.sp)
+                    Text(playNextActionTitle, color = colors.inkSecondary, fontSize = 11.5.sp, maxLines = 1, softWrap = false)
                 }
             }
 
@@ -2289,6 +2605,9 @@ private fun TrackListRow(
 private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
     var readyToLoad by remember { mutableStateOf(false) }
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var canGoBackState by remember { mutableStateOf(false) }
+
     LaunchedEffect(runtime) {
         runtime.cookieCleanupDeferred?.await()
         readyToLoad = true
@@ -2296,12 +2615,26 @@ private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
 
     Dialog(
         onDismissRequest = { runtime.isShowingWebLoginDialog = false },
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
     ) {
+        BackHandler(enabled = canGoBackState) {
+            val wv = webViewRef
+            if (wv != null && wv.canGoBack()) {
+                wv.goBack()
+                canGoBackState = wv.canGoBack()
+            } else {
+                canGoBackState = false
+            }
+        }
+
         Surface(
             modifier = Modifier
                 .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.systemBars),
+                .windowInsetsPadding(WindowInsets.systemBars)
+                .imePadding(),
             color = colors.surface
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -2316,6 +2649,8 @@ private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
                         color = colors.inkPrimary,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
                     NeutralOutlineButton("扫码登录") {
@@ -2325,17 +2660,29 @@ private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
                     Spacer(Modifier.width(8.dp))
                     NeutralOutlineButton("关闭") { runtime.isShowingWebLoginDialog = false }
                 }
-                HorizontalDivider(color = colors.separator)
+                HorizontalDivider(thickness = 0.5.dp, color = colors.separator)
                 if (readyToLoad) {
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             val cookieMgr = CookieManager.getInstance()
                             WebView(ctx).apply {
+                                webViewRef = this
                                 settings.javaScriptEnabled = true
                                 settings.domStorageEnabled = true
                                 webViewClient = object : WebViewClient() {
                                     private var intercepted = false
+
+                                    override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                                        super.doUpdateVisitedHistory(view, url, isReload)
+                                        canGoBackState = view?.canGoBack() == true
+                                    }
+
+                                    override fun onPageFinished(view: WebView?, url: String?) {
+                                        super.onPageFinished(view, url)
+                                        canGoBackState = view?.canGoBack() == true
+                                    }
+
                                     override fun shouldOverrideUrlLoading(
                                         view: WebView?,
                                         request: WebResourceRequest?
@@ -2363,6 +2710,10 @@ private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
                             }
                         },
                         onRelease = { webView ->
+                            if (webViewRef === webView) {
+                                webViewRef = null
+                            }
+                            canGoBackState = false
                             runCatching {
                                 webView.stopLoading()
                                 webView.destroy()

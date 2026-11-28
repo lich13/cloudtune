@@ -174,22 +174,4 @@ object PlaybackDecisionPolicy {
         }
         return PlaybackFailureAction.RetryTransientAfterDelay(priorAttemptCount + 1)
     }
-
-    fun guessMimeType(fileName: String): String {
-        val lower = fileName.lowercase(Locale.ROOT)
-        return when {
-            lower.endsWith(".flac") -> "audio/flac"
-            lower.endsWith(".mp3") -> "audio/mpeg"
-            lower.endsWith(".m4a") || lower.endsWith(".alac") -> "audio/mp4"
-            lower.endsWith(".aac") -> "audio/aac"
-            lower.endsWith(".wav") -> "audio/wav"
-            lower.endsWith(".ogg") -> "audio/ogg"
-            lower.endsWith(".opus") -> "audio/opus"
-            lower.endsWith(".mp4") || lower.endsWith(".m4v") -> "video/mp4"
-            lower.endsWith(".mov") -> "video/quicktime"
-            lower.endsWith(".mkv") -> "video/x-matroska"
-            lower.endsWith(".webm") -> "video/webm"
-            else -> "application/octet-stream"
-        }
-    }
 }

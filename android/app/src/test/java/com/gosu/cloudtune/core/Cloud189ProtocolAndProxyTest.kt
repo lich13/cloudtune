@@ -5,6 +5,7 @@ import com.gosu.cloudtune.data.CredentialStore
 import com.gosu.cloudtune.media.PlaybackSessionBridge
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import com.gosu.cloudtune.ui.CloudTuneViewModel
+import com.gosu.cloudtune.ui.fixture
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
@@ -109,6 +110,37 @@ class Cloud189ProtocolAndProxyTest {
                 entry.getString("expectedBucketHash"),
                 Cloud189Protocol.accountBucketHash(entry.getString("rawAccountId"))
             )
+        }
+
+        // 7) Unified media format table (.aiff/.aif/.dsf/.dff lossless parity & MIME types) + AtomicFileIO
+        for ((name, expectedMime) in listOf(
+            "Studio Master.aiff" to "audio/aiff",
+            "Archive.AIF" to "audio/aiff",
+            "SACD Layer.dsf" to "audio/dsf",
+            "DirectStream.DFF" to "audio/dff",
+            "Concert.flac" to "audio/flac",
+            "Album.alac" to "audio/mp4"
+        )) {
+            assertTrue("Expected audio file for $name", Cloud189Protocol.isAudioFile(name))
+            assertFalse("Expected non-video file for $name", Cloud189Protocol.isVideoFile(name))
+            assertTrue("Expected lossless audio for $name", TrackSummary("id", name, "Music", 1024L).isLosslessAudio)
+            assertEquals(expectedMime, Cloud189Protocol.guessMimeType(name))
+        }
+        assertTrue(Cloud189Protocol.isVideoFile("Live.mkv"))
+        assertFalse(Cloud189Protocol.isAudioFile("Live.mkv"))
+        assertEquals("video/x-matroska", Cloud189Protocol.guessMimeType("Live.mkv"))
+        assertEquals("application/octet-stream", Cloud189Protocol.guessMimeType("notes.pdf"))
+
+        val atomicRoot = Files.createTempDirectory("cloudtune-atomic-io").toFile()
+        try {
+            val target = File(atomicRoot, "nested/state.json")
+            AtomicFileIO.writeText(target, """{"v":1}""")
+            assertEquals("""{"v":1}""", target.readText(Charsets.UTF_8))
+            AtomicFileIO.writeText(target, """{"v":2}""")
+            assertEquals("""{"v":2}""", target.readText(Charsets.UTF_8))
+            assertTrue(target.parentFile.list().orEmpty().none { it.endsWith(".tmp") })
+        } finally {
+            atomicRoot.deleteRecursively()
         }
     }
 
@@ -258,33 +290,43 @@ class Cloud189ProtocolAndProxyTest {
             root.deleteRecursively()
         }
 
-        // 4) Draft settings isolation across module switches
+        // 4) Draft settings isolation across module switches & converged theme state
         val fixture = RepresentativeFixture.fromJsonString(locateContractsFile("representative-state.json").readText(Charsets.UTF_8))
-        val vm = CloudTuneViewModel.fixture(SnapshotScene.MUSIC, fixture)
-        assertEquals(2048L, vm.committedSettings.cacheLimitMb)
-        vm.cacheLimitDraft = "64"
-        vm.activeModule = ModuleTab.VIDEO
-        vm.activeModule = ModuleTab.SETTINGS
-        assertEquals("64", vm.cacheLimitDraft)
-        assertEquals(2048L, vm.committedSettings.cacheLimitMb)
-        assertFalse(vm.commitCacheLimitDraftAsync())
-        assertNotNull(vm.settingsValidationError)
-        assertEquals(vm.settingsValidationError, vm.statusMessage)
-        assertEquals(2048L, vm.committedSettings.cacheLimitMb)
+        val runtime = CloudTuneAppRuntime.fixture(SnapshotScene.MUSIC, fixture)
+        assertEquals(2048L, runtime.committedSettings.cacheLimitMb)
+        runtime.cacheLimitDraft = "64"
+        runtime.activeModule = ModuleTab.VIDEO
+        runtime.activeModule = ModuleTab.SETTINGS
+        assertEquals("64", runtime.cacheLimitDraft)
+        assertEquals(2048L, runtime.committedSettings.cacheLimitMb)
+        assertFalse(runtime.commitCacheLimitDraftAsync())
+        assertNotNull(runtime.settingsValidationError)
+        assertEquals(runtime.settingsValidationError, runtime.statusMessage)
+        assertEquals(2048L, runtime.committedSettings.cacheLimitMb)
 
-        vm.cacheLimitDraft = "4096"
-        vm.runtime.downloadThreadsDraft = "12"
-        vm.runtime.cacheThreadsDraft = "6"
-        vm.noteDraftEdited()
-        assertNull(vm.settingsValidationError)
-        assertNull(vm.statusMessage)
-        assertTrue(vm.commitCacheLimitDraftAsync())
-        assertEquals(4096L, vm.committedSettings.cacheLimitMb)
-        assertEquals("12", vm.runtime.downloadThreadsDraft)
-        assertEquals("6", vm.runtime.cacheThreadsDraft)
-        assertTrue(vm.commitTransferThreadsDraftAsync())
-        assertEquals(12, vm.committedSettings.downloadThreads)
-        assertEquals(6, vm.committedSettings.cacheThreads)
+        runtime.cacheLimitDraft = "4096"
+        runtime.downloadThreadsDraft = "12"
+        runtime.cacheThreadsDraft = "6"
+        runtime.noteDraftEdited()
+        assertNull(runtime.settingsValidationError)
+        assertNull(runtime.statusMessage)
+        assertTrue(runtime.commitCacheLimitDraftAsync())
+        assertEquals(4096L, runtime.committedSettings.cacheLimitMb)
+        assertEquals("12", runtime.downloadThreadsDraft)
+        assertEquals("6", runtime.cacheThreadsDraft)
+        assertTrue(runtime.commitTransferThreadsDraftAsync())
+        assertEquals(12, runtime.committedSettings.downloadThreads)
+        assertEquals(6, runtime.committedSettings.cacheThreads)
+
+        runtime.updateAppearanceMode(AppearanceMode.DARK)
+        runtime.updateDynamicColorEnabled(true)
+        assertEquals(AppearanceMode.DARK, runtime.themeMode)
+        assertEquals(AppearanceMode.DARK, runtime.committedSettings.appearanceMode)
+        assertTrue(runtime.dynamicColorEnabled)
+        assertTrue(runtime.committedSettings.dynamicColorEnabled)
+        runtime.logout()
+        assertEquals(AppearanceMode.DARK, runtime.themeMode)
+        assertTrue(runtime.dynamicColorEnabled)
 
         // 5) PlaybackQueueResolver.upcomingPreview anchors library continuation on upNextQueue.last ?? currentTrack
         val qa = TrackSummary("qa", "01.flac", "A", 100L)
@@ -330,7 +372,7 @@ class Cloud189ProtocolAndProxyTest {
                         capturedApiCookieHeader = outgoingCookies
                     }
                     val body = """{"res_code":0,"loginName":"alice@example.invalid","sessionKey":"sk_web","sessionSecret":"ss_web","refreshToken":"rt_web"}"""
-                    return CloudHttpResponse(200, emptyMap(), body.toByteArray(Charsets.UTF_8), url)
+                    return CloudHttpResponse(200, emptyMap(), body.toByteArray(Charsets.UTF_8))
                 }
 
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {
@@ -490,9 +532,9 @@ class Cloud189ProtocolAndProxyTest {
                 ): CloudHttpResponse {
                     if (url.contains("getSessionForPC.action")) {
                         val s = """{"res_code":0,"loginName":"alice@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt"}"""
-                        return CloudHttpResponse(200, emptyMap(), s.toByteArray(Charsets.UTF_8), url)
+                        return CloudHttpResponse(200, emptyMap(), s.toByteArray(Charsets.UTF_8))
                     }
-                    return CloudHttpResponse(status, emptyMap(), body.toByteArray(Charsets.UTF_8), url)
+                    return CloudHttpResponse(status, emptyMap(), body.toByteArray(Charsets.UTF_8))
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
                 override fun clearCookies() {}
@@ -701,7 +743,7 @@ class Cloud189ProtocolAndProxyTest {
                         url.contains("getSessionForPC.action") -> {
                             val idx = sessionIdx.get()
                             val b = """{"res_code":0,"accessToken":"at_$idx","refreshToken":"rt_$idx","sessionKey":"sk_$idx","sessionSecret":"ss_$idx"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("listFiles.action") -> {
                             val b = when {
@@ -712,7 +754,7 @@ class Cloud189ProtocolAndProxyTest {
                                 else ->
                                     """{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"cd1","name":"CD 1"},{"id":"cd2","name":"CD 2"}],"fileList":[]}}"""
                             }
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getFileDownloadUrl.action") -> {
                             if (url.contains("fileId=t-fail")) {
@@ -722,9 +764,9 @@ class Cloud189ProtocolAndProxyTest {
                                 }
                             }
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/song.mp3"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
-                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
                     }
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
@@ -740,80 +782,80 @@ class Cloud189ProtocolAndProxyTest {
                 enableLiveLoops = true
             )
             runtime.retryBaseDelayMs = 5L
-            val vm = CloudTuneViewModel(runtime = runtime)
+            val primaryVm = CloudTuneViewModel(runtime = runtime)
 
             // 1) Two accounts omitting loginName get display "天翼云盘用户" with distinct storage keys
             sessionIdx.set(1)
-            vm.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=1", emptyMap())
-            repeat(40) { if (vm.isAuthenticated && vm.browser != null) return@repeat; delay(15L) }
-            assertEquals("天翼云盘用户", vm.accountName)
-            val key1 = vm.accountStorageKey
+            runtime.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=1", emptyMap())
+            repeat(40) { if (runtime.isAuthenticated && runtime.browser != null) return@repeat; delay(15L) }
+            assertEquals("天翼云盘用户", runtime.accountName)
+            val key1 = runtime.accountStorageKey
             assertNotNull("key1 should be assigned", key1)
             assertFalse("key1 should not be default display name", key1 == "天翼云盘用户")
             store.saveLibrary(key1!!, listOf(TrackSummary("u1", "User1.flac", "CD 1", 100L)))
 
-            vm.logout()
+            runtime.logout()
             sessionIdx.set(2)
-            vm.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=2", emptyMap())
-            repeat(40) { if (vm.isAuthenticated && vm.browser != null) return@repeat; delay(15L) }
-            val key2 = vm.accountStorageKey
+            runtime.completeEmbeddedWebLogin("https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=2", emptyMap())
+            repeat(40) { if (runtime.isAuthenticated && runtime.browser != null) return@repeat; delay(15L) }
+            val key2 = runtime.accountStorageKey
             assertNotNull("key2 should be assigned", key2)
             assertFalse("key1 and key2 must differ: $key1 vs $key2", key1 == key2)
-            assertTrue("Account 2 library must be empty, got ${vm.tracks}", vm.tracks.isEmpty())
+            assertTrue("Account 2 library must be empty, got ${runtime.tracks}", runtime.tracks.isEmpty())
 
             // 2) Real subfolder names & distinct relative export subpaths
-            vm.browseTo("cd1", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd1", "CD 1")))
-            repeat(40) { if (vm.browser?.currentFolderId == "cd1") return@repeat; delay(15L) }
-            assertEquals("CD 1", vm.browser?.currentFolderName)
-            assertEquals("CD 1", vm.browser?.audioFiles?.firstOrNull()?.folderPath)
+            runtime.browseTo("cd1", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd1", "CD 1")))
+            repeat(40) { if (runtime.browser?.currentFolderId == "cd1") return@repeat; delay(15L) }
+            assertEquals("CD 1", runtime.browser?.currentFolderName)
+            assertEquals("CD 1", runtime.browser?.audioFiles?.firstOrNull()?.folderPath)
 
             runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
             repeat(40) {
-                if (vm.downloadTransfers.any { it.path == "CD 1/01. Song.flac" }) return@repeat
+                if (runtime.downloadTransfers.any { it.path == "CD 1/01. Song.flac" }) return@repeat
                 delay(20L)
             }
-            vm.browseTo("cd2", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd2", "CD 2")))
-            repeat(40) { if (vm.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
-            assertEquals("CD 2", vm.browser?.currentFolderName)
+            runtime.browseTo("cd2", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("cd2", "CD 2")))
+            repeat(40) { if (runtime.browser?.currentFolderId == "cd2") return@repeat; delay(15L) }
+            assertEquals("CD 2", runtime.browser?.currentFolderName)
             runtime.enqueueCurrentFolderDownloadWithExporter { _, subpath, _, _ -> subpath }
             repeat(40) {
-                if (vm.downloadTransfers.any { it.path == "CD 2/01. Song.flac" }) return@repeat
+                if (runtime.downloadTransfers.any { it.path == "CD 2/01. Song.flac" }) return@repeat
                 delay(20L)
             }
-            val queuedPaths = vm.downloadTransfers.mapNotNull { it.path }.toSet()
+            val queuedPaths = runtime.downloadTransfers.mapNotNull { it.path }.toSet()
             assertTrue("Expected CD 1 subpath in $queuedPaths", queuedPaths.contains("CD 1/01. Song.flac"))
             assertTrue("Expected CD 2 subpath in $queuedPaths", queuedPaths.contains("CD 2/01. Song.flac"))
 
             // 3) Retry cap enforcement (1 initial + 6 retries = 7 total, never infinite)
-            vm.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
+            runtime.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
             failDownloadUrl.set(true)
             downloadUrlCalls.set(0)
             val transientTrack = TrackSummary("t-fail", "Transient.mp3", "CD 2", 1024L)
-            vm.playTrack(transientTrack)
+            runtime.playTrack(transientTrack)
             repeat(80) {
-                if (vm.statusMessage?.contains("已停止自动重试") == true) return@repeat
+                if (runtime.statusMessage?.contains("已停止自动重试") == true) return@repeat
                 delay(20L)
             }
             assertEquals(1 + PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS, downloadUrlCalls.get())
-            assertTrue("Expected retry stop status, got: ${vm.statusMessage}", vm.statusMessage?.contains("已停止自动重试") == true)
+            assertTrue("Expected retry stop status, got: ${runtime.statusMessage}", runtime.statusMessage?.contains("已停止自动重试") == true)
 
             // ExoPlayer network "Source error" MUST NOT be misclassified as unsupported local codec
-            vm.handlePlaybackError(TrackSummary("t-src", "Network.flac", "CD 1", 1024L), "Source error", wasLoopback = false)
-            assertFalse("Source error must not claim codec unsupported: ${vm.statusMessage}", vm.statusMessage?.contains("不受系统解码器支持") == true)
-            vm.openVideoInApp(TrackSummary("v-1", "Clip.mp4", "CD 1", 2048L))
+            runtime.handlePlaybackError(TrackSummary("t-src", "Network.flac", "CD 1", 1024L), "Source error", wasLoopback = false)
+            assertFalse("Source error must not claim codec unsupported: ${runtime.statusMessage}", runtime.statusMessage?.contains("不受系统解码器支持") == true)
+            runtime.openVideoInApp(TrackSummary("v-1", "Clip.mp4", "CD 1", 2048L))
 
             // 4) Multi-ViewModel attach/detach ref-counting + ViewModel.onCleared() survival
-            val vmSecondary = CloudTuneViewModel(runtime = runtime)
-            vmSecondary.clearViewModelForTest()
+            val secondaryVm = CloudTuneViewModel(runtime = runtime)
+            secondaryVm.onCleared()
             failDownloadUrl.set(false)
             val q1 = TrackSummary("q1", "Queue1.mp3", "CD 1", 1024L)
             val q2 = TrackSummary("q2", "Queue2.mp3", "CD 1", 1024L)
-            vm.tracks = listOf(q1, q2)
-            vm.shuffle = false
-            vm.playTrack(q1)
-            repeat(40) { if (vm.currentTrackId == "q1") return@repeat; delay(15L) }
+            runtime.tracks = listOf(q1, q2)
+            runtime.shuffle = false
+            runtime.playTrack(q1)
+            repeat(40) { if (runtime.currentTrackId == "q1") return@repeat; delay(15L) }
 
-            vm.clearViewModelForTest()
+            primaryVm.onCleared()
             assertNotNull("SkipNext callback must survive ViewModel.onCleared()", PlaybackSessionBridge.onSkipNext)
             assertNotNull("LocalStreamServer must remain open after ViewModel.onCleared()", runtime.streamServer)
             // Verify LocalStreamServer port is still actively accepting TCP connections after onCleared()
@@ -828,7 +870,7 @@ class Cloud189ProtocolAndProxyTest {
                 runtime.lastPreparedPlaybackUrl?.startsWith("http://127.0.0.1:${runtime.streamServer!!.port}/stream/") == true
             )
 
-            vm.logout()
+            runtime.logout()
             runtime.streamServer?.close()
             Unit
         } finally {
@@ -853,11 +895,11 @@ class Cloud189ProtocolAndProxyTest {
                             refreshCalls.incrementAndGet()
                             delay(40L)
                             val b = """{"res_code":0,"accessToken":"at_boot","refreshToken":"rt_boot_2"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getSessionForPC.action") -> {
                             val b = """{"res_code":0,"loginName":"audiophile@example.invalid","sessionKey":"sk_boot","sessionSecret":"ss_boot","refreshToken":"rt_boot_2"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("listFiles.action") -> {
                             val b = when {
@@ -868,13 +910,13 @@ class Cloud189ProtocolAndProxyTest {
                                 else ->
                                     """{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"jazz","name":"Jazz"},{"id":"video","name":"Video"}],"fileList":[]}}"""
                             }
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getFileDownloadUrl.action") -> {
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/solo.flac"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
-                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
                     }
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
@@ -1001,11 +1043,11 @@ class Cloud189ProtocolAndProxyTest {
                     return when {
                         url.contains("refreshToken.do") -> {
                             val b = """{"res_code":0,"accessToken":"at_r14","refreshToken":"rt_r14_next"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getSessionForPC.action") -> {
                             val b = """{"res_code":0,"loginName":"r14@example.invalid","sessionKey":"sk_r14","sessionSecret":"ss_r14","refreshToken":"rt_r14_next"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("listFiles.action") -> {
                             when {
@@ -1013,23 +1055,23 @@ class Cloud189ProtocolAndProxyTest {
                                     slowFolderEntered.complete(Unit)
                                     slowFolderRelease.await()
                                     val b = """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"slow-1","name":"Slow.flac","size":1024}]}}"""
-                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                                 }
                                 url.contains("folderId=fast-b") -> {
                                     val b = """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"fast-1","name":"Fast.flac","size":1024}]}}"""
-                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                                 }
                                 else -> {
                                     val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
-                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                                 }
                             }
                         }
                         url.contains("getFileDownloadUrl.action") -> {
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/track.flac"}"""
-                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
-                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
                     }
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
@@ -1223,7 +1265,7 @@ class Cloud189ProtocolAndProxyTest {
                     ): CloudHttpResponse {
                         val user = currentLogin.get()
                         val body = """{"res_code":0,"loginName":"$user","sessionKey":"sk_$user","sessionSecret":"ss_$user","refreshToken":"rt_$user"}"""
-                        return CloudHttpResponse(200, emptyMap(), body.toByteArray(Charsets.UTF_8), url)
+                        return CloudHttpResponse(200, emptyMap(), body.toByteArray(Charsets.UTF_8))
                     }
                     override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
                     override fun clearCookies() {}

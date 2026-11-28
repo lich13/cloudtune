@@ -1,9 +1,6 @@
 package com.gosu.cloudtune.core
 
 import java.io.File
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import org.json.JSONObject
 
 data class CacheEntry(
@@ -129,7 +126,7 @@ class CacheManager(
         val children = cacheDir.listFiles() ?: return
         for (child in children) {
             if (child.name == "index.json" || child.name in valid) continue
-            if (child.name.endsWith(".part") || child.name.endsWith(".parts")) {
+            if (child.name.endsWith(".part") || child.name.endsWith(".parts") || child.name.endsWith(".tmp")) {
                 child.deleteRecursively()
             }
         }
@@ -146,20 +143,6 @@ class CacheManager(
                     .put("lastAccessedMs", v.lastAccessedMs)
             )
         }
-        val tmp = File(indexFile.parentFile, ".${indexFile.name}.tmp")
-        tmp.writeText(root.toString(), Charsets.UTF_8)
-        try {
-            Files.move(tmp.toPath(), indexFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        } catch (_: AtomicMoveNotSupportedException) {
-            runCatching {
-                Files.move(tmp.toPath(), indexFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            }.onFailure {
-                tmp.copyTo(indexFile, overwrite = true)
-                tmp.delete()
-            }
-        } catch (_: Exception) {
-            tmp.copyTo(indexFile, overwrite = true)
-            tmp.delete()
-        }
+        AtomicFileIO.writeText(indexFile, root.toString())
     }
 }

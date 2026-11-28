@@ -359,17 +359,66 @@ object Cloud189Protocol {
         return cleaned
     }
 
-    fun isAudioFile(name: String): Boolean {
-        val lower = name.lowercase(Locale.ROOT)
-        return listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".ape", ".wma", ".alac")
-            .any { lower.endsWith(it) }
+    private enum class MediaKind {
+        AUDIO,
+        VIDEO
     }
 
-    fun isVideoFile(name: String): Boolean {
-        val lower = name.lowercase(Locale.ROOT)
-        return listOf(".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg")
-            .any { lower.endsWith(it) }
+    private data class MediaFormatSpec(
+        val ext: String,
+        val kind: MediaKind,
+        val mimeType: String,
+        val isLossless: Boolean = false
+    )
+
+    private val MEDIA_FORMATS_BY_EXT: Map<String, MediaFormatSpec> = listOf(
+        MediaFormatSpec("mp3", MediaKind.AUDIO, "audio/mpeg"),
+        MediaFormatSpec("flac", MediaKind.AUDIO, "audio/flac", isLossless = true),
+        MediaFormatSpec("wav", MediaKind.AUDIO, "audio/wav", isLossless = true),
+        MediaFormatSpec("m4a", MediaKind.AUDIO, "audio/mp4"),
+        MediaFormatSpec("aac", MediaKind.AUDIO, "audio/aac"),
+        MediaFormatSpec("ogg", MediaKind.AUDIO, "audio/ogg"),
+        MediaFormatSpec("opus", MediaKind.AUDIO, "audio/opus"),
+        MediaFormatSpec("ape", MediaKind.AUDIO, "audio/x-ape", isLossless = true),
+        MediaFormatSpec("wma", MediaKind.AUDIO, "audio/x-ms-wma"),
+        MediaFormatSpec("alac", MediaKind.AUDIO, "audio/mp4", isLossless = true),
+        MediaFormatSpec("aiff", MediaKind.AUDIO, "audio/aiff", isLossless = true),
+        MediaFormatSpec("aif", MediaKind.AUDIO, "audio/aiff", isLossless = true),
+        MediaFormatSpec("dsf", MediaKind.AUDIO, "audio/dsf", isLossless = true),
+        MediaFormatSpec("dff", MediaKind.AUDIO, "audio/dff", isLossless = true),
+        MediaFormatSpec("mp4", MediaKind.VIDEO, "video/mp4"),
+        MediaFormatSpec("mkv", MediaKind.VIDEO, "video/x-matroska"),
+        MediaFormatSpec("mov", MediaKind.VIDEO, "video/quicktime"),
+        MediaFormatSpec("avi", MediaKind.VIDEO, "video/x-msvideo"),
+        MediaFormatSpec("webm", MediaKind.VIDEO, "video/webm"),
+        MediaFormatSpec("m4v", MediaKind.VIDEO, "video/mp4"),
+        MediaFormatSpec("wmv", MediaKind.VIDEO, "video/x-ms-wmv"),
+        MediaFormatSpec("flv", MediaKind.VIDEO, "video/x-flv"),
+        MediaFormatSpec("mpeg", MediaKind.VIDEO, "video/mpeg"),
+        MediaFormatSpec("mpg", MediaKind.VIDEO, "video/mpeg")
+    ).associateBy { it.ext }
+
+    private fun normalizedExtension(fileName: String): String {
+        val trimmed = fileName.trim()
+        val dot = trimmed.lastIndexOf('.')
+        if (dot < 0 || dot == trimmed.lastIndex) return ""
+        return trimmed.substring(dot + 1).trim().lowercase(Locale.ROOT)
     }
+
+    fun fileExtensionUpper(fileName: String): String =
+        normalizedExtension(fileName).uppercase(Locale.ROOT)
+
+    fun isAudioFile(name: String): Boolean =
+        MEDIA_FORMATS_BY_EXT[normalizedExtension(name)]?.kind == MediaKind.AUDIO
+
+    fun isVideoFile(name: String): Boolean =
+        MEDIA_FORMATS_BY_EXT[normalizedExtension(name)]?.kind == MediaKind.VIDEO
+
+    fun isLosslessAudioFile(name: String): Boolean =
+        MEDIA_FORMATS_BY_EXT[normalizedExtension(name)]?.isLossless == true
+
+    fun guessMimeType(fileName: String): String =
+        MEDIA_FORMATS_BY_EXT[normalizedExtension(fileName)]?.mimeType ?: "application/octet-stream"
 
     internal fun optNonBlank(json: JSONObject, key: String): String? {
         if (!json.has(key) || json.isNull(key)) return null

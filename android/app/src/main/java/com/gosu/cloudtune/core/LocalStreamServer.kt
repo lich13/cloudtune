@@ -11,9 +11,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -303,7 +300,7 @@ class LocalStreamServer(
                             return@withPermit
                         }
 
-                        val mime = PlaybackDecisionPolicy.guessMimeType(source.fileName)
+                        val mime = Cloud189Protocol.guessMimeType(source.fileName)
                         val fullLength = RangeHeaderValidator.extractFullAssetLength(
                             statusCode = opened.statusCode,
                             requestHadRange = upstreamRange != null,
@@ -482,25 +479,9 @@ class LocalStreamServer(
                                 val stillAuthorized = !session.revoked.get() &&
                                     isSourceStillRegistered(source.token, source.accountHash)
                                 if (stillAuthorized && completedCleanly && partOut != null && expectedTotal > 0L && delivered == expectedTotal && matchesExpected) {
-                                    val promoted = try {
-                                        Files.move(
-                                            partFile.toPath(),
-                                            source.cacheDestination.toPath(),
-                                            StandardCopyOption.REPLACE_EXISTING,
-                                            StandardCopyOption.ATOMIC_MOVE
-                                        )
-                                        true
-                                    } catch (_: AtomicMoveNotSupportedException) {
-                                        runCatching {
-                                            Files.move(
-                                                partFile.toPath(),
-                                                source.cacheDestination.toPath(),
-                                                StandardCopyOption.REPLACE_EXISTING
-                                            )
-                                        }.isSuccess
-                                    } catch (_: Exception) {
-                                        false
-                                    }
+                                    val promoted = runCatching {
+                                        AtomicFileIO.replaceAtomically(partFile, source.cacheDestination)
+                                    }.isSuccess
                                     if (promoted) {
                                         val recorded = runCatching {
                                             cacheManager.recordCompletedFile(

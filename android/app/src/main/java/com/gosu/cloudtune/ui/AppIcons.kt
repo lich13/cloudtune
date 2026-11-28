@@ -185,22 +185,6 @@ object AppIcons {
         }.build()
     }
 
-    val QueueList: ImageVector by lazy {
-        ImageVector.Builder("QueueList", 24.dp, 24.dp, 24f, 24f).apply {
-            path(
-                stroke = SolidColor(Color.Black),
-                strokeLineWidth = 2f,
-                strokeLineCap = StrokeCap.Round
-            ) {
-                moveTo(4f, 7f); lineTo(14f, 7f)
-                moveTo(4f, 12f); lineTo(14f, 12f)
-                moveTo(4f, 17f); lineTo(11f, 17f)
-                moveTo(17f, 11f); lineTo(17f, 18f)
-                moveTo(17f, 11f); lineTo(20f, 10f)
-            }
-        }.build()
-    }
-
     val Pip: ImageVector by lazy {
         ImageVector.Builder("Pip", 24.dp, 24.dp, 24f, 24f).apply {
             path(
@@ -255,16 +239,6 @@ object AppIcons {
                 strokeLineJoin = StrokeJoin.Round
             ) {
                 moveTo(6f, 9f); lineTo(12f, 15f); lineTo(18f, 9f)
-            }
-        }.build()
-    }
-
-    val MoreVert: ImageVector by lazy {
-        ImageVector.Builder("MoreVert", 24.dp, 24.dp, 24f, 24f).apply {
-            path(fill = SolidColor(Color.Black)) {
-                moveTo(12f, 5f); curveTo(12.9f, 5f, 13.6f, 5.7f, 13.6f, 6.6f); curveTo(13.6f, 7.5f, 12.9f, 8.2f, 12f, 8.2f); curveTo(11.1f, 8.2f, 10.4f, 7.5f, 10.4f, 6.6f); curveTo(10.4f, 5.7f, 11.1f, 5.0f, 12f, 5f)
-                moveTo(12f, 10.4f); curveTo(12.9f, 10.4f, 13.6f, 11.1f, 13.6f, 12f); curveTo(13.6f, 12.9f, 12.9f, 13.6f, 12f, 13.6f); curveTo(11.1f, 13.6f, 10.4f, 12.9f, 10.4f, 12f); curveTo(10.4f, 11.1f, 11.1f, 10.4f, 12f, 10.4f)
-                moveTo(12f, 15.8f); curveTo(12.9f, 15.8f, 13.6f, 16.5f, 13.6f, 17.4f); curveTo(13.6f, 18.3f, 12.9f, 19f, 12f, 19f); curveTo(11.1f, 19f, 10.4f, 18.3f, 10.4f, 17.4f); curveTo(10.4f, 16.5f, 11.1f, 15.8f, 12f, 15.8f)
             }
         }.build()
     }

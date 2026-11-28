@@ -4,9 +4,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -340,7 +337,7 @@ class TransferEngine(
             downloadParts(statusId, track.id, remoteUrl, totalSize, parts, partsDir)
             ensureActive()
             mergeParts(partsDir, parts, mergedTmp, totalSize)
-            moveOrCopyAtomically(mergedTmp, dest)
+            AtomicFileIO.replaceAtomically(mergedTmp, dest)
             cacheManager.recordCompletedFile(
                 trackId = track.id,
                 file = dest,
@@ -693,27 +690,6 @@ class TransferEngine(
             }
         }
 
-    private fun moveOrCopyAtomically(source: File, destination: File) {
-        try {
-            Files.move(
-                source.toPath(),
-                destination.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            try {
-                Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } catch (_: Exception) {
-                source.copyTo(destination, overwrite = true)
-                source.delete()
-            }
-        } catch (_: Exception) {
-            source.copyTo(destination, overwrite = true)
-            source.delete()
-        }
-    }
-
     private fun completedBytesForManifest(manifest: StagedDownloadManifest, stagingRootDir: File): Long {
         val safe = Cloud189Protocol.sanitizeFileName(manifest.taskId)
         val partsDir = File(stagingRootDir, "$safe.parts")
@@ -752,21 +728,7 @@ class TransferEngine(
                 }
                 arr.put(obj)
             }
-            val parent = manifestsFile.parentFile
-            parent?.mkdirs()
-            val bytes = arr.toString().toByteArray(Charsets.UTF_8)
-            val tmpFile = File(parent ?: File("."), ".${manifestsFile.name}.${UUID.randomUUID()}.tmp")
-            try {
-                FileOutputStream(tmpFile).use { out ->
-                    out.write(bytes)
-                    out.fd.sync()
-                }
-                moveOrCopyAtomically(tmpFile, manifestsFile)
-            } finally {
-                if (tmpFile.exists()) {
-                    tmpFile.delete()
-                }
-            }
+            AtomicFileIO.writeText(manifestsFile, arr.toString())
         }
     }
 }

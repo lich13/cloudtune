@@ -19,8 +19,7 @@ import org.json.JSONObject
 data class CloudHttpResponse(
     val statusCode: Int,
     val headers: Map<String, String>,
-    val body: ByteArray,
-    val finalUrl: String
+    val body: ByteArray
 ) {
     val text: String get() = body.toString(Charsets.UTF_8)
 }
@@ -141,7 +140,7 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
                         flatHeaders[k.lowercase()] = v.last()
                     }
                 }
-                return@withContext CloudHttpResponse(status, flatHeaders, bytes, currentUrl)
+                return@withContext CloudHttpResponse(status, flatHeaders, bytes)
             } finally {
                 conn.disconnect()
             }
@@ -239,10 +238,6 @@ class Cloud189Client(
             pendingQr = null
             transport.clearCookies()
         }
-    }
-
-    suspend fun clearSession(expectedEpoch: Int? = null) = mutex.withLock {
-        clearSessionImmediate(expectedEpoch)
     }
 
     fun importWebCookies(domainUrl: String, cookieHeader: String?) {

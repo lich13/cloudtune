@@ -68,9 +68,9 @@ class CloudTuneSnapshotTest {
                 val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
                 val activity = controller.get()
                 activity.enableEdgeToEdge()
-                val vm = CloudTuneViewModel.fixture(scene, fixture).apply {
-                    this.themeMode = themeMode
-                }
+                val vm = CloudTuneViewModel(
+                    runtime = CloudTuneAppRuntime.fixture(scene, fixture, appearanceMode = themeMode)
+                )
                 activity.setContent {
                     CloudTuneRootApp(viewModel = vm)
                 }
@@ -222,23 +222,23 @@ class CloudTuneSnapshotTest {
                     return when {
                         url.contains("refreshToken.do") -> {
                             val b = """{"res_code":0,"accessToken":"at_1","refreshToken":"rt_1"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getSessionForPC.action") -> {
                             val b = """{"res_code":0,"loginName":"guard@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt_1"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("listFiles.action") -> {
                             val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getFileDownloadUrl.action") -> {
                             enteredResolve.complete(Unit)
                             releaseResolve.await()
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/concert.mp4"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
-                        else -> com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                        else -> com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
                     }
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
@@ -343,15 +343,15 @@ class CloudTuneSnapshotTest {
                     return when {
                         url.contains("refreshToken.do") -> {
                             val b = """{"res_code":0,"accessToken":"at_1","refreshToken":"rt_1"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getSessionForPC.action") -> {
                             val b = """{"res_code":0,"loginName":"saf@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt_1"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("listFiles.action") -> {
                             val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
                         url.contains("getFileDownloadUrl.action") -> {
                             if (url.contains("fileId=vid-gated") || url.contains("fileId=vid-dl-gated")) {
@@ -362,9 +362,9 @@ class CloudTuneSnapshotTest {
                                 }
                             }
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/media.mp4"}"""
-                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8))
                         }
-                        else -> com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                        else -> com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8))
                     }
                 }
                 override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}

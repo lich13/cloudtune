@@ -10,6 +10,7 @@ import android.util.Base64
 import androidx.documentfile.provider.DocumentFile
 import com.gosu.cloudtune.core.AccountSettings
 import com.gosu.cloudtune.core.AppearanceMode
+import com.gosu.cloudtune.core.AtomicFileIO
 import com.gosu.cloudtune.core.Cloud189Protocol
 import com.gosu.cloudtune.core.CloudTuneException
 import com.gosu.cloudtune.core.FolderSelection
@@ -18,11 +19,7 @@ import com.gosu.cloudtune.core.PlaybackMode
 import com.gosu.cloudtune.core.TrackSummary
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.OutputStream
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.KeyStore
 import java.util.UUID
 import javax.crypto.Cipher
@@ -155,54 +152,13 @@ class AccountStore(val rootDir: File) {
     }
 
     private fun readAtomicTextOrNull(target: File): String? = synchronized(ioLock) {
-        val af = AtomicFile(target)
-        val base = af.baseFile
-        if (base != null) {
-            if (!base.isFile) return null
-            return af.openRead().use { it.readBytes().toString(Charsets.UTF_8) }
-        }
         if (!target.isFile) return null
-        return target.readText(Charsets.UTF_8)
+        target.readText(Charsets.UTF_8)
     }
 
     private fun writeAtomicText(target: File, content: String) {
         synchronized(ioLock) {
-            target.parentFile?.mkdirs()
-            val bytes = content.toByteArray(Charsets.UTF_8)
-            val af = AtomicFile(target)
-            if (af.baseFile != null) {
-                val stream = af.startWrite()
-                try {
-                    stream.write(bytes)
-                    af.finishWrite(stream)
-                    return
-                } catch (e: Exception) {
-                    af.failWrite(stream)
-                    throw e
-                }
-            }
-            val tmp = File(target.parentFile ?: File("."), ".${target.name}.${UUID.randomUUID()}.tmp")
-            try {
-                FileOutputStream(tmp).use { out ->
-                    out.write(bytes)
-                    out.fd.sync()
-                }
-                try {
-                    Files.move(
-                        tmp.toPath(),
-                        target.toPath(),
-                        StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE
-                    )
-                } catch (_: AtomicMoveNotSupportedException) {
-                    Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                }
-            } finally {
-                if (tmp.exists()) {
-                    tmp.delete()
-                }
-            }
-            Unit
+            AtomicFileIO.writeText(target, content)
         }
     }
 
@@ -227,9 +183,6 @@ class AccountStore(val rootDir: File) {
             )
         }.getOrNull()
     }
-
-    fun loadSettings(accountId: String): AccountSettings =
-        loadSettingsOrNull(accountId) ?: AccountSettings()
 
     fun saveSettings(accountId: String, settings: AccountSettings) {
         val f = paths(accountId).settingsFile

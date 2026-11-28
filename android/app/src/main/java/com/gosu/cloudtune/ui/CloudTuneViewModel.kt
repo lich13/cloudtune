@@ -43,8 +43,6 @@ import com.gosu.cloudtune.core.PlaybackFailureAction
 import com.gosu.cloudtune.core.PlaybackMode
 import com.gosu.cloudtune.core.PlaybackQueueResolver
 import com.gosu.cloudtune.core.QrLoginState
-import com.gosu.cloudtune.core.RepresentativeFixture
-import com.gosu.cloudtune.core.SnapshotScene
 import com.gosu.cloudtune.core.StagedFileExporter
 import com.gosu.cloudtune.core.StreamSourceRegistration
 import com.gosu.cloudtune.core.TrackSummary
@@ -116,8 +114,10 @@ class CloudTuneAppRuntime(
     private val uiPrefs = appCtx?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
-    var themeMode by mutableStateOf(AppearanceMode.SYSTEM)
-    var dynamicColorEnabled by mutableStateOf(false)
+    val themeMode: AppearanceMode
+        get() = committedSettings.appearanceMode
+    val dynamicColorEnabled: Boolean
+        get() = committedSettings.dynamicColorEnabled
     var activeModule by mutableStateOf(ModuleTab.MUSIC)
     var isBootstrapping by mutableStateOf(false)
     var busyLabel by mutableStateOf<String?>(null)
@@ -248,11 +248,9 @@ class CloudTuneAppRuntime(
 
     init {
         uiPrefs?.let { prefs ->
-            themeMode = AppearanceMode.fromWire(prefs.getString(KEY_APPEARANCE_MODE, null))
-            dynamicColorEnabled = prefs.getBoolean(KEY_DYNAMIC_COLOR, false)
             committedSettings = committedSettings.copy(
-                appearanceMode = themeMode,
-                dynamicColorEnabled = dynamicColorEnabled
+                appearanceMode = AppearanceMode.fromWire(prefs.getString(KEY_APPEARANCE_MODE, null)),
+                dynamicColorEnabled = prefs.getBoolean(KEY_DYNAMIC_COLOR, false)
             )
         }
         syncDraftsFromCommitted()
@@ -383,12 +381,6 @@ class CloudTuneAppRuntime(
 
     val downloadTransfers: List<TransferStatus>
         get() = transferSnapshot.items.filter { it.kind == "download" }
-
-    val activeStreamTransfers: List<TransferStatus>
-        get() = transferSnapshot.items.filter { it.kind != "download" }
-
-    val downloadableFiles: List<TrackSummary>
-        get() = cloudBrowser.payload?.let { it.audioFiles + it.videoFiles + it.otherFiles } ?: emptyList()
 
     private fun syncQueueAvailabilityToBridge() {
         if (!enableLiveLoops) return
@@ -553,7 +545,7 @@ class CloudTuneAppRuntime(
     }
 
     fun updateAppearanceMode(mode: AppearanceMode) {
-        themeMode = mode
+        committedSettings = committedSettings.copy(appearanceMode = mode)
         mirrorThemePrefs(mode, dynamicColorEnabled)
         scope.launch {
             mutateAccountSettings { prev -> prev.copy(appearanceMode = mode) }
@@ -561,7 +553,7 @@ class CloudTuneAppRuntime(
     }
 
     fun updateDynamicColorEnabled(enabled: Boolean) {
-        dynamicColorEnabled = enabled
+        committedSettings = committedSettings.copy(dynamicColorEnabled = enabled)
         mirrorThemePrefs(themeMode, enabled)
         scope.launch {
             mutateAccountSettings { prev -> prev.copy(dynamicColorEnabled = enabled) }
@@ -827,18 +819,6 @@ class CloudTuneAppRuntime(
         }
     }
 
-    fun completeEmbeddedWebLogin(callbackUrl: String, cookieHeader: String?) {
-        completeEmbeddedWebLogin(
-            callbackUrl = callbackUrl,
-            cookiesByOrigin = mapOf(
-                "https://open.e.189.cn" to cookieHeader,
-                "https://cloud.189.cn" to cookieHeader,
-                "https://api.cloud.189.cn" to cookieHeader,
-                "https://m.cloud.189.cn" to cookieHeader
-            )
-        )
-    }
-
     fun completeEmbeddedWebLogin(callbackUrl: String, cookiesByOrigin: Map<String, String?>) {
         val loginEpoch: Int
         val pendingCleanup: Deferred<Unit>?
@@ -942,12 +922,17 @@ class CloudTuneAppRuntime(
         displayName: String,
         expectedAuthEpoch: Int = authEpoch
     ) {
+        val fallbackAppearance = committedSettings.appearanceMode
+        val fallbackDynamicColor = committedSettings.dynamicColorEnabled
         val loaded = withContext(ioDispatcher) {
             val paths = accountStore.paths(storageKey)
             val cm = CacheManager(paths.cacheDir)
             val usage = cm.usageBytes()
             val savedSettings = accountStore.loadSettingsOrNull(storageKey)
-                ?: AccountSettings(appearanceMode = themeMode, dynamicColorEnabled = dynamicColorEnabled)
+                ?: AccountSettings(
+                    appearanceMode = fallbackAppearance,
+                    dynamicColorEnabled = fallbackDynamicColor
+                )
             val savedTracks = accountStore.loadLibrary(storageKey)
             transferEngine.restorePersistedDownloads(storageKey, paths.stagingDir, paths.transfersFile)
             val snap = transferEngine.snapshot()
@@ -966,8 +951,6 @@ class CloudTuneAppRuntime(
         cacheManager = loaded.cacheManager
         cacheUsageBytes = loaded.usageBytes
         committedSettings = loaded.settings
-        themeMode = loaded.settings.appearanceMode
-        dynamicColorEnabled = loaded.settings.dynamicColorEnabled
         mirrorThemePrefs(themeMode, dynamicColorEnabled)
         syncDraftsFromCommitted()
         tracks = loaded.tracks
@@ -2045,7 +2028,7 @@ class CloudTuneAppRuntime(
         val streamUrl = action.streamUrl ?: return
         val uri = Uri.parse(streamUrl)
         if (uri?.host != "127.0.0.1") return
-        val mime = PlaybackDecisionPolicy.guessMimeType(action.video.name)
+        val mime = Cloud189Protocol.guessMimeType(action.video.name)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -2063,7 +2046,7 @@ class CloudTuneAppRuntime(
     private fun launchFileProviderVideoIntent(context: Context, localFile: File, fileName: String) {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", localFile)
         val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, PlaybackDecisionPolicy.guessMimeType(fileName))
+            setDataAndType(uri, Cloud189Protocol.guessMimeType(fileName))
             clipData = ClipData.newRawUri("", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
@@ -2130,7 +2113,7 @@ class CloudTuneAppRuntime(
                 treeUriString = effectiveTreeUri,
                 stagedFile = staged,
                 relativeSubpath = rel,
-                mimeType = PlaybackDecisionPolicy.guessMimeType(track.name)
+                mimeType = Cloud189Protocol.guessMimeType(track.name)
             )
         }
     }
@@ -2195,7 +2178,7 @@ class CloudTuneAppRuntime(
                 treeUriString = effectiveTreeUri,
                 stagedFile = staged,
                 relativeSubpath = subpath,
-                mimeType = PlaybackDecisionPolicy.guessMimeType(subpath)
+                mimeType = Cloud189Protocol.guessMimeType(subpath)
             )
         }
     }
@@ -2307,7 +2290,7 @@ class CloudTuneAppRuntime(
                         treeUriString = effectiveTreeUri,
                         stagedFile = staged,
                         relativeSubpath = rel,
-                        mimeType = PlaybackDecisionPolicy.guessMimeType(rel)
+                        mimeType = Cloud189Protocol.guessMimeType(rel)
                     )
                 }
                 transferEngine.snapshot()
@@ -2630,154 +2613,10 @@ class CloudTuneViewModel(
         runtime.onUiAttached()
     }
 
-    // Minimal lifecycle & contract entrypoints; Compose UI binds directly to `viewModel.runtime`.
-    var themeMode: AppearanceMode
-        get() = runtime.themeMode
-        set(value) { runtime.themeMode = value }
-    var activeModule: ModuleTab
-        get() = runtime.activeModule
-        set(value) { runtime.activeModule = value }
-    var isAuthenticated: Boolean
-        get() = runtime.isAuthenticated
-        set(value) { runtime.isAuthenticated = value }
-    val accountName: String? get() = runtime.accountName
-    val accountStorageKey: String? get() = runtime.accountStorageKey
-    val committedSettings: AccountSettings get() = runtime.committedSettings
-    var cacheLimitDraft: String
-        get() = runtime.cacheLimitDraft
-        set(value) { runtime.cacheLimitDraft = value }
-    val settingsValidationError: String? get() = runtime.settingsValidationError
-    val statusMessage: String? get() = runtime.statusMessage
-    val browser: FolderBrowsePayload? get() = runtime.browser
-    var tracks: List<TrackSummary>
-        get() = runtime.tracks
-        set(value) { runtime.tracks = value }
-    val currentTrackId: String? get() = runtime.currentTrackId
-    var shuffle: Boolean
-        get() = runtime.shuffle
-        set(value) { runtime.shuffle = value }
-    val downloadTransfers: List<TransferStatus> get() = runtime.downloadTransfers
-
     fun bootstrap(): Deferred<Unit> = runtime.bootstrap()
-    fun noteDraftEdited() = runtime.noteDraftEdited()
-    fun commitCacheLimitDraft() = runtime.commitCacheLimitDraft()
-    suspend fun commitCacheLimitDraftAsync(): Boolean = runtime.commitCacheLimitDraftAsync()
-    fun commitTransferThreadsDraft() = runtime.commitTransferThreadsDraft()
-    suspend fun commitTransferThreadsDraftAsync(): Boolean = runtime.commitTransferThreadsDraftAsync()
-    fun updatePlaybackMode(mode: PlaybackMode) = runtime.updatePlaybackMode(mode)
-    fun completeEmbeddedWebLogin(callbackUrl: String, cookiesByOrigin: Map<String, String?>) =
-        runtime.completeEmbeddedWebLogin(callbackUrl, cookiesByOrigin)
-    fun logout() = runtime.logout()
-    fun browseTo(folderId: String?, nextCrumbs: List<BreadcrumbItem>, showBusy: Boolean = true) =
-        runtime.browseTo(folderId, nextCrumbs, showBusy)
-    fun playTrack(
-        track: TrackSummary,
-        modeOverride: PlaybackMode? = null,
-        forceStreamProxy: Boolean = false,
-        isRecoveryRetry: Boolean = false
-    ) = runtime.playTrack(track, modeOverride, forceStreamProxy, isRecoveryRetry)
-    fun playFromUpcomingQueue(track: TrackSummary) = runtime.playFromUpcomingQueue(track)
-    fun handlePlaybackError(
-        track: TrackSummary,
-        message: String,
-        wasLoopback: Boolean,
-        explicitIsDecode: Boolean? = null
-    ) = runtime.handlePlaybackError(track, message, wasLoopback, explicitIsDecode)
-    fun openVideoInApp(video: TrackSummary) = runtime.openVideoInApp(video)
-
-    internal fun clearViewModelForTest() {
-        onCleared()
-    }
 
     public override fun onCleared() {
         runtime.onUiDetached()
         super.onCleared()
-    }
-
-    companion object {
-        fun fixture(scene: SnapshotScene, fixture: RepresentativeFixture): CloudTuneViewModel {
-            val isolatedDir = File(System.getProperty("java.io.tmpdir"), "cloudtune-fixture-${UUID.randomUUID()}")
-            val vm = CloudTuneViewModel(accountStore = AccountStore(isolatedDir), enableLiveLoops = false)
-            val rt = vm.runtime
-            rt.committedSettings = AccountSettings(
-                musicFolder = fixture.currentFolder,
-                cacheLimitMb = fixture.cacheLimitMb,
-                downloadThreads = fixture.downloadThreads,
-                cacheThreads = fixture.cacheThreads,
-                playbackMode = fixture.playbackMode,
-                exportFolderDisplayName = "MusicExports",
-                appearanceMode = fixture.appearanceMode,
-                dynamicColorEnabled = fixture.dynamicColorEnabled
-            )
-            rt.themeMode = fixture.appearanceMode
-            rt.dynamicColorEnabled = fixture.dynamicColorEnabled
-            rt.syncDraftsFromCommitted()
-
-            when (scene) {
-                SnapshotScene.AUTH_IDLE -> {
-                    rt.isAuthenticated = false
-                    rt.accountName = null
-                    rt.accountStorageKey = null
-                    rt.cacheUsageBytes = 0L
-                }
-                SnapshotScene.AUTH_QR -> {
-                    rt.isAuthenticated = false
-                    rt.accountName = null
-                    rt.accountStorageKey = null
-                    rt.cacheUsageBytes = 0L
-                    rt.qrContent = fixture.qrContent
-                    rt.qrHint = fixture.qrMessage
-                    rt.statusMessage = fixture.qrMessage
-                    rt.qrBitmap = QrCodeHelper.generateQrBitmap(fixture.qrContent, 420)
-                }
-                SnapshotScene.MUSIC,
-                SnapshotScene.VIDEO,
-                SnapshotScene.DOWNLOAD,
-                SnapshotScene.ERROR_BANNER,
-                SnapshotScene.CLOUD,
-                SnapshotScene.SETTINGS,
-                SnapshotScene.NOW_PLAYING -> {
-                    rt.isAuthenticated = true
-                    rt.accountName = fixture.accountName
-                    rt.accountStorageKey = fixture.accountName
-                    rt.cacheUsageBytes = fixture.cacheUsageBytes
-                    val pane = BrowserPaneState(breadcrumbs = fixture.breadcrumbs, payload = fixture.browser)
-                    rt.cloudBrowser = pane
-                    rt.videoBrowser = pane
-                    rt.tracks = fixture.libraryTracks
-                    rt.activeTrack = fixture.libraryTracks.firstOrNull { it.id == fixture.nowPlayingTrackId }
-                        ?: fixture.browser.audioFiles.firstOrNull { it.id == fixture.nowPlayingTrackId }
-                    rt.currentTrackId = fixture.nowPlayingTrackId
-                    rt.nowPlayingTitle = fixture.nowPlayingTitle
-                    rt.nowPlayingArtist = fixture.nowPlayingArtist
-                    rt.nowPlayingAlbum = fixture.nowPlayingAlbum
-                    rt.isPlaying = scene != SnapshotScene.ERROR_BANNER && fixture.isPlaying
-                    rt.currentTime = fixture.currentTimeSeconds
-                    rt.duration = fixture.durationSeconds
-                    rt.shuffle = fixture.shuffle
-                    rt.shuffleOrderIds = fixture.libraryTracks.map { it.id }
-                    rt.loopMode = fixture.loopMode
-                    rt.upNextQueue = fixture.libraryTracks.filterNot { it.id == fixture.nowPlayingTrackId }.take(2)
-                    rt.transferSnapshot = fixture.transferSnapshot
-                    rt.statusMessage = if (scene == SnapshotScene.ERROR_BANNER) {
-                        fixture.errorBannerMessage
-                    } else {
-                        fixture.statusMessage
-                    }
-                    when (scene) {
-                        SnapshotScene.VIDEO -> rt.activeModule = ModuleTab.VIDEO
-                        SnapshotScene.DOWNLOAD -> rt.activeModule = ModuleTab.TRANSFERS
-                        SnapshotScene.CLOUD -> rt.activeModule = ModuleTab.CLOUD
-                        SnapshotScene.SETTINGS -> rt.activeModule = ModuleTab.SETTINGS
-                        SnapshotScene.NOW_PLAYING -> {
-                            rt.activeModule = ModuleTab.MUSIC
-                            rt.isShowingNowPlayingSheet = true
-                        }
-                        else -> rt.activeModule = ModuleTab.MUSIC
-                    }
-                }
-            }
-            return vm
-        }
     }
 }

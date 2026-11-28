@@ -95,20 +95,64 @@ public enum Cloud189Protocol {
         return false
     }
 
-    public static func formatHTTPDate(_ date: Date = Date()) -> String {
+    private static let upperHexTable: [UInt8] = Array("0123456789ABCDEF".utf8)
+    private static let lowerHexTable: [UInt8] = Array("0123456789abcdef".utf8)
+    private static let formatterLock = NSLock()
+    private static let httpDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
-        return formatter.string(from: date)
+        return formatter
+    }()
+    private static let qrPollDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-ddHH:mm:ss.SSS"
+        return formatter
+    }()
+    private static let ltRegex = try! NSRegularExpression(pattern: #"\blt\s*=\s*["']([^"']+)["']"#)
+    private static let paramIdRegex = try! NSRegularExpression(pattern: #"\bparamId\s*=\s*["']([^"']+)["']"#)
+    private static let reqIdRegex = try! NSRegularExpression(pattern: #"\breqId\s*=\s*["']([^"']+)["']"#)
+    private static let xmlRegexLock = NSLock()
+    nonisolated(unsafe) private static var xmlTagRegexCache: [String: NSRegularExpression] = {
+        var dict: [String: NSRegularExpression] = [:]
+        for tag in ["loginName", "userAccount", "userId", "sessionKey", "sessionSecret"] {
+            let escaped = NSRegularExpression.escapedPattern(for: tag)
+            let pattern = "<\(escaped)>\\s*(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*))\\s*</\(escaped)>"
+            if let compiled = try? NSRegularExpression(pattern: pattern) {
+                dict[tag] = compiled
+            }
+        }
+        return dict
+    }()
+    private static let forbiddenFileNameCharacters: CharacterSet = CharacterSet(charactersIn: "/\\:*?\"<>|")
+        .union(.controlCharacters)
+
+    private static func hexEncoded<Bytes: Sequence>(_ bytes: Bytes, uppercase: Bool) -> String where Bytes.Element == UInt8 {
+        let table = uppercase ? upperHexTable : lowerHexTable
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in bytes {
+            out.append(table[Int(byte >> 4)])
+            out.append(table[Int(byte & 0x0F)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    public static func formatHTTPDate(_ date: Date = Date()) -> String {
+        formatterLock.withLock {
+            httpDateFormatter.string(from: date)
+        }
     }
 
     public static func formatQrPollDate(_ date: Date = Date(), timeZone: TimeZone = .current) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = timeZone
-        formatter.dateFormat = "yyyy-MM-ddHH:mm:ss.SSS"
-        return formatter.string(from: date)
+        formatterLock.withLock {
+            if qrPollDateFormatter.timeZone != timeZone {
+                qrPollDateFormatter.timeZone = timeZone
+            }
+            return qrPollDateFormatter.string(from: date)
+        }
     }
 
     public static func computeSignature(
@@ -125,20 +169,19 @@ public enum Cloud189Protocol {
         let payload = "SessionKey=\(sessionKey)&Operate=\(method)&RequestURI=\(requestURI)&Date=\(dateHeader)"
         let key = SymmetricKey(data: Data(sessionSecret.utf8))
         let digest = HMAC<Insecure.SHA1>.authenticationCode(for: Data(payload.utf8), using: key)
-        let signature = digest.map { String(format: "%02X", $0) }.joined()
+        let signature = hexEncoded(digest, uppercase: true)
         return (requestURI, signature)
     }
 
     /// Uses word boundaries (`\blt\b`) so attributes like `alt="二维码登录成功"` never match `lt`.
     public static func extractLoginParameters(from html: String) throws -> LoginPageParameters {
-        let lt = try matchFirst(in: html, pattern: #"\blt\s*=\s*["']([^"']+)["']"#, label: "lt")
-        let paramId = try matchFirst(in: html, pattern: #"\bparamId\s*=\s*["']([^"']+)["']"#, label: "paramId")
-        let reqId = try matchFirst(in: html, pattern: #"\breqId\s*=\s*["']([^"']+)["']"#, label: "reqId")
+        let lt = try matchFirst(in: html, regex: ltRegex, label: "lt")
+        let paramId = try matchFirst(in: html, regex: paramIdRegex, label: "paramId")
+        let reqId = try matchFirst(in: html, regex: reqIdRegex, label: "reqId")
         return LoginPageParameters(lt: lt, paramId: paramId, reqId: reqId)
     }
 
-    private static func matchFirst(in text: String, pattern: String, label: String) throws -> String {
-        let regex = try NSRegularExpression(pattern: pattern)
+    private static func matchFirst(in text: String, regex: NSRegularExpression, label: String) throws -> String {
         let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: nsRange),
               match.numberOfRanges > 1,
@@ -315,7 +358,7 @@ public enum Cloud189Protocol {
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty && $0 != Cloud189Constants.defaultAccountDisplayName } ?? sessionKey
         let digest = SHA256.hash(data: Data("cloudtune-anon-account:\(seed)".utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        let hex = hexEncoded(digest, uppercase: false)
         return "acct:\(hex)"
     }
 
@@ -370,12 +413,11 @@ public enum Cloud189Protocol {
     public static func accountBucketHash(for accountId: String) -> String {
         let normalized = accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let digest = SHA256.hash(data: Data(normalized.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return hexEncoded(digest, uppercase: false)
     }
 
     public static func sanitizeFileName(_ raw: String) -> String {
-        let forbidden = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.controlCharacters)
-        let mapped = String(raw.unicodeScalars.map { forbidden.contains($0) ? "_" : Character($0) })
+        let mapped = String(raw.unicodeScalars.map { forbiddenFileNameCharacters.contains($0) ? "_" : Character($0) })
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if mapped.isEmpty {
             return "track.bin"
@@ -462,9 +504,23 @@ public enum Cloud189Protocol {
             .replacingOccurrences(of: "\u{feff}", with: "")
     }
 
+    private static func xmlTagRegex(for tag: String) -> NSRegularExpression? {
+        xmlRegexLock.withLock {
+            if let cached = xmlTagRegexCache[tag] {
+                return cached
+            }
+            let escaped = NSRegularExpression.escapedPattern(for: tag)
+            let pattern = "<\(escaped)>\\s*(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*))\\s*</\(escaped)>"
+            guard let compiled = try? NSRegularExpression(pattern: pattern) else {
+                return nil
+            }
+            xmlTagRegexCache[tag] = compiled
+            return compiled
+        }
+    }
+
     private static func extractXMLTag(_ tag: String, in xml: String) -> String? {
-        let pattern = "<\(NSRegularExpression.escapedPattern(for: tag))>\\s*(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*))\\s*</\(NSRegularExpression.escapedPattern(for: tag))>"
-        guard let regex = try? NSRegularExpression(pattern: pattern),
+        guard let regex = xmlTagRegex(for: tag),
               let match = regex.firstMatch(in: xml, range: NSRange(xml.startIndex..<xml.endIndex, in: xml)) else {
             return nil
         }

@@ -67,8 +67,25 @@ public final class CloudTuneViewModel {
 
     public var isBootstrapping: Bool = false
     public var busyLabel: String?
-    public var statusMessage: String?
+    public var statusMessage: String? {
+        didSet {
+            if statusMessage == nil {
+                statusKind = .info
+            }
+        }
+    }
+    public var statusKind: StatusKind = .info
     public var credentialIssue: CredentialIssue?
+
+    public func setStatus(_ message: String?, kind: StatusKind = .info) {
+        if let message {
+            statusKind = kind
+            statusMessage = message
+        } else {
+            statusMessage = nil
+            statusKind = .info
+        }
+    }
 
     public var isAuthenticated: Bool = false
     public var accountName: String?
@@ -288,7 +305,7 @@ public final class CloudTuneViewModel {
         }
 
         if let startupWarning {
-            self.statusMessage = startupWarning
+            self.setStatus(startupWarning, kind: .error)
         }
         syncDraftsFromCommitted()
 
@@ -350,7 +367,7 @@ public final class CloudTuneViewModel {
             vm.cacheUsageBytes = 0
             vm.qrContent = fixture.qrLogin.qrContent
             vm.qrHint = fixture.qrLogin.message
-            vm.statusMessage = fixture.qrLogin.message
+            vm.setStatus(fixture.qrLogin.message, kind: .info)
             vm.qrPNGData = QRCodeGenerator.generatePNGData(content: fixture.qrLogin.qrContent, dimension: 480)
         case .music, .video, .download, .errorBanner, .cloud, .settings, .nowPlaying:
             vm.isAuthenticated = true
@@ -378,7 +395,11 @@ public final class CloudTuneViewModel {
             vm.currentTime = fixture.nowPlaying.currentTimeSeconds
             vm.duration = fixture.nowPlaying.durationSeconds
             vm.transferSnapshot = fixture.transferSnapshot
-            vm.statusMessage = (scene == .errorBanner) ? fixture.errorBanner.statusMessage : fixture.nowPlaying.statusMessage
+            if scene == .errorBanner {
+                vm.setStatus(fixture.errorBanner.statusMessage, kind: .error)
+            } else {
+                vm.setStatus(fixture.nowPlaying.statusMessage, kind: .info)
+            }
 
             switch scene {
             case .video:
@@ -515,7 +536,7 @@ public final class CloudTuneViewModel {
             if settingsValidationError == nil {
                 let msg = "尚有未应用的设置草稿，请先点击「应用」或「还原修改」后再关闭。"
                 settingsValidationError = msg
-                statusMessage = msg
+                setStatus(msg, kind: .error)
             }
             return false
         }
@@ -528,7 +549,7 @@ public final class CloudTuneViewModel {
               parsed >= AccountSettings.minCacheLimitMB else {
             let msg = "缓存上限至少设为 256 MB。"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, kind: .error)
             return nil
         }
         return parsed
@@ -539,14 +560,14 @@ public final class CloudTuneViewModel {
               (1...AccountSettings.maxDownloadThreads).contains(dl) else {
             let msg = "下载线程范围是 1-\(AccountSettings.maxDownloadThreads)"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, kind: .error)
             return nil
         }
         guard let ct = Int(cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
               (1...AccountSettings.maxCacheThreads).contains(ct) else {
             let msg = "缓存线程范围是 1-\(AccountSettings.maxCacheThreads)"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, kind: .error)
             return nil
         }
         return (dl, ct)
@@ -615,7 +636,7 @@ public final class CloudTuneViewModel {
                 }
             } catch {
                 if isAuthenticated, activeAccountKey == expectedAccount {
-                    statusMessage = "缓存清理遇到异常：\(error.localizedDescription)"
+                    setStatus("缓存清理遇到异常：\(error.localizedDescription)", kind: .error)
                 }
             }
         }
@@ -643,7 +664,7 @@ public final class CloudTuneViewModel {
                 }
             } catch {
                 if isAuthenticated, activeAccountKey == expectedAccount {
-                    statusMessage = "缓存清理遇到异常：\(error.localizedDescription)"
+                    setStatus("缓存清理遇到异常：\(error.localizedDescription)", kind: .error)
                 }
             }
         }
@@ -699,7 +720,7 @@ public final class CloudTuneViewModel {
             committedSettings = next
             applyDraftSync(draftSync)
             if let successMessage {
-                statusMessage = successMessage
+                setStatus(successMessage, kind: .info)
             }
             return true
         }
@@ -720,12 +741,12 @@ public final class CloudTuneViewModel {
             }
             applyDraftSync(draftSync)
             if let successMessage {
-                statusMessage = successMessage
+                setStatus(successMessage, kind: .info)
             }
             return true
         } catch {
             if isAuthenticated, activeAccountKey == accountId {
-                statusMessage = "\(failurePrefix)：\(error.localizedDescription)"
+                setStatus("\(failurePrefix)：\(error.localizedDescription)", kind: .error)
             }
             return false
         }
@@ -742,7 +763,7 @@ public final class CloudTuneViewModel {
             return nil
         } catch {
             let warning = "钥匙串保存凭据失败：\(error.localizedDescription)"
-            statusMessage = warning
+            setStatus(warning, kind: .error)
             return warning
         }
     }
@@ -780,7 +801,7 @@ public final class CloudTuneViewModel {
         }
         credentialIssue = issue
         if let issue {
-            statusMessage = issue.userMessage
+            setStatus(issue.userMessage, kind: .error)
             return
         }
         guard let storedCred else {
@@ -813,7 +834,7 @@ public final class CloudTuneViewModel {
         } catch {
             guard authGeneration == expectedAuthGen else { return }
             isAuthenticated = false
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -834,14 +855,14 @@ public final class CloudTuneViewModel {
             guard authGeneration == expectedAuthGen, !isAuthenticated else { return }
             qrContent = start.qrContent
             qrHint = start.message
-            statusMessage = start.message
+            setStatus(start.message, kind: .info)
             qrPNGData = QRCodeGenerator.generatePNGData(content: start.qrContent, dimension: 512)
             startQrPolling()
         } catch is CancellationError {
             return
         } catch {
             guard authGeneration == expectedAuthGen else { return }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -860,7 +881,7 @@ public final class CloudTuneViewModel {
                     let poll = try await self.cloudClient.pollQrLogin()
                     guard !Task.isCancelled, self.authGeneration == expectedAuthGen else { return }
                     self.qrHint = poll.message
-                    self.statusMessage = poll.message
+                    self.setStatus(poll.message, kind: .info)
                     switch poll.state {
                     case .authenticated:
                         let clientEpoch = poll.sessionEpoch
@@ -921,7 +942,7 @@ public final class CloudTuneViewModel {
                     return
                 } catch {
                     if self.authGeneration == expectedAuthGen {
-                        self.statusMessage = error.localizedDescription
+                        self.setStatus(error.localizedDescription, kind: .error)
                     }
                     return
                 }
@@ -974,16 +995,19 @@ public final class CloudTuneViewModel {
             await browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
             guard isAuthenticated, activeAccountKey == identity.storageKey else { return }
             if let credentialWarning {
-                statusMessage = "天翼官方网页登录成功（\(credentialWarning)）"
+                setStatus("天翼官方网页登录成功（\(credentialWarning)）", kind: .error)
             } else {
-                statusMessage = "天翼官方网页登录成功"
+                setStatus("天翼官方网页登录成功", kind: .info)
             }
         } catch is CancellationError {
             return
         } catch {
             guard authGeneration == loginAuthGen else { return }
             isShowingWebLoginSheet = false
-            statusMessage = "网页登录回调兑换失败（\(error.localizedDescription)），已切换至二维码扫码登录，可保存二维码到相册后用天翼云盘 App 识别。"
+            setStatus(
+                "网页登录回调兑换失败（\(error.localizedDescription)），已切换至二维码扫码登录，可保存二维码到相册后用天翼云盘 App 识别。",
+                kind: .error
+            )
             await beginQrLogin()
         }
     }
@@ -1020,7 +1044,7 @@ public final class CloudTuneViewModel {
             guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.cacheStore = nil
             self.cacheUsageBytes = 0
-            self.statusMessage = "初始化本地缓存目录失败：\(error.localizedDescription)"
+            self.setStatus("初始化本地缓存目录失败：\(error.localizedDescription)", kind: .error)
         }
 
         do {
@@ -1040,7 +1064,7 @@ public final class CloudTuneViewModel {
             }
         } catch {
             guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
-            self.statusMessage = "读取账户设置失败：\(error.localizedDescription)"
+            self.setStatus("读取账户设置失败：\(error.localizedDescription)", kind: .error)
         }
 
         do {
@@ -1050,7 +1074,7 @@ public final class CloudTuneViewModel {
         } catch {
             guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.tracks = []
-            self.statusMessage = "读取本地曲库索引失败：\(error.localizedDescription)"
+            self.setStatus("读取本地曲库索引失败：\(error.localizedDescription)", kind: .error)
         }
 
         await transferEngine.restorePersistedDownloads(for: storageKey, accountStore: accountStore)
@@ -1127,7 +1151,7 @@ public final class CloudTuneViewModel {
         transferSnapshot = TransferSnapshotPayload()
         committedSettings = AccountSettings(appearanceMode: appearancePreference)
         syncDraftsFromCommitted()
-        statusMessage = "已退出登录并清理当前会话"
+        setStatus("已退出登录并清理当前会话", kind: .info)
     }
 
     public func shutdownForTermination() {
@@ -1239,7 +1263,7 @@ public final class CloudTuneViewModel {
                   activeAccountKey == expectedAccount else {
                 return
             }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -1278,7 +1302,7 @@ public final class CloudTuneViewModel {
 
     public func scanMusicLibrary(showBusy: Bool = true) async {
         guard isAuthenticated, let folder = committedSettings.musicFolder, let accountId = activeAccountKey else {
-            statusMessage = "请先在云盘目录中设为音乐库。"
+            setStatus("请先在云盘目录中设为音乐库。", kind: .info)
             return
         }
         let expectedAuthGen = authGeneration
@@ -1306,16 +1330,16 @@ public final class CloudTuneViewModel {
             do {
                 try await accountStore.saveLibrary(scanned, for: accountId)
                 guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
-                statusMessage = "已载入 \(scanned.count) 首音乐"
+                setStatus("已载入 \(scanned.count) 首音乐", kind: .info)
             } catch {
                 guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
-                statusMessage = "已载入 \(scanned.count) 首音乐（索引落盘失败：\(error.localizedDescription)）"
+                setStatus("已载入 \(scanned.count) 首音乐（索引落盘失败：\(error.localizedDescription)）", kind: .error)
             }
         } catch is CancellationError {
             return
         } catch {
             guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -1325,13 +1349,13 @@ public final class CloudTuneViewModel {
         cancelPrefetchTask()
         prefetchedTrackId = nil
         upNextQueue = PlaybackQueueResolver.insertPlayNext(upNext: upNextQueue, track: track)
-        statusMessage = "已设为下一首播放：《\(track.name)》"
+        setStatus("已设为下一首播放：《\(track.name)》", kind: .info)
         triggerPrefetchIfNeeded()
     }
 
     public func appendToQueue(_ track: TrackSummary) {
         upNextQueue = PlaybackQueueResolver.appendToQueue(upNext: upNextQueue, track: track)
-        statusMessage = "已加入待播队列：《\(track.name)》"
+        setStatus("已加入待播队列：《\(track.name)》", kind: .info)
     }
 
     public func removeFromQueue(trackId: String) {
@@ -1570,7 +1594,7 @@ public final class CloudTuneViewModel {
             return
         }
         if let audioSessionWarning = nowPlayingCoordinator.configureAudioSessionIfNeeded() {
-            statusMessage = audioSessionWarning
+            setStatus(audioSessionWarning, kind: .error)
         }
         currentPlaybackIsLoopback = isLoopback
         activeTrack = track
@@ -1665,7 +1689,7 @@ public final class CloudTuneViewModel {
         player.play()
         isPlaying = true
         if statusMessage == nil || !statusMessage!.hasPrefix("音频会话配置失败") {
-            statusMessage = isLoopback ? "边播边缓存《\(track.name)》" : "正在播放《\(track.name)》"
+            setStatus(isLoopback ? "边播边缓存《\(track.name)》" : "正在播放《\(track.name)》", kind: .info)
         }
 
         let fallbackAlbum = track.folderPath.isEmpty ? (committedSettings.musicFolder?.name ?? "天翼云盘") : track.folderPath
@@ -1804,7 +1828,7 @@ public final class CloudTuneViewModel {
         switch action {
         case .fallbackToStreamProxyOnce:
             guard isAuthenticated, playbackGeneration == failedGeneration else { return }
-            statusMessage = "《\(track.name)》优先缓存超时，改用流式代理直接起播"
+            setStatus("《\(track.name)》优先缓存超时，改用流式代理直接起播", kind: .info)
             await playTrack(
                 track,
                 modeOverride: .streamCache,
@@ -1814,7 +1838,7 @@ public final class CloudTuneViewModel {
             )
         case .fallbackToFullDownloadOnce:
             guard isAuthenticated, playbackGeneration == failedGeneration else { return }
-            statusMessage = "流式容器受限，回退整曲下载《\(track.name)》"
+            setStatus("流式容器受限，回退整曲下载《\(track.name)》", kind: .info)
             await playTrack(
                 track,
                 modeOverride: .downloadFirst,
@@ -1824,14 +1848,14 @@ public final class CloudTuneViewModel {
             )
         case let .stopImmediatelyUnsupportedCodec(msg):
             isPlaying = false
-            statusMessage = msg
+            setStatus(msg, kind: .error)
         case .stopAfterMaxRetries:
             isPlaying = false
-            statusMessage = "播放异常，已停止自动重试《\(track.name)》"
+            setStatus("播放异常，已停止自动重试《\(track.name)》", kind: .error)
         case let .retryTransientAfterDelay(attempt):
             isPlaying = false
             guard isAuthenticated, playbackGeneration == failedGeneration else { return }
-            statusMessage = "播放波动，正在重试《\(track.name)》(\(attempt)/\(PlaybackDecisionPolicy.maxRecoveryAttempts))"
+            setStatus("播放波动，正在重试《\(track.name)》(\(attempt)/\(PlaybackDecisionPolicy.maxRecoveryAttempts))", kind: .info)
             let delayMs = max(0, retryBaseDelayMs) * attempt
             if delayMs > 0 {
                 let sleepTask = Task {
@@ -2008,7 +2032,7 @@ public final class CloudTuneViewModel {
                 }
                 activeVideoTrack = video
                 activeVideoURL = cached
-                statusMessage = "正在播放已缓存视频：\(video.name)"
+                setStatus("正在播放已缓存视频：\(video.name)", kind: .info)
                 return
             }
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
@@ -2058,7 +2082,7 @@ public final class CloudTuneViewModel {
             }
             activeVideoTrack = video
             activeVideoURL = playbackURL
-            statusMessage = "正在应用内播放视频：\(video.name)"
+            setStatus("正在应用内播放视频：\(video.name)", kind: .info)
         } catch is CancellationError {
             return
         } catch {
@@ -2067,7 +2091,7 @@ public final class CloudTuneViewModel {
                   activeAccountKey == expectedAccount else {
                 return
             }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -2157,14 +2181,14 @@ public final class CloudTuneViewModel {
                   activeAccountKey == expectedAccount else {
                 return nil
             }
-            statusMessage = "获取视频源失败：\(error.localizedDescription)"
+            setStatus("获取视频源失败：\(error.localizedDescription)", kind: .error)
             return nil
         }
     }
 
     public func downloadVideoAndPrepareLocalFile(_ video: TrackSummary) async -> URL? {
         guard isAuthenticated, let accountId = activeAccountKey, let capturedStore = cacheStore else {
-            statusMessage = "请先登录后再缓存视频。"
+            setStatus("请先登录后再缓存视频。", kind: .error)
             return nil
         }
         externalVideoGeneration += 1
@@ -2202,7 +2226,7 @@ public final class CloudTuneViewModel {
             }
             cacheUsageBytes = latestUsage
             shareFileURL = localURL
-            statusMessage = "视频缓存完成，正在调用本地播放器打开"
+            setStatus("视频缓存完成，正在调用本地播放器打开", kind: .info)
             return localURL
         } catch is CancellationError {
             return nil
@@ -2212,7 +2236,7 @@ public final class CloudTuneViewModel {
                   activeAccountKey == accountId else {
                 return nil
             }
-            statusMessage = "缓存视频失败：\(error.localizedDescription)"
+            setStatus("缓存视频失败：\(error.localizedDescription)", kind: .error)
             return nil
         }
     }
@@ -2229,11 +2253,11 @@ public final class CloudTuneViewModel {
                 accountStore: accountStore
             )
             transferSnapshot = await transferEngine.snapshot()
-            statusMessage = "已创建下载任务 \(taskId)"
+            setStatus("已创建下载任务 \(taskId)", kind: .info)
         } catch is CancellationError {
             return
         } catch {
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -2264,19 +2288,16 @@ public final class CloudTuneViewModel {
                   activeAccountKey == accountId else {
                 return
             }
-            for item in allFiles {
-                guard authGeneration == expectedAuthGen,
-                      isAuthenticated,
-                      activeAccountKey == accountId else {
-                    return
-                }
+            let batchItems: [(track: TrackSummary, relativeExportSubpath: String)] = allFiles.map { item in
                 let rel = item.folderPath.hasPrefix(rootExportFolder)
                     ? "\(item.folderPath)/\(item.name)"
                     : "\(rootExportFolder)/\(item.name)"
-                _ = try await transferEngine.enqueueExportDownload(
+                return (track: item, relativeExportSubpath: rel)
+            }
+            if !batchItems.isEmpty {
+                _ = try await transferEngine.enqueueExportDownloads(
                     accountId: accountId,
-                    track: item,
-                    relativeExportSubpath: rel,
+                    items: batchItems,
                     parallelThreads: committedSettings.downloadThreads,
                     explicitDirectoryURL: explicitDirectoryURL,
                     accountStore: accountStore
@@ -2289,7 +2310,7 @@ public final class CloudTuneViewModel {
                 return
             }
             transferSnapshot = latestSnap
-            statusMessage = "目录下载已入队（共 \(allFiles.count) 个文件）"
+            setStatus("目录下载已入队（共 \(allFiles.count) 个文件）", kind: .info)
         } catch is CancellationError {
             return
         } catch {
@@ -2298,7 +2319,7 @@ public final class CloudTuneViewModel {
                   activeAccountKey == accountId else {
                 return
             }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
         }
     }
 
@@ -2332,11 +2353,11 @@ public final class CloudTuneViewModel {
                 lastAppliedSettingsSeq = result.sequence
                 committedSettings = result.settings
             }
-            statusMessage = "下载导出目录已设为 \(result.displayName)"
+            setStatus("下载导出目录已设为 \(result.displayName)", kind: .info)
             return true
         } catch {
             guard isAuthenticated, activeAccountKey == accountId else { return false }
-            statusMessage = error.localizedDescription
+            setStatus(error.localizedDescription, kind: .error)
             return false
         }
     }

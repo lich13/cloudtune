@@ -203,9 +203,11 @@ public struct MacWorkspaceView: View {
         VStack(spacing: 18) {
             if let status = viewModel.settingsValidationError ?? viewModel.busyLabel ?? viewModel.statusMessage,
                !status.isEmpty {
+                let isErr = viewModel.settingsValidationError != nil
+                    || (viewModel.busyLabel == nil && (viewModel.credentialIssue != nil || viewModel.statusKind == .error))
                 SubtleStatusBanner(
                     message: status,
-                    isError: viewModel.credentialIssue != nil || status.contains("失败"),
+                    isError: isErr,
                     busyLabel: viewModel.busyLabel,
                     palette: palette
                 )
@@ -301,9 +303,7 @@ public struct MacWorkspaceView: View {
                         if let status = viewModel.settingsValidationError ?? viewModel.busyLabel ?? viewModel.statusMessage,
                            !status.isEmpty {
                             let isErr = viewModel.settingsValidationError != nil
-                                || status.contains("失败")
-                                || status.contains("不受系统解码器支持")
-                                || status.contains("已停止自动重试")
+                                || (viewModel.busyLabel == nil && viewModel.statusKind == .error)
                             SubtleStatusBanner(
                                 message: status,
                                 isError: isErr,
@@ -1375,9 +1375,9 @@ public struct MacWorkspaceView: View {
         if await presentMacPanelAsync(panel) == .OK, let url = panel.url {
             do {
                 try pngData.write(to: url, options: .atomic)
-                viewModel.statusMessage = "二维码已保存至 \(url.lastPathComponent)"
+                viewModel.setStatus("二维码已保存至 \(url.lastPathComponent)", kind: .info)
             } catch {
-                viewModel.statusMessage = "保存二维码失败：\(error.localizedDescription)"
+                viewModel.setStatus("保存二维码失败：\(error.localizedDescription)", kind: .error)
             }
         }
     }

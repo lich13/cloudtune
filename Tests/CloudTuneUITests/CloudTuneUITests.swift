@@ -936,6 +936,42 @@ struct CloudTuneUITests {
         #expect(vm.accountStorageKey == nil)
     }
 
+    @Test("StatusKind contract transitions (.info / .error / nil reset) across fixture scenes, validation, and playback failures")
+    @MainActor
+    func verifyStatusKindContractTransitions() async throws {
+        let fixtureURL = repoRootURL().appendingPathComponent("contracts/representative-state.json")
+        let fixture = try RepresentativeFixture.load(from: fixtureURL)
+
+        let errorVM = CloudTuneViewModel.fixture(scene: .errorBanner, fixture: fixture)
+        #expect(errorVM.statusKind == .error)
+        #expect(errorVM.statusMessage == fixture.errorBanner.statusMessage)
+
+        let musicVM = CloudTuneViewModel.fixture(scene: .music, fixture: fixture)
+        #expect(musicVM.statusKind == .info)
+
+        // Validation failure sets .error; clearing statusMessage resets statusKind to .info
+        musicVM.cacheLimitDraft = "64"
+        #expect(await musicVM.commitCacheLimitDraft() == false)
+        #expect(musicVM.statusKind == .error)
+        musicVM.statusMessage = nil
+        #expect(musicVM.statusKind == .info)
+
+        // Normal queue operations keep .info even if track title contains words like "失败"
+        let trickyTrack = TrackSummary(id: "tricky-1", name: "永不失败的序曲.flac", folderPath: "Music", sizeBytes: 1024)
+        musicVM.playNext(trickyTrack)
+        #expect(musicVM.statusKind == .info)
+        #expect(musicVM.statusMessage?.contains("永不失败的序曲") == true)
+
+        // Unsupported codec failure sets .error
+        await musicVM.handlePlaybackPreparationFailure(
+            track: TrackSummary(id: "ape-err", name: "Broken.ape", folderPath: "Music", sizeBytes: 512),
+            error: CloudTuneError.unsupportedLocalMediaFormat("decode failed"),
+            wasLoopback: false,
+            resumeTime: 0
+        )
+        #expect(musicVM.statusKind == .error)
+    }
+
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")
     func verifyQRCodeRendering() throws {
         let png = try #require(QRCodeGenerator.generatePNGData(content: "https://open.e.189.cn/qr/test", dimension: 320))

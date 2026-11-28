@@ -114,7 +114,28 @@ public actor AccountScopedStore {
         guard let data = try? Data(contentsOf: p.libraryURL) else {
             return []
         }
-        return (try? JSONDecoder().decode([TrackSummary].self, from: data)) ?? []
+        if let decoded = try? JSONDecoder().decode([TrackSummary].self, from: data),
+           decoded.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            return decoded
+        }
+        guard let rawArray = try? JSONSerialization.jsonObject(with: data) as? [Any] else {
+            return []
+        }
+        let decoder = JSONDecoder()
+        var recovered: [TrackSummary] = []
+        recovered.reserveCapacity(rawArray.count)
+        for element in rawArray {
+            guard JSONSerialization.isValidJSONObject(element),
+                  let dict = element as? [String: Any],
+                  let itemData = try? JSONSerialization.data(withJSONObject: dict),
+                  let track = try? decoder.decode(TrackSummary.self, from: itemData),
+                  !track.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !track.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            recovered.append(track)
+        }
+        return recovered
     }
 
     public func saveLibrary(_ tracks: [TrackSummary], for accountId: String) throws {
@@ -182,6 +203,32 @@ public actor AccountScopedStore {
         return try? Data(contentsOf: p.exportBookmarkURL)
     }
 
+    /// Exports ordered staged part files sequentially (single-pass `128 KB` streaming) into the user-selected folder
+    /// using security-scoped bookmark + off-actor `NSFileCoordinator`.
+    public func exportStagedParts(
+        partURLs: [URL],
+        expectedTotalBytes: UInt64? = nil,
+        relativeSubpath: String,
+        explicitDirectoryURL: URL? = nil,
+        manifestBookmarkData: Data? = nil,
+        for accountId: String
+    ) async throws -> URL {
+        guard !partURLs.isEmpty else {
+            throw CloudTuneError.invalidRequest("导出分片列表为空")
+        }
+        let folderURL = try resolveExportDirectoryURL(
+            explicitDirectoryURL: explicitDirectoryURL,
+            manifestBookmarkData: manifestBookmarkData,
+            for: accountId
+        )
+        return try await Self.coordinateAndStreamPartsOffActor(
+            partURLs: partURLs,
+            expectedTotalBytes: expectedTotalBytes,
+            relativeSubpath: relativeSubpath,
+            folderURL: folderURL
+        )
+    }
+
     /// Exports a verified staged file into the user-selected folder using security-scoped bookmark + NSFileCoordinator.
     public func exportStagedFile(
         stagedFileURL: URL,
@@ -189,58 +236,102 @@ public actor AccountScopedStore {
         explicitDirectoryURL: URL? = nil,
         manifestBookmarkData: Data? = nil,
         for accountId: String
-    ) throws -> URL {
-        let folderURL: URL
-        if let explicitDirectoryURL {
-            folderURL = explicitDirectoryURL
-        } else {
-            let p = try paths(for: accountId)
-            let bookmarkData: Data
-            let usedAccountDefaultBookmark: Bool
-            if let manifestBookmarkData {
-                bookmarkData = manifestBookmarkData
-                usedAccountDefaultBookmark = false
-            } else if let defaultBookmarkData = try? Data(contentsOf: p.exportBookmarkURL) {
-                bookmarkData = defaultBookmarkData
-                usedAccountDefaultBookmark = true
-            } else {
-                throw CloudTuneError.exportPermissionRevoked("尚未选择导出目录或目录授权已失效，请重新选择导出文件夹。")
-            }
-            var isStale = false
-            #if os(macOS)
-            let resolveOptions: URL.BookmarkResolutionOptions = [.withSecurityScope]
-            #else
-            let resolveOptions: URL.BookmarkResolutionOptions = []
-            #endif
-            guard let resolved = try? URL(
-                resolvingBookmarkData: bookmarkData,
-                options: resolveOptions,
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            ) else {
-                throw CloudTuneError.exportPermissionRevoked("导出文件夹权限已撤销，请重新授权下载目录。")
-            }
-            if isStale && usedAccountDefaultBookmark {
-                let refreshedAccess = resolved.startAccessingSecurityScopedResource()
-                defer {
-                    if refreshedAccess { resolved.stopAccessingSecurityScopedResource() }
-                }
-                #if os(macOS)
-                let refreshCreationOptions: URL.BookmarkCreationOptions = [.withSecurityScope]
-                #else
-                let refreshCreationOptions: URL.BookmarkCreationOptions = []
-                #endif
-                if let refreshedData = try? resolved.bookmarkData(
-                    options: refreshCreationOptions,
-                    includingResourceValuesForKeys: nil,
-                    relativeTo: nil
-                ) {
-                    try? refreshedData.write(to: p.exportBookmarkURL, options: .atomic)
-                }
-            }
-            folderURL = resolved
-        }
+    ) async throws -> URL {
+        try await exportStagedParts(
+            partURLs: [stagedFileURL],
+            expectedTotalBytes: nil,
+            relativeSubpath: relativeSubpath,
+            explicitDirectoryURL: explicitDirectoryURL,
+            manifestBookmarkData: manifestBookmarkData,
+            for: accountId
+        )
+    }
 
+    private func resolveExportDirectoryURL(
+        explicitDirectoryURL: URL?,
+        manifestBookmarkData: Data?,
+        for accountId: String
+    ) throws -> URL {
+        if let explicitDirectoryURL {
+            return explicitDirectoryURL
+        }
+        let p = try paths(for: accountId)
+        let bookmarkData: Data
+        let usedAccountDefaultBookmark: Bool
+        if let manifestBookmarkData {
+            bookmarkData = manifestBookmarkData
+            usedAccountDefaultBookmark = false
+        } else if let defaultBookmarkData = try? Data(contentsOf: p.exportBookmarkURL) {
+            bookmarkData = defaultBookmarkData
+            usedAccountDefaultBookmark = true
+        } else {
+            throw CloudTuneError.exportPermissionRevoked("尚未选择导出目录或目录授权已失效，请重新选择导出文件夹。")
+        }
+        var isStale = false
+        #if os(macOS)
+        let resolveOptions: URL.BookmarkResolutionOptions = [.withSecurityScope]
+        #else
+        let resolveOptions: URL.BookmarkResolutionOptions = []
+        #endif
+        guard let resolved = try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: resolveOptions,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            throw CloudTuneError.exportPermissionRevoked("导出文件夹权限已撤销，请重新授权下载目录。")
+        }
+        if isStale && usedAccountDefaultBookmark {
+            let refreshedAccess = resolved.startAccessingSecurityScopedResource()
+            defer {
+                if refreshedAccess { resolved.stopAccessingSecurityScopedResource() }
+            }
+            #if os(macOS)
+            let refreshCreationOptions: URL.BookmarkCreationOptions = [.withSecurityScope]
+            #else
+            let refreshCreationOptions: URL.BookmarkCreationOptions = []
+            #endif
+            if let refreshedData = try? resolved.bookmarkData(
+                options: refreshCreationOptions,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            ) {
+                try? refreshedData.write(to: p.exportBookmarkURL, options: .atomic)
+            }
+        }
+        return resolved
+    }
+
+    nonisolated private static func coordinateAndStreamPartsOffActor(
+        partURLs: [URL],
+        expectedTotalBytes: UInt64?,
+        relativeSubpath: String,
+        folderURL: URL
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let result = try performCoordinatedPartExport(
+                        partURLs: partURLs,
+                        expectedTotalBytes: expectedTotalBytes,
+                        relativeSubpath: relativeSubpath,
+                        folderURL: folderURL
+                    )
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    nonisolated private static func performCoordinatedPartExport(
+        partURLs: [URL],
+        expectedTotalBytes: UInt64?,
+        relativeSubpath: String,
+        folderURL: URL
+    ) throws -> URL {
         let didStart = folderURL.startAccessingSecurityScopedResource()
         defer {
             if didStart { folderURL.stopAccessingSecurityScopedResource() }
@@ -286,30 +377,56 @@ public actor AccountScopedStore {
         let coordinator = NSFileCoordinator()
         coordinator.coordinate(writingItemAt: targetURL, options: .forReplacing, error: &coordinatorError) { coordinatedURL in
             do {
-                try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+                let fm = FileManager.default
+                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
                 if let linkVals = try? coordinatedURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
                    linkVals.isSymbolicLink == true {
                     throw CloudTuneError.storageError("导出目标路径不允许覆盖符号链接：\(targetLeafName)")
                 }
                 var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: coordinatedURL.path, isDirectory: &isDir), isDir.boolValue {
+                if fm.fileExists(atPath: coordinatedURL.path, isDirectory: &isDir), isDir.boolValue {
                     throw CloudTuneError.storageError("导出目标路径已存在同名文件夹：\(targetLeafName)")
                 }
-                let tempName = ".\(coordinatedURL.lastPathComponent).cloudtune-\(UUID().uuidString.lowercased()).tmp"
+                let tempName = ".cloudtune-export-\(UUID().uuidString.lowercased()).tmp"
                 let tempURL = coordinatedURL.deletingLastPathComponent().appendingPathComponent(tempName, isDirectory: false)
                 defer {
-                    try? FileManager.default.removeItem(at: tempURL)
+                    try? fm.removeItem(at: tempURL)
                 }
-                try FileManager.default.copyItem(at: stagedFileURL, to: tempURL)
+
+                guard fm.createFile(atPath: tempURL.path, contents: nil) else {
+                    throw CloudTuneError.exportPermissionRevoked("无法在导出目录中创建临时文件")
+                }
+                let outHandle = try FileHandle(forWritingTo: tempURL)
+                var totalWritten: UInt64 = 0
+                do {
+                    for partURL in partURLs {
+                        let inHandle = try FileHandle(forReadingFrom: partURL)
+                        defer { try? inHandle.close() }
+                        while let chunk = try inHandle.read(upToCount: 131_072), !chunk.isEmpty {
+                            try outHandle.write(contentsOf: chunk)
+                            totalWritten += UInt64(chunk.count)
+                        }
+                    }
+                    try outHandle.close()
+                } catch {
+                    try? outHandle.close()
+                    throw error
+                }
+
+                if let expectedTotalBytes, expectedTotalBytes > 0, totalWritten != expectedTotalBytes {
+                    throw CloudTuneError.storageError(
+                        "导出分片大小校验失败：实际写入 \(totalWritten) 字节，预期 \(expectedTotalBytes) 字节"
+                    )
+                }
 
                 var replaceIsDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: coordinatedURL.path, isDirectory: &replaceIsDir) {
+                if fm.fileExists(atPath: coordinatedURL.path, isDirectory: &replaceIsDir) {
                     if replaceIsDir.boolValue {
                         throw CloudTuneError.storageError("导出目标路径已存在同名文件夹：\(targetLeafName)")
                     }
-                    _ = try FileManager.default.replaceItemAt(coordinatedURL, withItemAt: tempURL)
+                    _ = try fm.replaceItemAt(coordinatedURL, withItemAt: tempURL)
                 } else {
-                    try FileManager.default.moveItem(at: tempURL, to: coordinatedURL)
+                    try fm.moveItem(at: tempURL, to: coordinatedURL)
                 }
             } catch {
                 writeError = error
@@ -378,6 +495,7 @@ public actor AccountScopedStore {
         }
 
         guard let candidate = matchedCandidate, let json = parsedSettings else {
+            try? Data("none".utf8).write(to: marker, options: .atomic)
             return nil
         }
 

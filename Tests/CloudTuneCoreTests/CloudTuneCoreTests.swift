@@ -91,6 +91,123 @@ struct CloudTuneCoreTests {
             #expect(Cloud189Protocol.accountBucketHash(for: raw) == expectedHash)
         }
 
+        // 6b) Range & Suffix Range validation parity against protocol-vectors.json
+        let rangeBlock = try #require(root["rangeValidation"] as? [String: Any])
+        let probeHeader = try #require(rangeBlock["probeRangeHeader"] as? String)
+        let midSeekHeader = try #require(rangeBlock["midSeekRangeHeader"] as? String)
+        let fullOpenHeader = try #require(rangeBlock["fullOpenRangeHeader"] as? String)
+        let partialCR = try #require(rangeBlock["partialContentRangeHeader"] as? String)
+        let expectedTotal = UInt64(try #require(rangeBlock["expectedTotalFromContentRange"] as? Int))
+        let resumeOffset = UInt64(try #require(rangeBlock["resumeOffset"] as? Int))
+        let validResumeCR = try #require(rangeBlock["validResumeContentRange"] as? String)
+        let mismatchedResumeCR = try #require(rangeBlock["mismatchedResumeContentRange"] as? String)
+        let initialNonZeroOffset = UInt64(try #require(rangeBlock["initialNonZeroOffset"] as? Int))
+        let validInitialNonZeroCR = try #require(rangeBlock["validInitialNonZeroContentRange"] as? String)
+        let mismatchedInitialNonZeroCR = try #require(rangeBlock["mismatchedInitialNonZeroContentRange"] as? String)
+        let suffixRangeHeader = try #require(rangeBlock["suffixRangeHeader"] as? String)
+        let suffixTotalLength = UInt64(try #require(rangeBlock["suffixTotalLength"] as? Int))
+        let expectedSuffixStart = UInt64(try #require(rangeBlock["expectedSuffixStart"] as? Int))
+        let expectedSuffixEnd = UInt64(try #require(rangeBlock["expectedSuffixEnd"] as? Int))
+        let validSuffixCR = try #require(rangeBlock["validSuffixContentRange"] as? String)
+        let mismatchedSuffixCR = try #require(rangeBlock["mismatchedSuffixContentRange"] as? String)
+
+        #expect(RangeHeaderValidator.parseRequestRange(probeHeader) == ParsedByteRange(start: 0, end: 1))
+        #expect(RangeHeaderValidator.canWriteThroughToCache(rangeHeader: probeHeader) == false)
+        #expect(RangeHeaderValidator.parseRequestRange(midSeekHeader) == ParsedByteRange(start: initialNonZeroOffset, end: nil))
+        #expect(RangeHeaderValidator.canWriteThroughToCache(rangeHeader: midSeekHeader) == false)
+        #expect(RangeHeaderValidator.parseRequestRange(fullOpenHeader) == ParsedByteRange(start: 0, end: nil))
+        #expect(RangeHeaderValidator.canWriteThroughToCache(rangeHeader: fullOpenHeader) == true)
+        #expect(RangeHeaderValidator.extractFullAssetLength(
+            statusCode: 206,
+            requestHadRange: true,
+            contentRangeHeader: partialCR,
+            contentLengthHeader: "2"
+        ) == expectedTotal)
+
+        try RangeHeaderValidator.validateResumeResponse(
+            expectedStartOffset: resumeOffset,
+            statusCode: 206,
+            contentRangeHeader: validResumeCR
+        )
+        #expect(throws: CloudTuneError.self) {
+            try RangeHeaderValidator.validateResumeResponse(
+                expectedStartOffset: resumeOffset,
+                statusCode: 206,
+                contentRangeHeader: mismatchedResumeCR
+            )
+        }
+        try RangeHeaderValidator.validateResumeResponse(
+            expectedStartOffset: initialNonZeroOffset,
+            statusCode: 206,
+            contentRangeHeader: validInitialNonZeroCR
+        )
+        #expect(throws: CloudTuneError.self) {
+            try RangeHeaderValidator.validateResumeResponse(
+                expectedStartOffset: initialNonZeroOffset,
+                statusCode: 206,
+                contentRangeHeader: mismatchedInitialNonZeroCR
+            )
+        }
+        #expect(throws: CloudTuneError.self) {
+            try RangeHeaderValidator.validateResumeResponse(
+                expectedStartOffset: initialNonZeroOffset,
+                statusCode: 200,
+                contentRangeHeader: validInitialNonZeroCR
+            )
+        }
+
+        let parsedSuffix = try #require(RangeHeaderValidator.parseRequestRange(suffixRangeHeader))
+        #expect(parsedSuffix.isSuffix == true)
+        #expect(parsedSuffix.headerValue == suffixRangeHeader)
+        #expect(RangeHeaderValidator.canWriteThroughToCache(rangeHeader: suffixRangeHeader) == false)
+        #expect(RangeHeaderValidator.parseRequestRange("bytes=-0") == nil)
+        let resolvedSuffix = try #require(parsedSuffix.resolve(totalLength: suffixTotalLength))
+        #expect(resolvedSuffix.start == expectedSuffixStart)
+        #expect(resolvedSuffix.end == expectedSuffixEnd)
+
+        let suffixLen = try #require(parsedSuffix.suffixLength)
+        let validatedSuffix = try RangeHeaderValidator.validateSuffixResponse(
+            suffixLength: suffixLen,
+            statusCode: 206,
+            contentRangeHeader: validSuffixCR
+        )
+        #expect(validatedSuffix.start == expectedSuffixStart)
+        #expect(validatedSuffix.end == expectedSuffixEnd)
+        #expect(validatedSuffix.totalLength == suffixTotalLength)
+        #expect(throws: CloudTuneError.self) {
+            _ = try RangeHeaderValidator.validateSuffixResponse(
+                suffixLength: suffixLen,
+                statusCode: 206,
+                contentRangeHeader: mismatchedSuffixCR
+            )
+        }
+        #expect(throws: CloudTuneError.self) {
+            _ = try RangeHeaderValidator.validateSuffixResponse(
+                suffixLength: suffixLen,
+                statusCode: 200,
+                contentRangeHeader: validSuffixCR
+            )
+        }
+
+        // QR poll date format vector check
+        let qrDateBlock = try #require(root["qrPollDateFormat"] as? [String: Any])
+        var cal = Calendar(identifier: .gregorian)
+        let tz = try #require(TimeZone(secondsFromGMT: 8 * 3600))
+        cal.timeZone = tz
+        let comps = DateComponents(
+            calendar: cal,
+            timeZone: tz,
+            year: try #require(qrDateBlock["year"] as? Int),
+            month: try #require(qrDateBlock["month"] as? Int),
+            day: try #require(qrDateBlock["day"] as? Int),
+            hour: try #require(qrDateBlock["hour"] as? Int),
+            minute: try #require(qrDateBlock["minute"] as? Int),
+            second: try #require(qrDateBlock["second"] as? Int),
+            nanosecond: (try #require(qrDateBlock["millisecond"] as? Int)) * 1_000_000
+        )
+        let formattedQrDate = Cloud189Protocol.formatQrPollDate(try #require(cal.date(from: comps)), timeZone: tz)
+        #expect(formattedQrDate == (qrDateBlock["expected"] as? String))
+
         // 7) Unified media extension classification & MIME mapping (including AIFF / AIF / DSF / DFF)
         for losslessName in ["Suite.aiff", "Track.AIF", "Master.dsf", "Studio.DFF", "Aria.flac", "Take.wav", "Album.alac", "Concert.ape"] {
             #expect(Cloud189Protocol.isAudioFile(losslessName) == true)
@@ -1460,6 +1577,409 @@ struct CloudTuneCoreTests {
         #expect(!FileManager.default.fileExists(atPath: dirB.appendingPathComponent("Track1.flac").path))
         #expect(try Data(contentsOf: dirB.appendingPathComponent("Track2.flac")) == payload2)
         #expect(!FileManager.default.fileExists(atPath: dirA.appendingPathComponent("Track2.flac").path))
+    }
+
+    @Test("Slice 2: StreamProxyServer rejects non-zero Range 200 OK, supports bytes=-512 suffix streaming & retry, serves cached tracks locally with zero upstream hits, and caps registered tokens")
+    func verifySlice2StreamProxySuffixInitialRangeAndDirectCacheServing() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s2-proxy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cacheStore = try CacheStore(cacheDirectory: tempDir)
+        let payload = Data((0..<10_000).map { UInt8(($0 * 11) & 0xFF) })
+
+        let observedRanges = LockedBox<[String?]>([])
+        let upstreamMode = LockedBox("200_on_nonzero")
+        let suffixPreResolveFailed = LockedBox(false)
+        let suffixMidStreamDropped = LockedBox(false)
+        let semaphore = GlobalTransferSemaphore(maxPermits: 4)
+
+        let proxy = try StreamProxyServer(
+            semaphore: semaphore,
+            fetcher: MockUpstreamFetcher { _, rangeHeader in
+                observedRanges.withValue { $0.append(rangeHeader) }
+                let mode = upstreamMode.withValue { $0 }
+                if mode == "200_on_nonzero" {
+                    return (
+                        200,
+                        ["content-length": "\(payload.count)"],
+                        AsyncThrowingStream { $0.yield(payload); $0.finish() }
+                    )
+                }
+                if mode == "bad_suffix_cr" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-511/\(payload.count)", "content-length": "512"],
+                        AsyncThrowingStream { $0.yield(payload.prefix(512)); $0.finish() }
+                    )
+                }
+                if rangeHeader == "bytes=-512" {
+                    let shouldFailFirst = suffixPreResolveFailed.withValue { flag -> Bool in
+                        if !flag { flag = true; return true }
+                        return false
+                    }
+                    if shouldFailFirst {
+                        throw URLError(.networkConnectionLost)
+                    }
+                    let shouldDropMid = suffixMidStreamDropped.withValue { flag -> Bool in
+                        if !flag { flag = true; return true }
+                        return false
+                    }
+                    let slice = payload.subdata(in: 9488..<10_000)
+                    let stream = AsyncThrowingStream<Data, Error> { cont in
+                        if shouldDropMid {
+                            cont.yield(slice.prefix(200))
+                            cont.finish(throwing: URLError(.networkConnectionLost))
+                        } else {
+                            cont.yield(slice)
+                            cont.finish()
+                        }
+                    }
+                    return (
+                        206,
+                        ["content-range": "bytes 9488-9999/\(payload.count)", "content-length": "512"],
+                        stream
+                    )
+                }
+                if rangeHeader == "bytes=9688-9999" {
+                    let rest = payload.subdata(in: 9688..<10_000)
+                    return (
+                        206,
+                        ["content-range": "bytes 9688-9999/\(payload.count)", "content-length": "\(rest.count)"],
+                        AsyncThrowingStream { $0.yield(rest); $0.finish() }
+                    )
+                }
+                throw CloudTuneError.protocolError("Unexpected upstream range: \(String(describing: rangeHeader))")
+            }
+        )
+        defer { Task { await proxy.shutdown() } }
+
+        let destURL = await cacheStore.cacheFileURL(trackId: "s2-track", originalFileName: "Suite.flac")
+        let streamURL = await proxy.registerSource(
+            StreamSourceRegistration(
+                accountHash: "acctS2",
+                trackId: "s2-track",
+                remoteURL: URL(string: "https://media.example.invalid/s2.flac")!,
+                cacheDestinationURL: destURL,
+                expectedSize: UInt64(payload.count),
+                fileName: "Suite.flac",
+                cacheLimitBytes: 64 * 1024 * 1024
+            ),
+            cacheStore: cacheStore
+        )
+
+        // 1) Initial non-zero Range (bytes=65536- or bytes=4096-) receiving 200 OK MUST be rejected with 502 Bad Gateway
+        var midSeekReq = URLRequest(url: streamURL)
+        midSeekReq.setValue("bytes=4096-", forHTTPHeaderField: "Range")
+        let (_, midSeekResp) = try await URLSession.shared.data(for: midSeekReq)
+        #expect((midSeekResp as? HTTPURLResponse)?.statusCode == 502)
+
+        // 2) Suffix range receiving mismatched Content-Range (bytes 0-511/10000) MUST be rejected with 502
+        upstreamMode.withValue { $0 = "bad_suffix_cr" }
+        var badSuffixReq = URLRequest(url: streamURL)
+        badSuffixReq.setValue("bytes=-512", forHTTPHeaderField: "Range")
+        let (_, badSuffixResp) = try await URLSession.shared.data(for: badSuffixReq)
+        #expect((badSuffixResp as? HTTPURLResponse)?.statusCode == 502)
+
+        // 3) Valid bytes=-512 retries bytes=-512 on pre-resolution failure (never bytes=0-), resumes mid-stream from 9688, and never writes cache
+        observedRanges.withValue { $0.removeAll() }
+        upstreamMode.withValue { $0 = "valid_suffix" }
+        var suffixReq = URLRequest(url: streamURL)
+        suffixReq.setValue("bytes=-512", forHTTPHeaderField: "Range")
+        let (suffixData, suffixResp) = try await URLSession.shared.data(for: suffixReq)
+        #expect((suffixResp as? HTTPURLResponse)?.statusCode == 206)
+        #expect(suffixData == payload.subdata(in: 9488..<10_000))
+        let suffixCalls = observedRanges.withValue { $0 }
+        #expect(suffixCalls == ["bytes=-512", "bytes=-512", "bytes=9688-9999"])
+        #expect(!suffixCalls.contains("bytes=0-"))
+        #expect(await cacheStore.existingCachedFile(trackId: "s2-track") == nil)
+
+        // 4) Once cached locally, StreamProxyServer serves 200, 206 (explicit & suffix), 416, and HEAD with ZERO upstream calls or remote permits!
+        let localPayload = Data((0..<150_000).map { UInt8(($0 * 5) & 0xFF) })
+        try localPayload.write(to: destURL, options: .atomic)
+        _ = try await cacheStore.recordCompletedFile(
+            trackId: "s2-track",
+            fileURL: destURL,
+            sizeBytes: UInt64(localPayload.count),
+            limitBytes: 64 * 1024 * 1024
+        )
+        observedRanges.withValue { $0.removeAll() }
+        // Exhaust all remote semaphore permits to prove local cache serving bypasses semaphore!
+        for _ in 0..<4 { try await semaphore.acquire() }
+
+        let (cachedFull, cachedFullResp) = try await URLSession.shared.data(from: streamURL)
+        #expect((cachedFullResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(cachedFull == localPayload)
+
+        var cachedExplicitReq = URLRequest(url: streamURL)
+        cachedExplicitReq.setValue("bytes=1000-2047", forHTTPHeaderField: "Range")
+        let (cachedExplicit, cachedExplicitResp) = try await URLSession.shared.data(for: cachedExplicitReq)
+        #expect((cachedExplicitResp as? HTTPURLResponse)?.statusCode == 206)
+        #expect(cachedExplicit == localPayload.subdata(in: 1000..<2048))
+
+        var cachedSuffixReq = URLRequest(url: streamURL)
+        cachedSuffixReq.setValue("bytes=-512", forHTTPHeaderField: "Range")
+        let (cachedSuffix, cachedSuffixResp) = try await URLSession.shared.data(for: cachedSuffixReq)
+        #expect((cachedSuffixResp as? HTTPURLResponse)?.statusCode == 206)
+        #expect(cachedSuffix == localPayload.suffix(512))
+
+        var cached416Req = URLRequest(url: streamURL)
+        cached416Req.setValue("bytes=999999-", forHTTPHeaderField: "Range")
+        let (_, cached416Resp) = try await URLSession.shared.data(for: cached416Req)
+        #expect((cached416Resp as? HTTPURLResponse)?.statusCode == 416)
+
+        var cachedHeadReq = URLRequest(url: streamURL)
+        cachedHeadReq.httpMethod = "HEAD"
+        let (cachedHeadBody, cachedHeadResp) = try await URLSession.shared.data(for: cachedHeadReq)
+        #expect((cachedHeadResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect((cachedHeadResp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length") == "\(localPayload.count)")
+        #expect(cachedHeadBody.isEmpty)
+
+        #expect(observedRanges.withValue { $0.isEmpty })
+        for _ in 0..<4 { await semaphore.release() }
+
+        // 5) sourcesByToken caps history at <= 128 entries
+        for idx in 0..<150 {
+            _ = await proxy.registerSource(
+                StreamSourceRegistration(
+                    token: "tok-cap-\(idx)",
+                    accountHash: "acctS2",
+                    trackId: "t-\(idx)",
+                    remoteURL: URL(string: "https://media.example.invalid/\(idx).flac")!,
+                    cacheDestinationURL: tempDir.appendingPathComponent("\(idx).flac"),
+                    expectedSize: 10,
+                    fileName: "\(idx).flac",
+                    cacheLimitBytes: 64 * 1024 * 1024
+                ),
+                cacheStore: cacheStore
+            )
+        }
+        #expect(await proxy.registeredSourceCount <= 128)
+    }
+
+    @Test("Slice 2: Premature 0-byte EOF retry cap, corrupt index.json rebuild & throttled flush, zero-merge single/multi-part export, resilient loadLibrary, .migrated-v2 marker, and 4-way scan")
+    func verifySlice2TransferCacheStoreAndScanOptimizations() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s2-core-\(UUID().uuidString)")
+        let exportDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s2-export-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir)
+        }
+        try FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+        let store = try AccountScopedStore(rootDirectory: root)
+
+        // (e1) .migrated-v2 negative marker written even when no legacy Tauri files exist
+        let emptyCandidate = root.appendingPathComponent("no-legacy-here", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyCandidate, withIntermediateDirectories: true)
+        let migratedNil = await store.migrateLegacyTauriDataIfPresent(candidateRoots: [emptyCandidate])
+        #expect(migratedNil == nil)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(".migrated-v2").path))
+
+        // (e2) Resilient per-item loadLibrary skips malformed elements and keeps valid tracks
+        let accountId = "s2_user@example.invalid"
+        let paths = try await store.paths(for: accountId)
+        let mixedLibraryJSON = """
+        [
+          {"id":"ok-1","name":"First.flac","folderPath":"Disc1","sizeBytes":1024},
+          "corrupt-string-element",
+          null,
+          {"id":99999,"name":"WrongIdType.flac","folderPath":"Disc1","sizeBytes":10},
+          {"id":"","name":"","folderPath":"Empty"},
+          {"id":"ok-2","name":"Second.wav","folderPath":"Disc2","sizeBytes":2048}
+        ]
+        """
+        try Data(mixedLibraryJSON.utf8).write(to: paths.libraryURL, options: .atomic)
+        let loadedTracks = try await store.loadLibrary(for: accountId)
+        #expect(loadedTracks.map(\.id) == ["ok-1", "ok-2"])
+
+        // (c) Corrupt index.json rebuilds valid <trackId>-<name> entries, deletes temp files, and throttles flush until 16 hits
+        let cacheDir = root.appendingPathComponent("corrupt-cache-test", isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let validBytesA = Data(repeating: 0x41, count: 4096)
+        let validBytesB = Data(repeating: 0x42, count: 2048)
+        let mediaA = cacheDir.appendingPathComponent("987654321-01 - Aria.flac")
+        let mediaB = cacheDir.appendingPathComponent("track-2-Sonata.flac")
+        let orphanPart = cacheDir.appendingPathComponent("orphan.flac.part")
+        let orphanTmp = cacheDir.appendingPathComponent("orphan.tmp")
+        try validBytesA.write(to: mediaA)
+        try validBytesB.write(to: mediaB)
+        try Data("temp".utf8).write(to: orphanPart)
+        try Data("temp2".utf8).write(to: orphanTmp)
+        let indexURL = cacheDir.appendingPathComponent("index.json")
+        try Data("{corrupt-json!!!".utf8).write(to: indexURL)
+
+        let rebuiltCache = try CacheStore(cacheDirectory: cacheDir, indexURL: indexURL)
+        #expect(await rebuiltCache.usageBytes() == UInt64(validBytesA.count + validBytesB.count))
+        #expect(!FileManager.default.fileExists(atPath: orphanPart.path))
+        #expect(!FileManager.default.fileExists(atPath: orphanTmp.path))
+        let initialRepairedData = try Data(contentsOf: indexURL)
+        let repairedDecoded = try JSONDecoder().decode([String: CacheEntry].self, from: initialRepairedData)
+        #expect(repairedDecoded.count == 2)
+
+        // Overwrite index.json with a sentinel marker in-place to observe throttled flush on 16th existingCachedFile call
+        try Data("{}".utf8).write(to: indexURL)
+        for _ in 0..<15 {
+            #expect(await rebuiltCache.existingCachedFile(trackId: "987654321")?.lastPathComponent == "987654321-01 - Aria.flac")
+        }
+        #expect(try String(contentsOf: indexURL, encoding: .utf8) == "{}")
+        #expect(await rebuiltCache.existingCachedFile(trackId: "track-2")?.lastPathComponent == "track-2-Sonata.flac")
+        let flushedAfter16 = try JSONDecoder().decode([String: CacheEntry].self, from: Data(contentsOf: indexURL))
+        #expect(flushedAfter16.count == 2)
+
+        // (b) Premature 0-byte EOF hits retry cap instead of looping infinitely
+        let eofAttempts = LockedBox(0)
+        let eofEngine = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 4),
+            fetcher: MockUpstreamFetcher { _, rangeHeader in
+                if rangeHeader == "bytes=0-0" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/4096", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(Data([0x00])); $0.finish() }
+                    )
+                }
+                eofAttempts.withValue { $0 += 1 }
+                return (
+                    206,
+                    ["content-range": "bytes 0-4095/4096", "content-length": "4096"],
+                    AsyncThrowingStream { $0.finish() }
+                )
+            },
+            retryBaseDelayMs: 2,
+            urlResolver: { _ in URL(string: "https://media.example.invalid/eof.flac")! }
+        )
+        let eofCache = try CacheStore(cacheDirectory: root.appendingPathComponent("eof-cache", isDirectory: true))
+        await #expect(throws: Error.self) {
+            _ = try await eofEngine.downloadTrackToCache(
+                track: TrackSummary(id: "eof-1", name: "ShortEOF.flac", folderPath: "M", sizeBytes: 4096),
+                cacheStore: eofCache,
+                parallelThreads: 1,
+                cacheLimitBytes: 16 * 1024 * 1024
+            )
+        }
+        #expect(eofAttempts.withValue { $0 } == 5)
+
+        // (d) Single-part & multi-part export write exact bytes without creating any .merged file, and orphan staging cleanup preserves manifests
+        let singlePayload = Data((0..<120_000).map { UInt8(($0 * 3) & 0xFF) })
+        let multiPayload = Data((0..<700_000).map { UInt8(($0 * 13) & 0xFF) })
+        let sawMergedInStaging = LockedBox(false)
+        let exportEngine = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 8),
+            fetcher: MockUpstreamFetcher { url, rangeHeader in
+                let data = url.lastPathComponent == "single.flac" ? singlePayload : multiPayload
+                if let entries = try? FileManager.default.contentsOfDirectory(atPath: paths.stagingDir.path),
+                   entries.contains(where: { $0.contains(".merged") }) {
+                    sawMergedInStaging.withValue { $0 = true }
+                }
+                if rangeHeader == "bytes=0-0" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/\(data.count)", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(data.prefix(1)); $0.finish() }
+                    )
+                }
+                if let rangeHeader, let parsed = RangeHeaderValidator.parseRequestRange(rangeHeader) {
+                    let start = Int(parsed.start)
+                    let end = Int(parsed.end ?? UInt64(data.count - 1))
+                    let sub = data.subdata(in: start..<(end + 1))
+                    return (
+                        206,
+                        ["content-range": "bytes \(start)-\(end)/\(data.count)", "content-length": "\(sub.count)"],
+                        AsyncThrowingStream { $0.yield(sub); $0.finish() }
+                    )
+                }
+                return (
+                    200,
+                    ["content-length": "\(data.count)"],
+                    AsyncThrowingStream { $0.yield(data); $0.finish() }
+                )
+            },
+            urlResolver: { tid in
+                URL(string: "https://media.example.invalid/\(tid == "single" ? "single.flac" : "multi.flac")")!
+            }
+        )
+
+        let batchIds = try await exportEngine.enqueueExportDownloads(
+            accountId: accountId,
+            items: [
+                (TrackSummary(id: "single", name: "Single.flac", folderPath: "Album", sizeBytes: UInt64(singlePayload.count)), "Album/Single.flac"),
+                (TrackSummary(id: "multi", name: "Multi.flac", folderPath: "Album", sizeBytes: UInt64(multiPayload.count)), "Album/Multi.flac")
+            ],
+            parallelThreads: 4,
+            explicitDirectoryURL: exportDir,
+            accountStore: store
+        )
+        #expect(batchIds.count == 2)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await exportEngine.snapshot().hasActiveItems && ContinuousClock.now < deadline {
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: paths.stagingDir.path),
+               entries.contains(where: { $0.contains(".merged") }) {
+                sawMergedInStaging.withValue { $0 = true }
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(sawMergedInStaging.withValue { $0 } == false)
+        #expect(try Data(contentsOf: exportDir.appendingPathComponent("Album/Single.flac")) == singlePayload)
+        #expect(try Data(contentsOf: exportDir.appendingPathComponent("Album/Multi.flac")) == multiPayload)
+        #expect((try FileManager.default.contentsOfDirectory(atPath: paths.stagingDir.path)).isEmpty)
+
+        // Orphan staging directory cleaned AFTER manifest restore while preserving active manifest partsDir
+        let keptTaskId = "download:keep-me"
+        let keptPartsDir = paths.stagingDir.appendingPathComponent("\(Cloud189Protocol.sanitizeFileName(keptTaskId)).parts", isDirectory: true)
+        let orphanPartsDir = paths.stagingDir.appendingPathComponent("download_orphan_stale.parts", isDirectory: true)
+        try FileManager.default.createDirectory(at: keptPartsDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: orphanPartsDir, withIntermediateDirectories: true)
+        try Data("partial".utf8).write(to: keptPartsDir.appendingPathComponent("00.part"))
+        try Data("orphan".utf8).write(to: orphanPartsDir.appendingPathComponent("00.part"))
+        let keptManifest = StagedDownloadManifest(
+            taskId: keptTaskId,
+            accountHash: paths.bucketHash,
+            trackId: "t-keep",
+            fileName: "Keep.flac",
+            relativeExportSubpath: "Keep.flac",
+            totalSize: 1000,
+            partCount: 1,
+            state: "paused"
+        )
+        try JSONEncoder().encode([keptManifest]).write(to: paths.transfersURL, options: .atomic)
+        await exportEngine.restorePersistedDownloads(for: accountId, accountStore: store)
+        #expect(FileManager.default.fileExists(atPath: keptPartsDir.appendingPathComponent("00.part").path))
+        #expect(!FileManager.default.fileExists(atPath: orphanPartsDir.path))
+
+        // Bounded 4-way concurrent scanAllFiles with deterministic sorted output
+        actor ConcurrencyTrackingTransport: CloudHTTPTransport {
+            private var active = 0
+            private(set) var peak = 0
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                if url.path.contains("getSessionForPC.action") {
+                    let b = #"{"res_code":0,"loginName":"scan@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                active += 1
+                peak = max(peak, active)
+                try await Task.sleep(for: .milliseconds(20))
+                active -= 1
+                let q = url.query ?? ""
+                if q.contains("folderId=root") {
+                    let folders = (0..<8).map { #"{"id":"sub\#($0)","name":"Disc\#(8 - $0)"}"# }.joined(separator: ",")
+                    let b = #"{"res_code":0,"fileListAO":{"count":8,"folderList":[\#(folders)],"fileList":[]}}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                let subId = q.split(separator: "&").first { $0.hasPrefix("folderId=") }.map { String($0.dropFirst("folderId=".count)) } ?? "x"
+                let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"f-\#(subId)","name":"Track.flac","size":100}]}}"#
+                return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+            }
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+        let scanTransport = ConcurrencyTrackingTransport()
+        let scanClient = Cloud189Client(transport: scanTransport)
+        _ = try await scanClient.exchangeRedirectForSession(redirectURL: "https://m.cloud.189.cn/cb?paras=1")
+        let scanned = try await scanClient.scanAllFiles(folderId: "root", folderName: "BoxSet")
+        let observedPeak = await scanTransport.peak
+        #expect(observedPeak <= 4)
+        #expect(observedPeak >= 2)
+        #expect(scanned.count == 8)
+        #expect(scanned.map(\.folderPath) == (1...8).map { "BoxSet/Disc\($0)" })
     }
 
     private static func makeSyntheticPNGData(width: Int, height: Int, includeAlpha: Bool) throws -> Data {

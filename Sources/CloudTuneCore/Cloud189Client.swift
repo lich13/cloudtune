@@ -566,26 +566,67 @@ public actor Cloud189Client {
     }
 
     private func scanRecursive(folderId: String, folderName: String, audioOnly: Bool) async throws -> [TrackSummary] {
-        var queue: [(String, String)] = [(folderId, folderName)]
-        var index = 0
+        let maxConcurrentFolders = 4
+        var pending: [(id: String, path: String)] = [(folderId, folderName)]
+        var pendingIndex = 0
+        var inFlight = 0
         var collected: [TrackSummary] = []
 
-        while index < queue.count {
-            let (currId, currPath) = queue[index]
-            index += 1
-            let leafName = currPath.split(separator: "/").last.map(String.init) ?? currPath
-            let listing = try await listRemoteFolder(folderId: currId, folderName: leafName, folderPath: currPath)
-            for sub in listing.folders {
-                queue.append((sub.id, "\(currPath)/\(sub.name)"))
+        try await withThrowingTaskGroup(of: (subfolders: [(String, String)], tracks: [TrackSummary]).self) { group in
+            func scheduleAvailable() throws {
+                while inFlight < maxConcurrentFolders && pendingIndex < pending.count {
+                    try Task.checkCancellation()
+                    let (currId, currPath) = pending[pendingIndex]
+                    pendingIndex += 1
+                    inFlight += 1
+                    let leafName = currPath.split(separator: "/").last.map(String.init) ?? currPath
+                    group.addTask {
+                        try Task.checkCancellation()
+                        let listing = try await self.listRemoteFolder(
+                            folderId: currId,
+                            folderName: leafName,
+                            folderPath: currPath
+                        )
+                        let subfolders = listing.folders.map { ($0.id, "\(currPath)/\($0.name)") }
+                        let rawItems = audioOnly
+                            ? listing.audioFiles
+                            : (listing.audioFiles + listing.videoFiles + listing.otherFiles)
+                        let tracks = rawItems.map { item -> TrackSummary in
+                            var copy = item
+                            copy.folderPath = currPath
+                            return copy
+                        }
+                        return (subfolders, tracks)
+                    }
+                }
             }
-            let items = audioOnly ? listing.audioFiles : (listing.audioFiles + listing.videoFiles + listing.otherFiles)
-            for var track in items {
-                track.folderPath = currPath
-                collected.append(track)
+
+            try scheduleAvailable()
+            while inFlight > 0 {
+                guard let result = try await group.next() else {
+                    break
+                }
+                inFlight -= 1
+                try Task.checkCancellation()
+                pending.append(contentsOf: result.subfolders)
+                collected.append(contentsOf: result.tracks)
+                try scheduleAvailable()
             }
         }
-        collected.sort {
-            ("\($0.folderPath)/\($0.name)".lowercased()) < ("\($1.folderPath)/\($1.name)".lowercased())
+
+        collected.sort { lhs, rhs in
+            let leftKey = "\(lhs.folderPath)/\(lhs.name)".lowercased()
+            let rightKey = "\(rhs.folderPath)/\(rhs.name)".lowercased()
+            if leftKey != rightKey {
+                return leftKey < rightKey
+            }
+            if lhs.folderPath != rhs.folderPath {
+                return lhs.folderPath < rhs.folderPath
+            }
+            if lhs.name != rhs.name {
+                return lhs.name < rhs.name
+            }
+            return lhs.id < rhs.id
         }
         return collected
     }

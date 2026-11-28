@@ -7,6 +7,11 @@ public enum LoopMode: String, Codable, CaseIterable, Sendable {
     case one
 }
 
+public enum StatusKind: String, Codable, Equatable, Sendable {
+    case info
+    case error
+}
+
 public enum AppearanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case system
     case light

@@ -118,9 +118,17 @@ public actor TransferEngine {
         let task: Task<URL, Error>
     }
 
+    private struct TaskSpeedSample {
+        var monotonicBytes: UInt64
+        var lastSampleBytes: UInt64
+        var lastSampleInstant: ContinuousClock.Instant
+        var bytesPerSecond: UInt64
+    }
+
     private let semaphore: GlobalTransferSemaphore
     private let fetcher: UpstreamStreamFetcher
     private let urlResolver: @Sendable (String) async throws -> URL
+    private let retryBaseDelayMs: Int
     private nonisolated let cancellationBag = ActiveTaskCancellationBag()
     private var statuses: [String: TransferStatus] = [:]
     private var statusAccountHashes: [String: String] = [:]
@@ -128,6 +136,11 @@ public actor TransferEngine {
     private var manifestAccountKeys: [String: String] = [:]
     private var runningTasks: [String: Task<Void, Error>] = [:]
     private var inFlightCacheDownloads: [String: InFlightCacheDownload] = [:]
+    private var speedSamples: [String: TaskSpeedSample] = [:]
+    private var aggregateMonotonicBytes: UInt64 = 0
+    private var aggregateLastSampleBytes: UInt64 = 0
+    private var aggregateLastSampleInstant: ContinuousClock.Instant = .now
+    private var aggregateBytesPerSecond: UInt64 = 0
     private var onActivityChange: (@Sendable (TransferSnapshotPayload, Bool) -> Void)?
     private var lastNotifiedHasActive: Bool = false
     private let fm = FileManager.default
@@ -135,11 +148,13 @@ public actor TransferEngine {
     public init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
+        retryBaseDelayMs: Int = 250,
         onActivityChange: (@Sendable (TransferSnapshotPayload, Bool) -> Void)? = nil,
         urlResolver: @escaping @Sendable (String) async throws -> URL
     ) {
         self.semaphore = semaphore
         self.fetcher = fetcher
+        self.retryBaseDelayMs = max(1, retryBaseDelayMs)
         self.onActivityChange = onActivityChange
         self.urlResolver = urlResolver
     }
@@ -172,12 +187,21 @@ public actor TransferEngine {
     }
 
     public func restorePersistedDownloads(for accountId: String, accountStore: AccountScopedStore) async {
-        guard let paths = try? await accountStore.paths(for: accountId),
-              let data = try? Data(contentsOf: paths.transfersURL),
-              let saved = try? JSONDecoder().decode([StagedDownloadManifest].self, from: data) else {
+        guard let paths = try? await accountStore.paths(for: accountId) else {
             return
         }
         let targetHash = paths.bucketHash
+        let saved: [StagedDownloadManifest]
+        if fm.fileExists(atPath: paths.transfersURL.path) {
+            guard let data = try? Data(contentsOf: paths.transfersURL),
+                  let decoded = try? JSONDecoder().decode([StagedDownloadManifest].self, from: data) else {
+                return
+            }
+            saved = decoded
+        } else {
+            saved = []
+        }
+
         for var item in saved {
             if !item.accountHash.isEmpty && item.accountHash != targetHash {
                 continue
@@ -204,20 +228,147 @@ public actor TransferEngine {
                 totalBytes: item.totalSize > 0 ? item.totalSize : nil
             )
         }
-        notifyActivityChanged(force: true)
+
+        // Clean orphaned staging directories/files AFTER manifests are loaded so referenced partsDir entries survive.
+        var referencedStagingNames = Set<String>()
+        for manifest in manifests.values where manifest.accountHash == targetHash {
+            let safeKey = Cloud189Protocol.sanitizeFileName(manifest.taskId)
+            referencedStagingNames.insert("\(safeKey).parts")
+        }
+        if let children = try? fm.contentsOfDirectory(at: paths.stagingDir, includingPropertiesForKeys: nil) {
+            for child in children where !referencedStagingNames.contains(child.lastPathComponent) {
+                try? fm.removeItem(at: child)
+            }
+        }
+
+        if !saved.isEmpty {
+            notifyActivityChanged(force: true)
+        }
+    }
+
+    private static func durationSeconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+    }
+
+    private func ensureSpeedTrackingStarted(for taskId: String, initialBytes: UInt64 = 0, initialSpeed: UInt64 = 0) {
+        let now = ContinuousClock.now
+        if speedSamples.isEmpty {
+            aggregateLastSampleBytes = aggregateMonotonicBytes
+            aggregateLastSampleInstant = now
+            aggregateBytesPerSecond = 0
+        }
+        if speedSamples[taskId] == nil {
+            speedSamples[taskId] = TaskSpeedSample(
+                monotonicBytes: initialBytes,
+                lastSampleBytes: initialBytes,
+                lastSampleInstant: now,
+                bytesPerSecond: initialSpeed
+            )
+        }
+    }
+
+    private func clearSpeedTracking(for taskId: String) {
+        speedSamples.removeValue(forKey: taskId)
+        if speedSamples.isEmpty {
+            aggregateBytesPerSecond = 0
+            aggregateLastSampleBytes = aggregateMonotonicBytes
+            aggregateLastSampleInstant = .now
+        }
     }
 
     public func snapshot() -> TransferSnapshotPayload {
+        let now = ContinuousClock.now
+        for (id, var sample) in speedSamples {
+            guard var status = statuses[id], status.state == "running" || status.state == "streaming" else {
+                speedSamples.removeValue(forKey: id)
+                continue
+            }
+            let elapsed = sample.lastSampleInstant.duration(to: now)
+            let secs = Self.durationSeconds(elapsed)
+            let pendingDelta = sample.monotonicBytes >= sample.lastSampleBytes
+                ? (sample.monotonicBytes - sample.lastSampleBytes)
+                : 0
+            if pendingDelta > 0 && elapsed >= .milliseconds(200) && secs > 0 {
+                sample.bytesPerSecond = UInt64(Double(pendingDelta) / secs)
+                sample.lastSampleBytes = sample.monotonicBytes
+                sample.lastSampleInstant = now
+                speedSamples[id] = sample
+                status.bytesPerSecond = sample.bytesPerSecond
+                statuses[id] = status
+            } else if pendingDelta == 0 && elapsed >= .milliseconds(1500) && sample.monotonicBytes > 0 {
+                sample.bytesPerSecond = 0
+                sample.lastSampleInstant = now
+                speedSamples[id] = sample
+                status.bytesPerSecond = 0
+                statuses[id] = status
+            }
+        }
+
         let items = statuses.values.sorted { $0.id < $1.id }
-        let speed = items
-            .filter { $0.state == "running" || $0.state == "streaming" }
-            .reduce(UInt64(0)) { $0 + $1.bytesPerSecond }
-        return TransferSnapshotPayload(totalSpeedBytesPerSecond: speed, items: items)
+        let activeItems = items.filter { $0.state == "running" || $0.state == "streaming" }
+        guard !activeItems.isEmpty else {
+            aggregateBytesPerSecond = 0
+            aggregateLastSampleBytes = aggregateMonotonicBytes
+            aggregateLastSampleInstant = now
+            return TransferSnapshotPayload(totalSpeedBytesPerSecond: 0, items: items)
+        }
+
+        let aggElapsed = aggregateLastSampleInstant.duration(to: now)
+        let aggSecs = Self.durationSeconds(aggElapsed)
+        let aggDelta = aggregateMonotonicBytes >= aggregateLastSampleBytes
+            ? (aggregateMonotonicBytes - aggregateLastSampleBytes)
+            : 0
+        if aggDelta > 0 && aggElapsed >= .milliseconds(200) && aggSecs > 0 {
+            aggregateBytesPerSecond = UInt64(Double(aggDelta) / aggSecs)
+            aggregateLastSampleBytes = aggregateMonotonicBytes
+            aggregateLastSampleInstant = now
+        } else if aggDelta == 0 && aggElapsed >= .milliseconds(1500) {
+            aggregateBytesPerSecond = 0
+            aggregateLastSampleInstant = now
+        }
+
+        let summedTaskSpeed = activeItems.reduce(UInt64(0)) { $0 + $1.bytesPerSecond }
+        let resolvedTotalSpeed = aggregateBytesPerSecond > 0 ? aggregateBytesPerSecond : summedTaskSpeed
+        return TransferSnapshotPayload(totalSpeedBytesPerSecond: resolvedTotalSpeed, items: items)
     }
 
     public func updateExternalTransferStatus(id: String, accountHash: String? = nil, status: TransferStatus?) {
         let previous = statuses[id]
-        if let status {
+        if var status {
+            if status.state == "running" || status.state == "streaming" {
+                let now = ContinuousClock.now
+                if var sample = speedSamples[id] {
+                    let delta = status.transferredBytes > sample.monotonicBytes
+                        ? (status.transferredBytes - sample.monotonicBytes)
+                        : 0
+                    if delta > 0 {
+                        sample.monotonicBytes &+= delta
+                        aggregateMonotonicBytes &+= delta
+                        let elapsed = sample.lastSampleInstant.duration(to: now)
+                        let secs = Self.durationSeconds(elapsed)
+                        let windowDelta = sample.monotonicBytes - sample.lastSampleBytes
+                        if elapsed >= .milliseconds(200) && secs > 0 {
+                            sample.bytesPerSecond = UInt64(Double(windowDelta) / secs)
+                            sample.lastSampleBytes = sample.monotonicBytes
+                            sample.lastSampleInstant = now
+                        } else if sample.bytesPerSecond == 0 && secs > 0.005 {
+                            sample.bytesPerSecond = UInt64(Double(windowDelta) / secs)
+                        }
+                        status.bytesPerSecond = sample.bytesPerSecond
+                    } else if status.bytesPerSecond > 0 {
+                        sample.bytesPerSecond = status.bytesPerSecond
+                    }
+                    speedSamples[id] = sample
+                } else {
+                    ensureSpeedTrackingStarted(
+                        for: id,
+                        initialBytes: status.transferredBytes,
+                        initialSpeed: status.bytesPerSecond
+                    )
+                }
+            } else {
+                clearSpeedTracking(for: id)
+            }
             statuses[id] = status
             if let accountHash {
                 statusAccountHashes[id] = accountHash
@@ -225,6 +376,7 @@ public actor TransferEngine {
             let forceNotify = (previous == nil) || (previous?.state != status.state)
             notifyActivityChanged(force: forceNotify)
         } else {
+            clearSpeedTracking(for: id)
             let removed = statuses.removeValue(forKey: id) != nil
             statusAccountHashes.removeValue(forKey: id)
             if removed {
@@ -238,6 +390,7 @@ public actor TransferEngine {
         for (id, manifest) in manifests where manifest.accountHash == targetHash {
             runningTasks[id]?.cancel()
             runningTasks.removeValue(forKey: id)
+            clearSpeedTracking(for: id)
             statuses.removeValue(forKey: id)
             statusAccountHashes.removeValue(forKey: id)
             manifests.removeValue(forKey: id)
@@ -246,17 +399,20 @@ public actor TransferEngine {
         for (cacheKey, inFlight) in inFlightCacheDownloads where inFlight.accountHash == nil || inFlight.accountHash == targetHash {
             inFlight.task.cancel()
             inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            clearSpeedTracking(for: inFlight.statusId)
             statuses.removeValue(forKey: inFlight.statusId)
             statusAccountHashes.removeValue(forKey: inFlight.statusId)
         }
         for (id, ownerHash) in statusAccountHashes where ownerHash == targetHash {
             runningTasks[id]?.cancel()
             runningTasks.removeValue(forKey: id)
+            clearSpeedTracking(for: id)
             statuses.removeValue(forKey: id)
             statusAccountHashes.removeValue(forKey: id)
         }
         for key in Array(statuses.keys) where key.hasPrefix("stream:") || key.hasPrefix("prefetch:") || key.hasPrefix("playback:") {
             if statusAccountHashes[key] == nil || statusAccountHashes[key] == targetHash {
+                clearSpeedTracking(for: key)
                 statuses.removeValue(forKey: key)
                 statusAccountHashes.removeValue(forKey: key)
             }
@@ -319,6 +475,7 @@ public actor TransferEngine {
         if let accountHash {
             statusAccountHashes[statusId] = accountHash
         }
+        ensureSpeedTrackingStarted(for: statusId)
         notifyActivityChanged(force: true)
 
         let worker = Task<URL, Error> {
@@ -361,6 +518,7 @@ public actor TransferEngine {
         inFlight.waiterIDs.remove(waiterID)
         if inFlight.waiterIDs.isEmpty {
             inFlightCacheDownloads.removeValue(forKey: cacheKey)
+            clearSpeedTracking(for: inFlight.statusId)
             statuses.removeValue(forKey: inFlight.statusId)
             statusAccountHashes.removeValue(forKey: inFlight.statusId)
             inFlight.task.cancel()
@@ -393,6 +551,7 @@ public actor TransferEngine {
             if inFlightCacheDownloads[cacheKey]?.workerID == workerID {
                 inFlightCacheDownloads.removeValue(forKey: cacheKey)
             }
+            clearSpeedTracking(for: statusId)
             statuses.removeValue(forKey: statusId)
             statusAccountHashes.removeValue(forKey: statusId)
             try? fm.removeItem(at: partsDir)
@@ -417,19 +576,107 @@ public actor TransferEngine {
             partsDir: partsDir
         )
         try Task.checkCancellation()
-        try mergeParts(partsDir: partsDir, partCount: partCount, into: tempMerged, expectedTotal: totalSize)
-        if fm.fileExists(atPath: destination.path) {
-            _ = try fm.replaceItemAt(destination, withItemAt: tempMerged)
+
+        let recordedSize: UInt64
+        if partCount <= 1 {
+            let singlePartURL = partsDir.appendingPathComponent("00.part")
+            let attrs = try fm.attributesOfItem(atPath: singlePartURL.path)
+            let diskSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            if totalSize > 0 && diskSize != totalSize {
+                throw CloudTuneError.storageError("缓存单分片校验失败：实际 \(diskSize) 字节，预期 \(totalSize) 字节")
+            }
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: singlePartURL)
+            } else {
+                try fm.moveItem(at: singlePartURL, to: destination)
+            }
+            recordedSize = totalSize > 0 ? totalSize : diskSize
         } else {
-            try fm.moveItem(at: tempMerged, to: destination)
+            try mergeParts(partsDir: partsDir, partCount: partCount, into: tempMerged, expectedTotal: totalSize)
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: tempMerged)
+            } else {
+                try fm.moveItem(at: tempMerged, to: destination)
+            }
+            recordedSize = totalSize > 0 ? totalSize : track.sizeBytes
         }
+
         _ = try await cacheStore.recordCompletedFile(
             trackId: track.id,
             fileURL: destination,
-            sizeBytes: totalSize > 0 ? totalSize : track.sizeBytes,
+            sizeBytes: recordedSize,
             limitBytes: cacheLimitBytes
         )
         return destination
+    }
+
+    /// Enqueues a batch of resumable export downloads (capturing bookmark once, writing `transfers.json` once, and emitting snapshot once).
+    @discardableResult
+    public func enqueueExportDownloads(
+        accountId: String,
+        items: [(track: TrackSummary, relativeExportSubpath: String)],
+        parallelThreads: Int,
+        explicitDirectoryURL: URL? = nil,
+        accountStore: AccountScopedStore
+    ) async throws -> [String] {
+        guard !items.isEmpty else { return [] }
+        let partCount = min(max(1, parallelThreads), 16)
+        let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
+        let exportBookmarkData = await accountStore.captureExportBookmarkData(
+            explicitDirectoryURL: explicitDirectoryURL,
+            for: accountId
+        )
+
+        var createdManifests: [StagedDownloadManifest] = []
+        createdManifests.reserveCapacity(items.count)
+        var taskIds: [String] = []
+        taskIds.reserveCapacity(items.count)
+
+        for entry in items {
+            let taskId = "download:\(UUID().uuidString.lowercased())"
+            let manifest = StagedDownloadManifest(
+                taskId: taskId,
+                accountHash: accountHash,
+                trackId: entry.track.id,
+                fileName: entry.track.name,
+                relativeExportSubpath: entry.relativeExportSubpath,
+                totalSize: entry.track.sizeBytes,
+                partCount: partCount,
+                state: "running",
+                exportBookmarkData: exportBookmarkData
+            )
+            manifests[taskId] = manifest
+            manifestAccountKeys[taskId] = accountId
+            statusAccountHashes[taskId] = accountHash
+            statuses[taskId] = TransferStatus(
+                id: taskId,
+                label: entry.track.name,
+                kind: "download",
+                state: "running",
+                path: entry.relativeExportSubpath,
+                canPause: true,
+                canResume: false,
+                canDelete: true,
+                bytesPerSecond: 0,
+                transferredBytes: 0,
+                totalBytes: entry.track.sizeBytes > 0 ? entry.track.sizeBytes : nil
+            )
+            ensureSpeedTrackingStarted(for: taskId)
+            createdManifests.append(manifest)
+            taskIds.append(taskId)
+        }
+
+        await persistManifests(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
+        notifyActivityChanged(force: true)
+        for manifest in createdManifests {
+            spawnExportTask(
+                manifest: manifest,
+                accountKey: accountId,
+                explicitDirectoryURL: explicitDirectoryURL,
+                accountStore: accountStore
+            )
+        }
+        return taskIds
     }
 
     /// Enqueues a resumable multi-part export download staged in private storage and exported upon verification.
@@ -442,49 +689,20 @@ public actor TransferEngine {
         explicitDirectoryURL: URL? = nil,
         accountStore: AccountScopedStore
     ) async throws -> String {
-        let taskId = "download:\(UUID().uuidString.lowercased())"
-        let partCount = min(max(1, parallelThreads), 16)
-        let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
-        let exportBookmarkData = await accountStore.captureExportBookmarkData(
+        let ids = try await enqueueExportDownloads(
+            accountId: accountId,
+            items: [(track: track, relativeExportSubpath: relativeExportSubpath)],
+            parallelThreads: parallelThreads,
             explicitDirectoryURL: explicitDirectoryURL,
-            for: accountId
+            accountStore: accountStore
         )
-        let manifest = StagedDownloadManifest(
-            taskId: taskId,
-            accountHash: accountHash,
-            trackId: track.id,
-            fileName: track.name,
-            relativeExportSubpath: relativeExportSubpath,
-            totalSize: track.sizeBytes,
-            partCount: partCount,
-            state: "running",
-            exportBookmarkData: exportBookmarkData
-        )
-        manifests[taskId] = manifest
-        manifestAccountKeys[taskId] = accountId
-        statusAccountHashes[taskId] = accountHash
-        statuses[taskId] = TransferStatus(
-            id: taskId,
-            label: track.name,
-            kind: "download",
-            state: "running",
-            path: relativeExportSubpath,
-            canPause: true,
-            canResume: false,
-            canDelete: true,
-            bytesPerSecond: 0,
-            transferredBytes: 0,
-            totalBytes: track.sizeBytes > 0 ? track.sizeBytes : nil
-        )
-        await persistManifests(forAccountKey: accountId, accountHash: accountHash, accountStore: accountStore)
-        notifyActivityChanged(force: true)
-        spawnExportTask(manifest: manifest, accountKey: accountId, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
-        return taskId
+        return ids[0]
     }
 
     public func pauseTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
+        clearSpeedTracking(for: id)
         if var m = manifests[id] {
             m.state = "paused"
             manifests[id] = m
@@ -520,6 +738,7 @@ public actor TransferEngine {
             s.canResume = false
             statuses[id] = s
         }
+        ensureSpeedTrackingStarted(for: id)
         await persistManifests(forAccountKey: accountKey, accountHash: m.accountHash, accountStore: accountStore)
         notifyActivityChanged(force: true)
         spawnExportTask(manifest: m, accountKey: accountKey, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
@@ -528,6 +747,7 @@ public actor TransferEngine {
     public func deleteTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
+        clearSpeedTracking(for: id)
         let manifest = manifests.removeValue(forKey: id)
         let accountKey = manifestAccountKeys.removeValue(forKey: id)
         statuses.removeValue(forKey: id)
@@ -576,7 +796,6 @@ public actor TransferEngine {
             let paths = try await accountStore.paths(for: accountKey)
             let safeKey = Cloud189Protocol.sanitizeFileName(id)
             let partsDir = paths.stagingDir.appendingPathComponent("\(safeKey).parts", isDirectory: true)
-            let mergedURL = paths.stagingDir.appendingPathComponent("\(safeKey).merged")
             try fm.createDirectory(at: partsDir, withIntermediateDirectories: true)
 
             let remoteURL = try await urlResolver(manifest.trackId)
@@ -607,18 +826,22 @@ public actor TransferEngine {
                 partsDir: partsDir
             )
             try Task.checkCancellation()
-            try mergeParts(partsDir: partsDir, partCount: effectiveParts, into: mergedURL, expectedTotal: totalSize)
-            let exportedURL = try await accountStore.exportStagedFile(
-                stagedFileURL: mergedURL,
+
+            let orderedPartURLs = (0..<max(1, effectiveParts)).map { idx in
+                partsDir.appendingPathComponent(String(format: "%02d.part", idx))
+            }
+            let exportedURL = try await accountStore.exportStagedParts(
+                partURLs: orderedPartURLs,
+                expectedTotalBytes: totalSize,
                 relativeSubpath: updatedManifest.relativeExportSubpath,
                 explicitDirectoryURL: explicitDirectoryURL,
                 manifestBookmarkData: updatedManifest.exportBookmarkData,
                 for: accountKey
             )
-            try? fm.removeItem(at: mergedURL)
             try? fm.removeItem(at: partsDir)
 
             guard manifests[id] != nil else { return }
+            clearSpeedTracking(for: id)
             manifests.removeValue(forKey: id)
             manifestAccountKeys.removeValue(forKey: id)
             statusAccountHashes[id] = manifest.accountHash
@@ -638,8 +861,10 @@ public actor TransferEngine {
             await persistManifests(forAccountKey: accountKey, accountHash: manifest.accountHash, accountStore: accountStore)
             notifyActivityChanged(force: true)
         } catch is CancellationError {
+            clearSpeedTracking(for: id)
             return
         } catch {
+            clearSpeedTracking(for: id)
             if var m = manifests[id] {
                 m.state = "paused"
                 manifests[id] = m
@@ -733,12 +958,14 @@ public actor TransferEngine {
 
         var currentURL = url
         var attempt = 0
+        let maxRetries = 5
 
         while true {
             try Task.checkCancellation()
             if let expectedLen, written >= expectedLen { return }
             let reqStart = start + written
             let rangeSpec = (reqStart == 0 && end == nil) ? nil : ParsedByteRange(start: reqStart, end: end).headerValue
+            var bytesThisAttempt: UInt64 = 0
 
             do {
                 try await semaphore.acquire()
@@ -779,47 +1006,76 @@ public actor TransferEngine {
                             slice = chunk
                         }
                         try fh.write(contentsOf: slice)
-                        written += UInt64(slice.count)
-                        windowBytes += UInt64(slice.count)
-                        let elapsed = windowStart.duration(to: .now)
-                        if elapsed >= .milliseconds(300) {
-                            let secs = max(0.05, Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18)
-                            let speed = UInt64(Double(windowBytes) / secs)
-                            recordProgressDelta(taskId: taskId, deltaBytes: windowBytes, speed: speed)
+                        let sliceLen = UInt64(slice.count)
+                        written += sliceLen
+                        bytesThisAttempt += sliceLen
+                        windowBytes += sliceLen
+                        if windowStart.duration(to: .now) >= .milliseconds(150) {
+                            recordProgressDelta(taskId: taskId, deltaBytes: windowBytes)
                             windowBytes = 0
                             windowStart = .now
                         }
                     }
                     if windowBytes > 0 {
-                        recordProgressDelta(taskId: taskId, deltaBytes: windowBytes, speed: windowBytes)
+                        recordProgressDelta(taskId: taskId, deltaBytes: windowBytes)
                     }
                     await semaphore.release()
                 } catch {
                     await semaphore.release()
                     throw error
                 }
-                if expectedLen == nil || written >= (expectedLen ?? 0) {
+                if let expectedLen {
+                    if written >= expectedLen {
+                        return
+                    }
+                    if bytesThisAttempt > 0 {
+                        attempt = 0
+                        continue
+                    }
+                    throw CloudTuneError.protocolError("上游提前关闭连接且未返回任何分片数据")
+                } else {
                     return
                 }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                if bytesThisAttempt > 0 {
+                    attempt = 0
+                }
                 attempt += 1
-                if attempt >= 5 {
+                if attempt >= maxRetries {
                     throw error
                 }
-                try await Task.sleep(for: .milliseconds(250 * attempt))
+                try await Task.sleep(for: .milliseconds(retryBaseDelayMs * attempt))
             }
         }
     }
 
-    private func recordProgressDelta(taskId: String, deltaBytes: UInt64, speed: UInt64) {
-        guard var status = statuses[taskId] else { return }
+    private func recordProgressDelta(taskId: String, deltaBytes: UInt64) {
+        guard deltaBytes > 0, var status = statuses[taskId] else { return }
         status.transferredBytes += deltaBytes
         if let total = status.totalBytes, status.transferredBytes > total {
             status.transferredBytes = total
         }
-        status.bytesPerSecond = speed
+
+        let now = ContinuousClock.now
+        ensureSpeedTrackingStarted(for: taskId)
+        aggregateMonotonicBytes &+= deltaBytes
+        if var sample = speedSamples[taskId] {
+            sample.monotonicBytes &+= deltaBytes
+            let elapsed = sample.lastSampleInstant.duration(to: now)
+            let secs = Self.durationSeconds(elapsed)
+            let windowDelta = sample.monotonicBytes - sample.lastSampleBytes
+            if elapsed >= .milliseconds(200) && secs > 0 {
+                sample.bytesPerSecond = UInt64(Double(windowDelta) / secs)
+                sample.lastSampleBytes = sample.monotonicBytes
+                sample.lastSampleInstant = now
+            } else if sample.bytesPerSecond == 0 && secs >= 0.01 {
+                sample.bytesPerSecond = UInt64(Double(windowDelta) / secs)
+            }
+            speedSamples[taskId] = sample
+            status.bytesPerSecond = sample.bytesPerSecond
+        }
         statuses[taskId] = status
     }
 

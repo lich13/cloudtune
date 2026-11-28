@@ -178,7 +178,7 @@ public struct IOSRootView: View {
                 if let status = viewModel.busyLabel ?? viewModel.statusMessage, !status.isEmpty {
                     SubtleStatusBanner(
                         message: status,
-                        isError: viewModel.credentialIssue != nil || status.contains("失败"),
+                        isError: viewModel.busyLabel == nil && (viewModel.credentialIssue != nil || viewModel.statusKind == .error),
                         busyLabel: viewModel.busyLabel,
                         palette: palette
                     )
@@ -217,8 +217,8 @@ public struct IOSRootView: View {
                                     palette: palette
                                 ) {
                                     let vm = viewModel
-                                    Self.saveQRToPhotoLibrary(pngData) { message in
-                                        vm.statusMessage = message
+                                    Self.saveQRToPhotoLibrary(pngData) { message, kind in
+                                        vm.setStatus(message, kind: kind)
                                     }
                                 }
                             }
@@ -977,9 +977,7 @@ public struct IOSRootView: View {
         if let status = viewModel.settingsValidationError ?? viewModel.busyLabel ?? viewModel.statusMessage,
            !status.isEmpty {
             let isErr = viewModel.settingsValidationError != nil
-                || status.contains("失败")
-                || status.contains("不受系统解码器支持")
-                || status.contains("已停止自动重试")
+                || (viewModel.busyLabel == nil && viewModel.statusKind == .error)
             SubtleStatusBanner(
                 message: status,
                 isError: isErr,
@@ -1477,7 +1475,8 @@ public struct IOSRootView: View {
                    !status.isEmpty {
                     SubtleStatusBanner(
                         message: status,
-                        isError: viewModel.settingsValidationError != nil || status.contains("失败"),
+                        isError: viewModel.settingsValidationError != nil
+                            || (viewModel.busyLabel == nil && viewModel.statusKind == .error),
                         busyLabel: viewModel.busyLabel,
                         palette: palette
                     )
@@ -1661,13 +1660,13 @@ public struct IOSRootView: View {
 
     nonisolated private static func saveQRToPhotoLibrary(
         _ pngData: Data,
-        onStatus: @escaping @MainActor @Sendable (String) -> Void
+        onStatus: @escaping @MainActor @Sendable (String, StatusKind) -> Void
     ) {
         guard !pngData.isEmpty else { return }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 Task { @MainActor in
-                    onStatus("未获相册写入权限，请在系统设置中开启相册访问。")
+                    onStatus("未获相册写入权限，请在系统设置中开启相册访问。", .error)
                 }
                 return
             }
@@ -1677,11 +1676,11 @@ public struct IOSRootView: View {
             }) { ok, err in
                 let errDesc = err?.localizedDescription ?? ""
                 Task { @MainActor in
-                    onStatus(
-                        ok
-                            ? "二维码已保存到系统相册，请打开天翼云盘 App 扫一扫选择相册图片。"
-                            : "保存相册失败：\(errDesc)"
-                    )
+                    if ok {
+                        onStatus("二维码已保存到系统相册，请打开天翼云盘 App 扫一扫选择相册图片。", .info)
+                    } else {
+                        onStatus("保存相册失败：\(errDesc)", .error)
+                    }
                 }
             }
         }

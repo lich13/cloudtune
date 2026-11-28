@@ -1,15 +1,15 @@
 import Foundation
 
-public struct StagedDownloadManifest: Codable, Equatable, Sendable {
-    public var taskId: String
-    public var accountHash: String
-    public var trackId: String
-    public var fileName: String
-    public var relativeExportSubpath: String
-    public var totalSize: UInt64
-    public var partCount: Int
-    public var state: String
-    public var exportBookmarkData: Data? = nil
+package struct StagedDownloadManifest: Codable, Equatable, Sendable {
+    package var taskId: String
+    package var accountHash: String
+    package var trackId: String
+    package var fileName: String
+    package var relativeExportSubpath: String
+    package var totalSize: UInt64
+    package var partCount: Int
+    package var state: String
+    package var exportBookmarkData: Data? = nil
 
     private enum CodingKeys: String, CodingKey {
         case taskId
@@ -24,7 +24,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         case exportBookmarkData
     }
 
-    public init(
+    package init(
         taskId: String,
         accountHash: String,
         trackId: String,
@@ -46,7 +46,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.exportBookmarkData = exportBookmarkData
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.taskId = try c.decode(String.self, forKey: .taskId)
         if let hash = try c.decodeIfPresent(String.self, forKey: .accountHash), !hash.isEmpty {
@@ -65,7 +65,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.exportBookmarkData = try c.decodeIfPresent(Data.self, forKey: .exportBookmarkData)
     }
 
-    public func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(taskId, forKey: .taskId)
         try c.encode(trackId, forKey: .trackId)
@@ -108,7 +108,7 @@ private final class ActiveTaskCancellationBag: @unchecked Sendable {
     }
 }
 
-public actor TransferEngine {
+package actor TransferEngine {
     private struct InFlightCacheDownload {
         let workerID: UUID
         let cacheKey: String
@@ -145,7 +145,7 @@ public actor TransferEngine {
     private var lastNotifiedHasActive: Bool = false
     private let fm = FileManager.default
 
-    public init(
+    package init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         retryBaseDelayMs: Int = 250,
@@ -159,19 +159,19 @@ public actor TransferEngine {
         self.urlResolver = urlResolver
     }
 
-    public func setOnActivityChange(_ callback: (@Sendable (TransferSnapshotPayload, Bool) -> Void)?) {
+    package func setOnActivityChange(_ callback: (@Sendable (TransferSnapshotPayload, Bool) -> Void)?) {
         self.onActivityChange = callback
         let snap = snapshot()
         let active = snap.hasActiveItems
         self.lastNotifiedHasActive = active
     }
 
-    public func hasInFlightCacheDownload(for cacheFileURL: URL) -> Bool {
+    package func hasInFlightCacheDownload(for cacheFileURL: URL) -> Bool {
         let cacheKey = cacheFileURL.standardizedFileURL.path
         return inFlightCacheDownloads[cacheKey] != nil
     }
 
-    public nonisolated func cancelAllImmediate() {
+    package nonisolated func cancelAllImmediate() {
         cancellationBag.cancelAll()
     }
 
@@ -186,7 +186,7 @@ public actor TransferEngine {
         }
     }
 
-    public func restorePersistedDownloads(for accountId: String, accountStore: AccountScopedStore) async {
+    package func restorePersistedDownloads(for accountId: String, accountStore: AccountScopedStore) async {
         guard let paths = try? await accountStore.paths(for: accountId) else {
             return
         }
@@ -276,7 +276,7 @@ public actor TransferEngine {
         }
     }
 
-    public func snapshot() -> TransferSnapshotPayload {
+    package func snapshot() -> TransferSnapshotPayload {
         let now = ContinuousClock.now
         for (id, var sample) in speedSamples {
             guard var status = statuses[id], status.state == "running" || status.state == "streaming" else {
@@ -332,7 +332,7 @@ public actor TransferEngine {
         return TransferSnapshotPayload(totalSpeedBytesPerSecond: resolvedTotalSpeed, items: items)
     }
 
-    public func updateExternalTransferStatus(id: String, accountHash: String? = nil, status: TransferStatus?) {
+    package func updateExternalTransferStatus(id: String, accountHash: String? = nil, status: TransferStatus?) {
         let previous = statuses[id]
         if var status {
             if status.state == "running" || status.state == "streaming" {
@@ -385,7 +385,7 @@ public actor TransferEngine {
         }
     }
 
-    public func cancelAll(forAccountId accountId: String) {
+    package func cancelAll(forAccountId accountId: String) {
         let targetHash = Cloud189Protocol.accountBucketHash(for: accountId)
         for (id, manifest) in manifests where manifest.accountHash == targetHash {
             runningTasks[id]?.cancel()
@@ -423,7 +423,7 @@ public actor TransferEngine {
     /// Downloads a track directly into private cache (`download_first` or background `prefetch`) using the shared 8-permit limiter.
     /// Concurrent `prefetch` and `playback` calls for the same cache destination coalesce onto a single in-flight download.
     @discardableResult
-    public func downloadTrackToCache(
+    package func downloadTrackToCache(
         track: TrackSummary,
         cacheStore: CacheStore,
         parallelThreads: Int,
@@ -612,7 +612,7 @@ public actor TransferEngine {
 
     /// Enqueues a batch of resumable export downloads (capturing bookmark once, writing `transfers.json` once, and emitting snapshot once).
     @discardableResult
-    public func enqueueExportDownloads(
+    package func enqueueExportDownloads(
         accountId: String,
         items: [(track: TrackSummary, relativeExportSubpath: String)],
         parallelThreads: Int,
@@ -681,7 +681,7 @@ public actor TransferEngine {
 
     /// Enqueues a resumable multi-part export download staged in private storage and exported upon verification.
     @discardableResult
-    public func enqueueExportDownload(
+    package func enqueueExportDownload(
         accountId: String,
         track: TrackSummary,
         relativeExportSubpath: String,
@@ -699,7 +699,7 @@ public actor TransferEngine {
         return ids[0]
     }
 
-    public func pauseTransfer(id: String, accountStore: AccountScopedStore) async {
+    package func pauseTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
         clearSpeedTracking(for: id)
@@ -720,7 +720,7 @@ public actor TransferEngine {
         }
     }
 
-    public func resumeTransfer(id: String, explicitDirectoryURL: URL? = nil, accountStore: AccountScopedStore) async {
+    package func resumeTransfer(id: String, explicitDirectoryURL: URL? = nil, accountStore: AccountScopedStore) async {
         guard var m = manifests[id], let accountKey = manifestAccountKeys[id] else { return }
         if let explicitDirectoryURL,
            let refreshedBookmark = await accountStore.captureExportBookmarkData(
@@ -744,7 +744,7 @@ public actor TransferEngine {
         spawnExportTask(manifest: m, accountKey: accountKey, explicitDirectoryURL: explicitDirectoryURL, accountStore: accountStore)
     }
 
-    public func deleteTransfer(id: String, accountStore: AccountScopedStore) async {
+    package func deleteTransfer(id: String, accountStore: AccountScopedStore) async {
         runningTasks[id]?.cancel()
         runningTasks.removeValue(forKey: id)
         clearSpeedTracking(for: id)

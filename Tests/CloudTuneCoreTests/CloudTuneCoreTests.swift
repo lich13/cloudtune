@@ -31,22 +31,41 @@ private func repoRootURL() -> URL {
 
 @Suite("CloudTuneCore Protocol, Range Proxy, Concurrency & Keychain Tests")
 struct CloudTuneCoreTests {
-    @Test("Shared protocol-vectors.json parity (HMAC-SHA1, alt-safe HTML extraction, QR & session split, account SHA-256)")
-    func verifySharedProtocolVectors() throws {
+    @Test("Shared protocol-vectors.json parity (100% top-level keys including playbackFallbackPolicy, HMAC-SHA1, QR & session split, Range, account SHA-256)")
+    func verifySharedProtocolVectors() async throws {
         let vectorsURL = repoRootURL().appendingPathComponent("contracts/protocol-vectors.json")
         let data = try Data(contentsOf: vectorsURL)
         let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 
+        let expectedTopLevelKeys: Set<String> = [
+            "hmacSignature",
+            "loginHtmlExtraction",
+            "qrPollDateFormat",
+            "qrPollPayloads",
+            "sessionPayloads",
+            "webLoginCallbacks",
+            "rangeValidation",
+            "playbackFallbackPolicy",
+            "accountIsolation"
+        ]
+        #expect(Set(root.keys) == expectedTopLevelKeys)
+
         // 1) HMAC-SHA1
         let hmacBlock = try #require(root["hmacSignature"] as? [String: Any])
+        let sessionKey = try #require(hmacBlock["sessionKey"] as? String)
+        let sessionSecret = try #require(hmacBlock["sessionSecret"] as? String)
+        let method = try #require(hmacBlock["method"] as? String)
+        let urlString = try #require(hmacBlock["url"] as? String)
+        let dateHeader = try #require(hmacBlock["date"] as? String)
         let (reqURI, sig) = try Cloud189Protocol.computeSignature(
-            sessionKey: try #require(hmacBlock["sessionKey"] as? String),
-            sessionSecret: try #require(hmacBlock["sessionSecret"] as? String),
-            method: try #require(hmacBlock["method"] as? String),
-            urlString: try #require(hmacBlock["url"] as? String),
-            dateHeader: try #require(hmacBlock["date"] as? String)
+            sessionKey: sessionKey,
+            sessionSecret: sessionSecret,
+            method: method,
+            urlString: urlString,
+            dateHeader: dateHeader
         )
         #expect(reqURI == (hmacBlock["expectedRequestUri"] as? String))
+        #expect("SessionKey=\(sessionKey)&Operate=\(method)&RequestURI=\(reqURI)&Date=\(dateHeader)" == (hmacBlock["expectedPayload"] as? String))
         #expect(sig == (hmacBlock["expectedSignature"] as? String))
 
         // 2) Login HTML extraction avoiding alt="二维码登录成功"
@@ -207,6 +226,36 @@ struct CloudTuneCoreTests {
         )
         let formattedQrDate = Cloud189Protocol.formatQrPollDate(try #require(cal.date(from: comps)), timeZone: tz)
         #expect(formattedQrDate == (qrDateBlock["expected"] as? String))
+
+        // 6c) Playback fallback & global remote permit policy parity against protocol-vectors.json
+        let fallbackBlock = try #require(root["playbackFallbackPolicy"] as? [String: Any])
+        let largeThreshold = UInt64(try #require(fallbackBlock["largeTrackThresholdBytes"] as? Int))
+        let maxRemotePermits = try #require(fallbackBlock["globalMaxRemotePermits"] as? Int)
+        let sampleLargeBytes = UInt64(try #require(fallbackBlock["sampleLargeTrackBytes"] as? Int))
+        let sampleSmallBytes = UInt64(try #require(fallbackBlock["sampleSmallTrackBytes"] as? Int))
+
+        #expect(PlaybackDecisionPolicy.largeTrackThresholdBytes == largeThreshold)
+        #expect(await GlobalTransferSemaphore().maxPermits == maxRemotePermits)
+        #expect(PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+            mode: .streamCache,
+            sizeBytes: sampleLargeBytes,
+            forceStreamProxy: false
+        ) == true)
+        #expect(PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+            mode: .streamCache,
+            sizeBytes: sampleLargeBytes,
+            forceStreamProxy: true
+        ) == false)
+        #expect(PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+            mode: .streamCache,
+            sizeBytes: sampleSmallBytes,
+            forceStreamProxy: false
+        ) == false)
+        #expect(PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+            mode: .downloadFirst,
+            sizeBytes: sampleSmallBytes,
+            forceStreamProxy: false
+        ) == true)
 
         // 7) Unified media extension classification & MIME mapping (including AIFF / AIF / DSF / DFF)
         for losslessName in ["Suite.aiff", "Track.AIF", "Master.dsf", "Studio.DFF", "Aria.flac", "Take.wav", "Album.alac", "Concert.ape"] {
@@ -1980,6 +2029,203 @@ struct CloudTuneCoreTests {
         #expect(observedPeak >= 2)
         #expect(scanned.count == 8)
         #expect(scanned.map(\.folderPath) == (1...8).map { "BoxSet/Disc\($0)" })
+    }
+
+    @Test("Slice 3: Off-MainActor NowPlayingCoordinator remote command handler invocation and live 4-part cross-restart byte-exact export resume")
+    func verifyOffMainActorRemoteCommandsAndFourPartCrossRestartExportResume() async throws {
+        // 1) Invoke NowPlayingCoordinator remote command handler targets directly on DispatchQueue.global()
+        #if canImport(MediaPlayer)
+        let recordedEvents = LockedBox<[String]>([])
+        let coordinator = await MainActor.run {
+            let c = NowPlayingCoordinator()
+            c.registerRemoteCommands(RemoteCommandCallbacks(
+                onPlay: { recordedEvents.withValue { $0.append("play") } },
+                onPause: { recordedEvents.withValue { $0.append("pause") } },
+                onTogglePlayPause: { recordedEvents.withValue { $0.append("toggle") } },
+                onNextTrack: { recordedEvents.withValue { $0.append("next") } },
+                onPreviousTrack: { recordedEvents.withValue { $0.append("prev") } },
+                onSeekDelta: { delta in recordedEvents.withValue { $0.append("delta:\(Int(delta))") } },
+                onSeekToPosition: { pos in recordedEvents.withValue { $0.append("pos:\(Int(pos))") } }
+            ))
+            return c
+        }
+
+        let globalInvocation: (ranOffMain: Bool, statuses: [Bool]) = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let offMain = !Thread.isMainThread
+                let statuses = [
+                    coordinator.invokeRemoteCommandForTesting(.play),
+                    coordinator.invokeRemoteCommandForTesting(.pause),
+                    coordinator.invokeRemoteCommandForTesting(.togglePlayPause),
+                    coordinator.invokeRemoteCommandForTesting(.nextTrack),
+                    coordinator.invokeRemoteCommandForTesting(.previousTrack),
+                    coordinator.invokeRemoteCommandForTesting(.skipForward(15)),
+                    coordinator.invokeRemoteCommandForTesting(.skipBackward(10)),
+                    coordinator.invokeRemoteCommandForTesting(.changePlaybackPosition(42)),
+                    coordinator.invokeRemoteCommandForTesting(.changePlaybackPosition(nil))
+                ]
+                continuation.resume(returning: (offMain, statuses))
+            }
+        }
+        #expect(globalInvocation.ranOffMain == true)
+        #expect(globalInvocation.statuses == [true, true, true, true, true, true, true, true, false])
+        #expect(recordedEvents.withValue { $0 } == [
+            "play", "pause", "toggle", "next", "prev", "delta:15", "delta:-10", "pos:42"
+        ])
+
+        await MainActor.run {
+            coordinator.unregisterRemoteCommands()
+        }
+        let postUnregister = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: coordinator.invokeRemoteCommandForTesting(.play))
+            }
+        }
+        #expect(postUnregister == false)
+        #endif
+
+        // 2) Live 4-part export download interrupted mid-stream across process restart resumes strictly remaining byte spans
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s3-res-\(UUID().uuidString)")
+        let exportDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s3-out-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: exportDir)
+        }
+        try FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+
+        let store = try AccountScopedStore(rootDirectory: root)
+        let accountId = "multipart_resume@example.invalid"
+        _ = try await store.saveExportDirectoryBookmarkAndSettings(exportDir, for: accountId)
+
+        let totalBytes = 1_200_000
+        let sourcePayload = Data((0..<totalBytes).map { idx in
+            UInt8(((idx &* 31) ^ (idx >> 7) ^ 0xA5) & 0xFF)
+        })
+        let expectedDigest = SHA256.hash(data: sourcePayload)
+
+        // Run 1: Let part 00 complete (0..<300_000), part 01 stall after 120_000 bytes, part 02 stall at 0 bytes, part 03 stall after 90_000 bytes
+        let stalledParts = LockedBox(0)
+        let engine1 = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 8),
+            fetcher: MockUpstreamFetcher { _, rangeHeader in
+                if rangeHeader == "bytes=0-0" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/\(totalBytes)", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(sourcePayload.prefix(1)); $0.finish() }
+                    )
+                }
+                let parsed = try #require(RangeHeaderValidator.parseRequestRange(rangeHeader))
+                let start = Int(parsed.start)
+                let end = Int(parsed.end ?? UInt64(totalBytes - 1))
+                if start == 0 {
+                    let fullPart0 = sourcePayload.subdata(in: start..<(end + 1))
+                    return (
+                        206,
+                        ["content-range": "bytes \(start)-\(end)/\(totalBytes)", "content-length": "\(fullPart0.count)"],
+                        AsyncThrowingStream { $0.yield(fullPart0); $0.finish() }
+                    )
+                }
+                let partialCount: Int = switch start {
+                case 300_000: 120_000
+                case 600_000: 0
+                default: 90_000
+                }
+                let slice = partialCount > 0 ? sourcePayload.subdata(in: start..<(start + partialCount)) : Data()
+                let stream = AsyncThrowingStream<Data, Error> { cont in
+                    let producer = Task {
+                        if !slice.isEmpty {
+                            cont.yield(slice)
+                        }
+                        stalledParts.withValue { $0 += 1 }
+                        try? await Task.sleep(for: .seconds(15))
+                        cont.finish(throwing: CancellationError())
+                    }
+                    cont.onTermination = { _ in producer.cancel() }
+                }
+                return (
+                    206,
+                    ["content-range": "bytes \(start)-\(end)/\(totalBytes)", "content-length": "\(end - start + 1)"],
+                    stream
+                )
+            },
+            urlResolver: { _ in URL(string: "https://media.example.invalid/live4part.flac")! }
+        )
+
+        let track = TrackSummary(
+            id: "t-4part",
+            name: "FourPartMaster.flac",
+            folderPath: "Masters",
+            sizeBytes: UInt64(totalBytes)
+        )
+        let taskId = try await engine1.enqueueExportDownload(
+            accountId: accountId,
+            track: track,
+            relativeExportSubpath: "Masters/FourPartMaster.flac",
+            parallelThreads: 4,
+            explicitDirectoryURL: nil,
+            accountStore: store
+        )
+
+        let stallDeadline = ContinuousClock.now + .seconds(5)
+        while stalledParts.withValue({ $0 }) < 3 && ContinuousClock.now < stallDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await Task.sleep(for: .milliseconds(60))
+        engine1.cancelAllImmediate()
+
+        // Run 2: Fresh TransferEngine restores persisted manifest + partial .part files and resumes to byte-exact completion
+        let run2Ranges = LockedBox<[String]>([])
+        let engine2 = TransferEngine(
+            semaphore: GlobalTransferSemaphore(maxPermits: 8),
+            fetcher: MockUpstreamFetcher { _, rangeHeader in
+                if let rangeHeader {
+                    run2Ranges.withValue { $0.append(rangeHeader) }
+                }
+                if rangeHeader == "bytes=0-0" {
+                    return (
+                        206,
+                        ["content-range": "bytes 0-0/\(totalBytes)", "content-length": "1"],
+                        AsyncThrowingStream { $0.yield(sourcePayload.prefix(1)); $0.finish() }
+                    )
+                }
+                let parsed = try #require(RangeHeaderValidator.parseRequestRange(rangeHeader))
+                let start = Int(parsed.start)
+                let end = Int(parsed.end ?? UInt64(totalBytes - 1))
+                let sub = sourcePayload.subdata(in: start..<(end + 1))
+                return (
+                    206,
+                    ["content-range": "bytes \(start)-\(end)/\(totalBytes)", "content-length": "\(sub.count)"],
+                    AsyncThrowingStream { $0.yield(sub); $0.finish() }
+                )
+            },
+            urlResolver: { _ in URL(string: "https://media.example.invalid/live4part-fresh.flac")! }
+        )
+
+        await engine2.restorePersistedDownloads(for: accountId, accountStore: store)
+        let restored = try #require(await engine2.snapshot().items.first { $0.id == taskId })
+        #expect(restored.state == "paused")
+        #expect(restored.transferredBytes == 510_000)
+
+        await engine2.resumeTransfer(id: taskId, explicitDirectoryURL: nil, accountStore: store)
+        let resumeDeadline = ContinuousClock.now + .seconds(5)
+        while await engine2.snapshot().hasActiveItems && ContinuousClock.now < resumeDeadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        let completed = try #require(await engine2.snapshot().items.first { $0.id == taskId })
+        #expect(completed.state == "completed")
+        let exportedFileURL = exportDir.appendingPathComponent("Masters/FourPartMaster.flac")
+        let exportedData = try Data(contentsOf: exportedFileURL)
+        #expect(exportedData.count == totalBytes)
+        #expect(SHA256.hash(data: exportedData) == expectedDigest)
+        #expect(exportedData == sourcePayload)
+
+        let observedRun2Ranges = Set(run2Ranges.withValue { $0 })
+        #expect(!observedRun2Ranges.contains("bytes=0-299999"))
+        #expect(observedRun2Ranges.contains("bytes=420000-599999"))
+        #expect(observedRun2Ranges.contains("bytes=600000-899999"))
+        #expect(observedRun2Ranges.contains("bytes=990000-1199999"))
     }
 
     private static func makeSyntheticPNGData(width: Int, height: Int, includeAlpha: Bool) throws -> Data {

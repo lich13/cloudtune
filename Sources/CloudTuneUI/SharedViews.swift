@@ -1,5 +1,6 @@
 import AVKit
 import CloudTuneCore
+import CryptoKit
 import SwiftUI
 #if os(macOS)
 import AppKit
@@ -7,26 +8,120 @@ import AppKit
 import UIKit
 #endif
 
-private func decodePlatformImage(_ data: Data) -> Image? {
+private final class DecodedImageCache: @unchecked Sendable {
+    static let shared = DecodedImageCache()
+
     #if os(macOS)
-    guard let nsImage = NSImage(data: data) else { return nil }
-    return Image(nsImage: nsImage)
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 96
+        return c
+    }()
     #elseif os(iOS)
-    guard let uiImage = UIImage(data: data) else { return nil }
-    return Image(uiImage: uiImage)
-    #else
-    return nil
+    private let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.countLimit = 96
+        return c
+    }()
     #endif
+
+    func image(for data: Data) -> Image? {
+        guard !data.isEmpty else { return nil }
+        let digest = SHA256.hash(data: data)
+        var hex = ""
+        hex.reserveCapacity(72)
+        for byte in digest {
+            let hi = Int(byte >> 4)
+            let lo = Int(byte & 0x0F)
+            hex.append(Character(UnicodeScalar(hi < 10 ? 48 + hi : 87 + hi)!))
+            hex.append(Character(UnicodeScalar(lo < 10 ? 48 + lo : 87 + lo)!))
+        }
+        let key = "\(data.count):\(hex)" as NSString
+        #if os(macOS)
+        if let cached = cache.object(forKey: key) {
+            return Image(nsImage: cached)
+        }
+        guard let decoded = NSImage(data: data) else { return nil }
+        cache.setObject(decoded, forKey: key, cost: data.count)
+        return Image(nsImage: decoded)
+        #elseif os(iOS)
+        if let cached = cache.object(forKey: key) {
+            return Image(uiImage: cached)
+        }
+        guard let decoded = UIImage(data: data) else { return nil }
+        cache.setObject(decoded, forKey: key, cost: data.count)
+        return Image(uiImage: decoded)
+        #else
+        return nil
+        #endif
+    }
 }
 
-public struct SubtleStatusBanner: View {
-    public let message: String
-    public let isError: Bool
-    public let busyLabel: String?
-    public let palette: CloudTunePalette
-    public let onDismiss: (() -> Void)?
+private func decodePlatformImage(_ data: Data) -> Image? {
+    DecodedImageCache.shared.image(for: data)
+}
 
-    public init(
+package struct InteractiveSurfaceButtonStyle: ButtonStyle {
+    package var hoverOverlayColor: Color?
+    package var cornerRadius: CGFloat
+    package var pressScale: CGFloat
+
+    package init(
+        hoverOverlayColor: Color? = Color.primary.opacity(0.05),
+        cornerRadius: CGFloat = 8,
+        pressScale: CGFloat = 0.985
+    ) {
+        self.hoverOverlayColor = hoverOverlayColor
+        self.cornerRadius = cornerRadius
+        self.pressScale = pressScale
+    }
+
+    package func makeBody(configuration: Configuration) -> some View {
+        InteractiveSurfaceButtonBody(
+            configuration: configuration,
+            hoverOverlayColor: hoverOverlayColor,
+            cornerRadius: cornerRadius,
+            pressScale: pressScale
+        )
+    }
+
+    private struct InteractiveSurfaceButtonBody: View {
+        let configuration: Configuration
+        let hoverOverlayColor: Color?
+        let cornerRadius: CGFloat
+        let pressScale: CGFloat
+        @Environment(\.isEnabled) private var isEnabled
+        @State private var isHovered = false
+
+        var body: some View {
+            configuration.label
+                .contentShape(Rectangle())
+                .background {
+                    if isHovered, isEnabled, let hoverOverlayColor {
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(hoverOverlayColor)
+                    }
+                }
+                .opacity(configuration.isPressed ? 0.78 : 1.0)
+                .scaleEffect(configuration.isPressed ? pressScale : 1.0)
+                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+                #if os(macOS)
+                .onHover { hovering in
+                    isHovered = hovering
+                }
+                #endif
+        }
+    }
+}
+
+package struct SubtleStatusBanner: View {
+    package let message: String
+    package let isError: Bool
+    package let busyLabel: String?
+    package let palette: CloudTunePalette
+    package let onDismiss: (() -> Void)?
+
+    package init(
         message: String,
         isError: Bool = false,
         busyLabel: String? = nil,
@@ -40,7 +135,7 @@ public struct SubtleStatusBanner: View {
         self.onDismiss = onDismiss
     }
 
-    public var body: some View {
+    package var body: some View {
         let tint = isError ? palette.destructive : palette.accent
         HStack(spacing: 8) {
             if busyLabel != nil {
@@ -64,7 +159,7 @@ public struct SubtleStatusBanner: View {
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
             }
         }
         .padding(.horizontal, 12)
@@ -80,14 +175,14 @@ public struct SubtleStatusBanner: View {
     }
 }
 
-public struct ArtworkView: View {
-    public let artworkData: Data?
-    public let seedText: String
-    public let size: CGFloat
-    public let cornerRadius: CGFloat
-    public let palette: CloudTunePalette
+package struct ArtworkView: View {
+    package let artworkData: Data?
+    package let seedText: String
+    package let size: CGFloat
+    package let cornerRadius: CGFloat
+    package let palette: CloudTunePalette
 
-    public init(
+    package init(
         artworkData: Data?,
         seedText: String,
         size: CGFloat,
@@ -125,7 +220,7 @@ public struct ArtworkView: View {
         }
     }
 
-    public var body: some View {
+    package var body: some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if let artworkData, let decoded = decodePlatformImage(artworkData) {
             decoded
@@ -155,16 +250,16 @@ public struct ArtworkView: View {
     }
 }
 
-public struct LosslessBadge: View {
-    public let track: TrackSummary
-    public let palette: CloudTunePalette
+package struct LosslessBadge: View {
+    package let track: TrackSummary
+    package let palette: CloudTunePalette
 
-    public init(track: TrackSummary, palette: CloudTunePalette) {
+    package init(track: TrackSummary, palette: CloudTunePalette) {
         self.track = track
         self.palette = palette
     }
 
-    public var body: some View {
+    package var body: some View {
         if track.isLosslessAudio {
             let label = track.fileExtensionUpper
             Text(label)
@@ -180,25 +275,35 @@ public struct LosslessBadge: View {
     }
 }
 
-public struct InteractiveScrubSlider: View {
-    public let value: Double
-    public let total: Double
-    public let palette: CloudTunePalette
-    public let onPreviewChange: ((Double?) -> Void)?
-    public let onSeek: (Double) -> Void
+package struct InteractiveScrubSlider: View {
+    package let value: Double
+    package let total: Double
+    package let palette: CloudTunePalette
+    package let touchHeight: CGFloat
+    package let onPreviewChange: ((Double?) -> Void)?
+    package let onSeek: (Double) -> Void
 
     @State private var dragFraction: Double?
+    @GestureState private var isGestureActive: Bool = false
 
-    public init(
+    #if os(iOS)
+    package static let defaultTouchHeight: CGFloat = 32
+    #else
+    package static let defaultTouchHeight: CGFloat = 20
+    #endif
+
+    package init(
         value: Double,
         total: Double,
         palette: CloudTunePalette,
+        touchHeight: CGFloat = Self.defaultTouchHeight,
         onPreviewChange: ((Double?) -> Void)? = nil,
         onSeek: @escaping (Double) -> Void
     ) {
         self.value = value
         self.total = total
         self.palette = palette
+        self.touchHeight = max(20, touchHeight)
         self.onPreviewChange = onPreviewChange
         self.onSeek = onSeek
     }
@@ -212,7 +317,7 @@ public struct InteractiveScrubSlider: View {
         dragFraction ?? committedFraction
     }
 
-    public var body: some View {
+    package var body: some View {
         GeometryReader { geo in
             let width = max(1, geo.size.width)
             let isDragging = dragFraction != nil
@@ -239,6 +344,9 @@ public struct InteractiveScrubSlider: View {
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($isGestureActive) { _, state, _ in
+                        state = true
+                    }
                     .onChanged { gesture in
                         guard total > 0 else { return }
                         let pct = min(1.0, max(0.0, Double(gesture.location.x / width)))
@@ -252,13 +360,20 @@ public struct InteractiveScrubSlider: View {
                             return
                         }
                         let pct = min(1.0, max(0.0, Double(gesture.location.x / width)))
+                        let targetSeconds = pct * total
+                        onSeek(targetSeconds)
                         dragFraction = nil
-                        onPreviewChange?(nil)
-                        onSeek(pct * total)
                     }
             )
+            .onChange(of: isGestureActive) { _, active in
+                if !active, dragFraction != nil {
+                    dragFraction = nil
+                    onPreviewChange?(nil)
+                }
+            }
         }
-        .frame(height: 20)
+        .frame(height: touchHeight)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("播放进度")
         .accessibilityValue("\(CloudTuneFormatters.formatClock(activeFraction * max(0, total))) / \(CloudTuneFormatters.formatClock(total))")
@@ -277,15 +392,117 @@ public struct InteractiveScrubSlider: View {
     }
 }
 
-public struct PrimaryActionButton: View {
-    public let title: String
-    public let systemImage: String?
-    public let palette: CloudTunePalette
-    public let minWidth: CGFloat?
-    public let isDisabled: Bool
-    public let action: () -> Void
+package enum ScrubberLayoutStyle: Sendable {
+    case macHorizontal
+    case iosStacked(fontSize: CGFloat)
+}
 
-    public init(
+/// Isolated leaf scrubber view observing ONLY `PlaybackTimeline` (`currentTime` & `duration`),
+/// holding `scrubPreviewSeconds` across in-flight `seekPlayback` calls to prevent release bounce-back flicker.
+package struct NowPlayingScrubberView: View {
+    package let timeline: PlaybackTimeline
+    package let palette: CloudTunePalette
+    package let layout: ScrubberLayoutStyle
+    package let onSeek: @MainActor (Double) async -> Void
+
+    @State private var scrubPreviewSeconds: Double?
+    @State private var inFlightSeekToken: UInt64 = 0
+
+    package init(
+        timeline: PlaybackTimeline,
+        palette: CloudTunePalette,
+        layout: ScrubberLayoutStyle,
+        onSeek: @escaping @MainActor (Double) async -> Void
+    ) {
+        self.timeline = timeline
+        self.palette = palette
+        self.layout = layout
+        self.onSeek = onSeek
+    }
+
+    private var displayedSeconds: Double {
+        scrubPreviewSeconds ?? timeline.currentTime
+    }
+
+    private func commitSeek(_ targetSeconds: Double) {
+        scrubPreviewSeconds = targetSeconds
+        inFlightSeekToken &+= 1
+        let token = inFlightSeekToken
+        Task { @MainActor in
+            await onSeek(targetSeconds)
+            if inFlightSeekToken == token {
+                scrubPreviewSeconds = nil
+            }
+        }
+    }
+
+    package var body: some View {
+        switch layout {
+        case .macHorizontal:
+            HStack(spacing: 8) {
+                Text(CloudTuneFormatters.formatClock(displayedSeconds))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(palette.inkTertiary)
+                    .frame(width: 40, alignment: .trailing)
+
+                InteractiveScrubSlider(
+                    value: displayedSeconds,
+                    total: timeline.duration,
+                    palette: palette,
+                    touchHeight: 20,
+                    onPreviewChange: { preview in
+                        if let preview {
+                            scrubPreviewSeconds = preview
+                        } else if inFlightSeekToken == 0 {
+                            scrubPreviewSeconds = nil
+                        }
+                    },
+                    onSeek: commitSeek
+                )
+
+                Text(CloudTuneFormatters.formatClock(timeline.duration))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(palette.inkTertiary)
+                    .frame(width: 40, alignment: .leading)
+            }
+
+        case let .iosStacked(fontSize):
+            VStack(spacing: 2) {
+                InteractiveScrubSlider(
+                    value: displayedSeconds,
+                    total: timeline.duration,
+                    palette: palette,
+                    touchHeight: 32,
+                    onPreviewChange: { preview in
+                        if let preview {
+                            scrubPreviewSeconds = preview
+                        } else if inFlightSeekToken == 0 {
+                            scrubPreviewSeconds = nil
+                        }
+                    },
+                    onSeek: commitSeek
+                )
+                HStack {
+                    Text(CloudTuneFormatters.formatClock(displayedSeconds))
+                    Spacer()
+                    Text(CloudTuneFormatters.formatClock(timeline.duration))
+                }
+                .font(.system(size: fontSize).monospacedDigit())
+                .foregroundStyle(palette.inkTertiary)
+            }
+        }
+    }
+}
+
+package struct PrimaryActionButton: View {
+    package let title: String
+    package let systemImage: String?
+    package let palette: CloudTunePalette
+    package let minWidth: CGFloat?
+    package let isDisabled: Bool
+    package let action: () -> Void
+
+    package init(
         _ title: String,
         systemImage: String? = nil,
         palette: CloudTunePalette,
@@ -301,7 +518,7 @@ public struct PrimaryActionButton: View {
         self.action = action
     }
 
-    public var body: some View {
+    package var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 if let systemImage {
@@ -322,20 +539,20 @@ public struct PrimaryActionButton: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: Color.white.opacity(0.08), cornerRadius: 13))
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.55 : 1.0)
     }
 }
 
-public struct SecondaryActionButton: View {
-    public let title: String
-    public let systemImage: String?
-    public let palette: CloudTunePalette
-    public let isDisabled: Bool
-    public let action: () -> Void
+package struct SecondaryActionButton: View {
+    package let title: String
+    package let systemImage: String?
+    package let palette: CloudTunePalette
+    package let isDisabled: Bool
+    package let action: () -> Void
 
-    public init(
+    package init(
         _ title: String,
         systemImage: String? = nil,
         palette: CloudTunePalette,
@@ -349,7 +566,7 @@ public struct SecondaryActionButton: View {
         self.action = action
     }
 
-    public var body: some View {
+    package var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
                 if let systemImage {
@@ -373,20 +590,20 @@ public struct SecondaryActionButton: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 12))
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.5 : 1.0)
     }
 }
 
-public struct ToggleChipButton: View {
-    public let title: String
-    public let systemImage: String?
-    public let isActive: Bool
-    public let palette: CloudTunePalette
-    public let action: () -> Void
+package struct ToggleChipButton: View {
+    package let title: String
+    package let systemImage: String?
+    package let isActive: Bool
+    package let palette: CloudTunePalette
+    package let action: () -> Void
 
-    public init(
+    package init(
         _ title: String,
         systemImage: String? = nil,
         isActive: Bool,
@@ -400,7 +617,7 @@ public struct ToggleChipButton: View {
         self.action = action
     }
 
-    public var body: some View {
+    package var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
                 if let systemImage {
@@ -424,20 +641,20 @@ public struct ToggleChipButton: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 16))
     }
 }
 
-public struct TrackRowButton<TrailingAccessory: View>: View {
-    public let track: TrackSummary
-    public let isActive: Bool
-    public let actionLabel: String
-    public let palette: CloudTunePalette
-    public let action: () -> Void
+package struct TrackRowButton<TrailingAccessory: View>: View {
+    package let track: TrackSummary
+    package let isActive: Bool
+    package let actionLabel: String
+    package let palette: CloudTunePalette
+    package let action: () -> Void
     private let hasTrailingAccessory: Bool
     private let trailingAccessory: TrailingAccessory
 
-    public init(
+    package init(
         track: TrackSummary,
         isActive: Bool = false,
         actionLabel: String,
@@ -453,7 +670,7 @@ public struct TrackRowButton<TrailingAccessory: View>: View {
         self.trailingAccessory = EmptyView()
     }
 
-    public init(
+    package init(
         track: TrackSummary,
         isActive: Bool = false,
         actionLabel: String,
@@ -470,7 +687,7 @@ public struct TrackRowButton<TrailingAccessory: View>: View {
         self.trailingAccessory = trailingAccessory()
     }
 
-    public var body: some View {
+    package var body: some View {
         HStack(spacing: 0) {
             Button(action: action) {
                 HStack(spacing: 12) {
@@ -503,7 +720,7 @@ public struct TrackRowButton<TrailingAccessory: View>: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 13, pressScale: 0.992))
 
             if hasTrailingAccessory {
                 trailingAccessory
@@ -521,18 +738,18 @@ public struct TrackRowButton<TrailingAccessory: View>: View {
     }
 }
 
-public struct FolderRowButton: View {
-    public let folder: RemoteFolder
-    public let palette: CloudTunePalette
-    public let action: () -> Void
+package struct FolderRowButton: View {
+    package let folder: RemoteFolder
+    package let palette: CloudTunePalette
+    package let action: () -> Void
 
-    public init(folder: RemoteFolder, palette: CloudTunePalette, action: @escaping () -> Void) {
+    package init(folder: RemoteFolder, palette: CloudTunePalette, action: @escaping () -> Void) {
         self.folder = folder
         self.palette = palette
         self.action = action
     }
 
-    public var body: some View {
+    package var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: "folder.fill")
@@ -560,18 +777,18 @@ public struct FolderRowButton: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 12, pressScale: 0.99))
     }
 }
 
-public struct TransferRowCardView: View {
-    public let item: TransferStatus
-    public let palette: CloudTunePalette
-    public let onPause: () -> Void
-    public let onResume: () -> Void
-    public let onDelete: () -> Void
+package struct TransferRowCardView: View {
+    package let item: TransferStatus
+    package let palette: CloudTunePalette
+    package let onPause: () -> Void
+    package let onResume: () -> Void
+    package let onDelete: () -> Void
 
-    public init(
+    package init(
         item: TransferStatus,
         palette: CloudTunePalette,
         onPause: @escaping () -> Void,
@@ -585,7 +802,7 @@ public struct TransferRowCardView: View {
         self.onDelete = onDelete
     }
 
-    public var body: some View {
+    package var body: some View {
         let pct = CloudTuneFormatters.formatPercent(transferred: item.transferredBytes, total: item.totalBytes)
         let stateSummary: String = {
             if let path = item.path, !path.isEmpty {
@@ -698,20 +915,20 @@ public struct TransferRowCardView: View {
     }
 }
 
-public struct QrCodeArtworkView: View {
-    public let pngData: Data?
-    public let hint: String?
-    public let host: String?
-    public let palette: CloudTunePalette
+package struct QrCodeArtworkView: View {
+    package let pngData: Data?
+    package let hint: String?
+    package let host: String?
+    package let palette: CloudTunePalette
 
-    public init(pngData: Data?, hint: String?, host: String?, palette: CloudTunePalette) {
+    package init(pngData: Data?, hint: String?, host: String?, palette: CloudTunePalette) {
         self.pngData = pngData
         self.hint = hint
         self.host = host
         self.palette = palette
     }
 
-    public var body: some View {
+    package var body: some View {
         if let pngData, let image = decodePlatformImage(pngData) {
             VStack(spacing: 10) {
                 image
@@ -778,23 +995,23 @@ public struct QrCodeArtworkView: View {
 }
 
 #if os(macOS)
-public struct AirPlayRoutePicker: NSViewRepresentable {
-    public init() {}
+package struct AirPlayRoutePicker: NSViewRepresentable {
+    package init() {}
 
-    public func makeNSView(context: Context) -> AVRoutePickerView {
+    package func makeNSView(context: Context) -> AVRoutePickerView {
         let picker = AVRoutePickerView(frame: NSRect(x: 0, y: 0, width: 28, height: 28))
         picker.isRoutePickerButtonBordered = false
         return picker
     }
 
-    public func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+    package func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
 
-    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: AVRoutePickerView, context: Context) -> CGSize? {
+    package func sizeThatFits(_ proposal: ProposedViewSize, nsView: AVRoutePickerView, context: Context) -> CGSize? {
         CGSize(width: 28, height: 28)
     }
 }
 
-public enum MacMenuEntry {
+package enum MacMenuEntry {
     case item(
         title: String,
         systemImage: String? = nil,
@@ -806,12 +1023,12 @@ public enum MacMenuEntry {
 }
 
 /// Native AppKit `NSView` + `NSMenu.popUp` trigger with full rectangular hit area (never uses SwiftUI `Menu`).
-public struct MacPopUpMenuButton: NSViewRepresentable {
-    public let systemImage: String
-    public let accessibilityTitle: String
-    public let entries: () -> [MacMenuEntry]
+package struct MacPopUpMenuButton: NSViewRepresentable {
+    package let systemImage: String
+    package let accessibilityTitle: String
+    package let entries: () -> [MacMenuEntry]
 
-    public init(
+    package init(
         systemImage: String,
         accessibilityTitle: String,
         entries: @escaping () -> [MacMenuEntry]
@@ -821,11 +1038,11 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
         self.entries = entries
     }
 
-    public func makeCoordinator() -> Coordinator {
+    package func makeCoordinator() -> Coordinator {
         Coordinator(entries: entries)
     }
 
-    public func makeNSView(context: Context) -> PopUpTriggerNSView {
+    package func makeNSView(context: Context) -> PopUpTriggerNSView {
         let view = PopUpTriggerNSView()
         view.configure(systemImage: systemImage, accessibilityTitle: accessibilityTitle)
         view.onTrigger = { [weak coordinator = context.coordinator] anchor in
@@ -834,18 +1051,18 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
         return view
     }
 
-    public func updateNSView(_ nsView: PopUpTriggerNSView, context: Context) {
+    package func updateNSView(_ nsView: PopUpTriggerNSView, context: Context) {
         context.coordinator.entries = entries
         nsView.configure(systemImage: systemImage, accessibilityTitle: accessibilityTitle)
     }
 
-    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: PopUpTriggerNSView, context: Context) -> CGSize? {
+    package func sizeThatFits(_ proposal: ProposedViewSize, nsView: PopUpTriggerNSView, context: Context) -> CGSize? {
         let intrinsic = nsView.intrinsicContentSize
         return CGSize(width: intrinsic.width, height: intrinsic.height)
     }
 
     @MainActor
-    public final class Coordinator: NSObject {
+    package final class Coordinator: NSObject {
         var entries: () -> [MacMenuEntry]
         private var handlers: [Int: @MainActor () -> Void] = [:]
 
@@ -853,10 +1070,11 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
             self.entries = entries
         }
 
-        func presentMenu(from view: NSView) {
+        func presentMenu(from view: PopUpTriggerNSView) {
             handlers.removeAll()
             let menu = NSMenu()
             menu.autoenablesItems = false
+            menu.appearance = view.effectiveAppearance
             var nextTag = 1
             for entry in entries() {
                 switch entry {
@@ -876,7 +1094,10 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
                     menu.addItem(item)
                 }
             }
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
+            // `PopUpTriggerNSView.isFlipped == true`: y = bounds.height + 4 anchors 4pt BELOW the button's bottom edge.
+            let anchorPoint = view.menuPopUpAnchorPoint
+            _ = menu.popUp(positioning: nil, at: anchorPoint, in: view)
+            view.resetInteractionState()
         }
 
         @objc private func handleMenuItem(_ sender: NSMenuItem) {
@@ -884,26 +1105,51 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
         }
     }
 
-    public final class PopUpTriggerNSView: NSView {
-        var onTrigger: ((NSView) -> Void)?
+    package final class PopUpTriggerNSView: NSView {
+        package var onTrigger: ((PopUpTriggerNSView) -> Void)?
         private var symbolName: String = "ellipsis.circle"
-        private var isHovered = false {
-            didSet { needsDisplay = true }
+        package private(set) var isHovered = false {
+            didSet {
+                if oldValue != isHovered {
+                    needsDisplay = true
+                }
+            }
+        }
+        private var isPressed = false {
+            didSet {
+                if oldValue != isPressed {
+                    needsDisplay = true
+                }
+            }
         }
         private var trackingRef: NSTrackingArea?
 
-        override public var intrinsicContentSize: NSSize {
+        override package var isFlipped: Bool {
+            true
+        }
+
+        package var menuPopUpAnchorPoint: NSPoint {
+            NSPoint(x: 0, y: bounds.height + 4)
+        }
+
+        override package var intrinsicContentSize: NSSize {
             NSSize(width: 28, height: 28)
         }
 
-        func configure(systemImage: String, accessibilityTitle: String) {
+        package func configure(systemImage: String, accessibilityTitle: String) {
             self.symbolName = systemImage
+            setAccessibilityElement(true)
             setAccessibilityLabel(accessibilityTitle)
             setAccessibilityRole(.popUpButton)
             needsDisplay = true
         }
 
-        override public func updateTrackingAreas() {
+        package func resetInteractionState() {
+            isPressed = false
+            isHovered = false
+        }
+
+        override package func updateTrackingAreas() {
             super.updateTrackingAreas()
             if let trackingRef {
                 removeTrackingArea(trackingRef)
@@ -918,24 +1164,32 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
             trackingRef = area
         }
 
-        override public func mouseEntered(with event: NSEvent) {
+        override package func mouseEntered(with event: NSEvent) {
             isHovered = true
         }
 
-        override public func mouseExited(with event: NSEvent) {
-            isHovered = false
+        override package func mouseExited(with event: NSEvent) {
+            resetInteractionState()
         }
 
-        override public func mouseDown(with event: NSEvent) {
+        override package func mouseDown(with event: NSEvent) {
+            isPressed = true
             onTrigger?(self)
+            resetInteractionState()
         }
 
-        override public func draw(_ dirtyRect: NSRect) {
+        override package func accessibilityPerformPress() -> Bool {
+            onTrigger?(self)
+            resetInteractionState()
+            return true
+        }
+
+        override package func draw(_ dirtyRect: NSRect) {
             super.draw(dirtyRect)
-            if isHovered {
+            if isPressed || isHovered {
                 let radius = min(bounds.width, bounds.height) * 0.25
                 let path = NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius)
-                NSColor.labelColor.withAlphaComponent(0.08).setFill()
+                NSColor.labelColor.withAlphaComponent(isPressed ? 0.14 : 0.08).setFill()
                 path.fill()
             }
             let cfg = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
@@ -952,19 +1206,19 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
                 width: sSize.width,
                 height: sSize.height
             )
-            symbol.draw(in: iconRect)
+            symbol.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
         }
     }
 }
 #elseif os(iOS)
-public struct AirPlayRoutePicker: UIViewRepresentable {
-    public let tint: UIColor
+package struct AirPlayRoutePicker: UIViewRepresentable {
+    package let tint: UIColor
 
-    public init(tint: UIColor = .label) {
+    package init(tint: UIColor = .label) {
         self.tint = tint
     }
 
-    public func makeUIView(context: Context) -> AVRoutePickerView {
+    package func makeUIView(context: Context) -> AVRoutePickerView {
         let picker = AVRoutePickerView(frame: CGRect(x: 0, y: 0, width: 34, height: 34))
         picker.prioritizesVideoDevices = false
         picker.tintColor = tint
@@ -972,7 +1226,7 @@ public struct AirPlayRoutePicker: UIViewRepresentable {
         return picker
     }
 
-    public func updateUIView(_ uiView: AVRoutePickerView, context: Context) {
+    package func updateUIView(_ uiView: AVRoutePickerView, context: Context) {
         uiView.tintColor = tint
         uiView.activeTintColor = tint
     }

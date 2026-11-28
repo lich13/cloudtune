@@ -3,29 +3,46 @@ import CloudTuneCore
 import Foundation
 import Observation
 
-public enum BrowserScope: Sendable {
+package enum BrowserScope: Sendable {
     case cloud
     case video
 }
 
-public struct BrowserPaneState: Equatable, Sendable {
-    public var breadcrumbs: [BreadcrumbItem]
-    public var payload: FolderBrowsePayload?
+package struct BrowserPaneState: Equatable, Sendable {
+    package var breadcrumbs: [BreadcrumbItem]
+    package var payload: FolderBrowsePayload?
 
-    public init(breadcrumbs: [BreadcrumbItem] = [.root], payload: FolderBrowsePayload? = nil) {
+    package init(breadcrumbs: [BreadcrumbItem] = [.root], payload: FolderBrowsePayload? = nil) {
         self.breadcrumbs = breadcrumbs
         self.payload = payload
     }
 }
 
-public struct PendingExternalVideoChoice: Equatable, Identifiable, Sendable {
-    public var id: String { video.id }
-    public let video: TrackSummary
-    public let streamURL: URL?
+package struct PendingExternalVideoChoice: Equatable, Identifiable, Sendable {
+    package var id: String { video.id }
+    package let video: TrackSummary
+    package let streamURL: URL?
 
-    public init(video: TrackSummary, streamURL: URL?) {
+    package init(video: TrackSummary, streamURL: URL?) {
         self.video = video
         self.streamURL = streamURL
+    }
+}
+
+@MainActor
+@Observable
+package final class PlaybackTimeline {
+    package var currentTime: Double = 0
+    package var duration: Double = 0
+
+    package init(currentTime: Double = 0, duration: Double = 0) {
+        self.currentTime = currentTime
+        self.duration = duration
+    }
+
+    package func reset() {
+        currentTime = 0
+        duration = 0
     }
 }
 
@@ -56,28 +73,28 @@ public final class CloudTuneViewModel {
     private static let appearanceDefaultsKey = "com.gosu.cloudtune.appearanceMode"
     private static let volumeDefaultsKey = "com.gosu.cloudtune.playerVolume"
 
-    public var appearancePreference: AppearanceMode = .system {
+    package var appearancePreference: AppearanceMode = .system {
         didSet {
             if persistPreferencesToDefaults {
                 userDefaults.set(appearancePreference.rawValue, forKey: Self.appearanceDefaultsKey)
             }
         }
     }
-    public var activeModule: ModuleTab = .music
+    package var activeModule: ModuleTab = .music
 
-    public var isBootstrapping: Bool = false
-    public var busyLabel: String?
-    public var statusMessage: String? {
+    package var isBootstrapping: Bool = false
+    package var busyLabel: String?
+    package var statusMessage: String? {
         didSet {
             if statusMessage == nil {
                 statusKind = .info
             }
         }
     }
-    public var statusKind: StatusKind = .info
-    public var credentialIssue: CredentialIssue?
+    package var statusKind: StatusKind = .info
+    package var credentialIssue: CredentialIssue?
 
-    public func setStatus(_ message: String?, kind: StatusKind = .info) {
+    package func setStatus(_ message: String?, kind: StatusKind = .info) {
         if let message {
             statusKind = kind
             statusMessage = message
@@ -87,68 +104,94 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public var isAuthenticated: Bool = false
-    public var accountName: String?
-    public private(set) var accountStorageKey: String?
+    package var isAuthenticated: Bool = false
+    package var accountName: String?
+    package private(set) var accountStorageKey: String?
 
     // Strictly separated committed vs draft settings
-    public private(set) var committedSettings: AccountSettings = AccountSettings()
-    public var cacheLimitDraft: String = "1024"
-    public var downloadThreadsDraft: String = "8"
-    public var cacheThreadsDraft: String = "4"
-    public var settingsValidationError: String?
+    package private(set) var committedSettings: AccountSettings = AccountSettings()
+    package var cacheLimitDraft: String = "1024"
+    package var downloadThreadsDraft: String = "8"
+    package var cacheThreadsDraft: String = "4"
+    package var settingsValidationError: String?
 
-    public var cacheUsageBytes: UInt64 = 0
+    package var cacheUsageBytes: UInt64 = 0
 
     // Login state
-    public var qrContent: String?
-    public var qrPNGData: Data?
-    public var qrHint: String?
-    public var isShowingWebLoginSheet: Bool = false
+    package var qrContent: String?
+    package var qrPNGData: Data?
+    package var qrHint: String?
+    package var isShowingWebLoginSheet: Bool = false
 
     // Decoupled Cloud & Video browsers + library
-    public var cloudBrowser = BrowserPaneState()
-    public var videoBrowser = BrowserPaneState()
-    public var tracks: [TrackSummary] = [] {
+    package var cloudBrowser = BrowserPaneState()
+    package var videoBrowser = BrowserPaneState()
+    package var tracks: [TrackSummary] = [] {
         didSet {
+            rebuildTrackLookups()
             if shuffle {
                 shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(
                     tracks: tracks,
                     anchorTrackId: currentTrackId
                 )
+            } else {
+                rebuildOrderedQueueCache()
             }
+            recomputeVisibleTracks(force: true)
             syncRemoteCommandAvailability()
         }
     }
-    public var searchQuery: String = ""
+    package var searchQuery: String = "" {
+        didSet {
+            recomputeVisibleTracks(force: false)
+        }
+    }
+    package private(set) var visibleTracks: [TrackSummary] = []
+    @ObservationIgnored package private(set) var tracksById: [String: TrackSummary] = [:]
+    @ObservationIgnored package private(set) var trackIndexById: [String: Int] = [:]
+    @ObservationIgnored private var orderedLibraryTracksCache: [TrackSummary] = []
+    @ObservationIgnored private var orderedIndexByIdCache: [String: Int] = [:]
+    @ObservationIgnored private var upNextTrackIdSet: Set<String> = []
+    @ObservationIgnored private var lastNormalizedSearchQuery: String = ""
+
+    // Isolated high-frequency playback clock
+    package let timeline = PlaybackTimeline()
+    package var currentTime: Double {
+        get { timeline.currentTime }
+        set { timeline.currentTime = newValue }
+    }
+    package var duration: Double {
+        get { timeline.duration }
+        set { timeline.duration = newValue }
+    }
 
     // Playback & unified queue state
-    public var activeTrack: TrackSummary? {
+    package var activeTrack: TrackSummary? {
         didSet { syncRemoteCommandAvailability() }
     }
-    public var currentTrackId: String? {
+    package var currentTrackId: String? {
         didSet { syncRemoteCommandAvailability() }
     }
-    public var nowPlayingMetadata: NowPlayingMetadata?
-    public var isPlaying: Bool = false
-    public var loadingTrackId: String?
-    public var shuffle: Bool = true {
+    package var nowPlayingMetadata: NowPlayingMetadata?
+    package var isPlaying: Bool = false
+    package var loadingTrackId: String?
+    package var shuffle: Bool = true {
         didSet {
             if shuffle {
                 shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(
                     tracks: tracks,
                     anchorTrackId: currentTrackId
                 )
+            } else {
+                rebuildOrderedQueueCache()
             }
             syncRemoteCommandAvailability()
         }
     }
-    public var loopMode: LoopMode = .all {
+    package var loopMode: LoopMode = .all {
         didSet { syncRemoteCommandAvailability() }
     }
-    public var currentTime: Double = 0
-    public var duration: Double = 0
-    public var volume: Double = 0.85 {
+    package var volume: Double = 0.85 {
         didSet {
             let clamped = min(1.0, max(0.0, volume.isFinite ? volume : 0.85))
             if volume != clamped {
@@ -161,17 +204,24 @@ public final class CloudTuneViewModel {
             }
         }
     }
-    public var upNextQueue: [TrackSummary] = [] {
-        didSet { syncRemoteCommandAvailability() }
+    package var upNextQueue: [TrackSummary] = [] {
+        didSet {
+            upNextTrackIdSet = Set(upNextQueue.map(\.id))
+            syncRemoteCommandAvailability()
+        }
     }
-    public private(set) var shuffleOrderIds: [String] = []
+    package private(set) var shuffleOrderIds: [String] = [] {
+        didSet {
+            rebuildOrderedQueueCache()
+        }
+    }
 
     // Presentation state (shared across live app & offscreen snapshot scenes)
-    public var isShowingNowPlaying: Bool = false
-    public var isShowingSettingsSheet: Bool = false
+    package var isShowingNowPlaying: Bool = false
+    package var isShowingSettingsSheet: Bool = false
 
     // Video sheet / external handoff state
-    public var activeVideoURL: URL? {
+    package var activeVideoURL: URL? {
         didSet {
             if activeVideoURL == nil {
                 activeVideoTrack = nil
@@ -183,20 +233,20 @@ public final class CloudTuneViewModel {
             }
         }
     }
-    public var activeVideoTrack: TrackSummary?
-    public var shareFileURL: URL?
-    public var pendingExternalVideoChoice: PendingExternalVideoChoice?
+    package var activeVideoTrack: TrackSummary?
+    package var shareFileURL: URL?
+    package var pendingExternalVideoChoice: PendingExternalVideoChoice?
 
     // Transfers
-    public var transferSnapshot: TransferSnapshotPayload = TransferSnapshotPayload()
+    package var transferSnapshot: TransferSnapshotPayload = TransferSnapshotPayload()
 
     // Runtime collaborators
-    public let cloudClient: Cloud189Client
-    public let accountStore: AccountScopedStore
-    public let semaphore: GlobalTransferSemaphore
-    public let streamServer: StreamProxyServer?
-    public let transferEngine: TransferEngine
-    public private(set) var hasActivePlayerObservers: Bool = false
+    package let cloudClient: Cloud189Client
+    package let accountStore: AccountScopedStore
+    package let semaphore: GlobalTransferSemaphore
+    package let streamServer: StreamProxyServer?
+    package let transferEngine: TransferEngine
+    package private(set) var hasActivePlayerObservers: Bool = false
 
     private let keychainBackend: KeychainBackend
     private let userDefaults: UserDefaults
@@ -207,7 +257,7 @@ public final class CloudTuneViewModel {
     private let nowPlayingCoordinator = NowPlayingCoordinator()
 
     @ObservationIgnored private var _player: AVPlayer?
-    public var player: AVPlayer {
+    package var player: AVPlayer {
         if let existing = _player {
             return existing
         }
@@ -222,6 +272,8 @@ public final class CloudTuneViewModel {
     @ObservationIgnored private var failObserver: NSObjectProtocol?
     @ObservationIgnored private var itemStatusObservation: NSKeyValueObservation?
     @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
+    @ObservationIgnored private var activeSeekToken: UInt64 = 0
+    @ObservationIgnored private var isSeekingPlayback: Bool = false
     private var qrPollTask: Task<Void, Never>?
     private var transferRefreshTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Error>?
@@ -243,16 +295,20 @@ public final class CloudTuneViewModel {
     private var recoveryAttempts: Int = 0
     private var currentPlaybackIsLoopback: Bool = false
     private var wasPlayingBeforeInterruption: Bool = false
-    public var retryBaseDelayMs: Int = 1500
+    package var retryBaseDelayMs: Int = 1500
 
-    public init(
+    public convenience init() {
+        self.init(enableLiveObservers: true)
+    }
+
+    package init(
         cloudClient: Cloud189Client = Cloud189Client(),
         accountStore: AccountScopedStore? = nil,
         keychainBackend: KeychainBackend = SystemKeychainBackend(),
         semaphore: GlobalTransferSemaphore = GlobalTransferSemaphore(maxPermits: 8),
         upstreamFetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         userDefaults: UserDefaults = .standard,
-        enableLiveObservers: Bool = true
+        enableLiveObservers: Bool
     ) {
         self.cloudClient = cloudClient
         let resolvedStore = AccountScopedStore.resolveOrFallback(accountStore)
@@ -422,78 +478,143 @@ public final class CloudTuneViewModel {
     }
     #endif
 
-    public var visibleTracks: [TrackSummary] {
-        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !trimmed.isEmpty else { return tracks }
-        return tracks.filter {
-            $0.name.lowercased().contains(trimmed) || $0.folderPath.lowercased().contains(trimmed)
+    private func rebuildTrackLookups() {
+        var byId: [String: TrackSummary] = [:]
+        var indexById: [String: Int] = [:]
+        byId.reserveCapacity(tracks.count)
+        indexById.reserveCapacity(tracks.count)
+        for (idx, track) in tracks.enumerated() where byId[track.id] == nil {
+            byId[track.id] = track
+            indexById[track.id] = idx
+        }
+        tracksById = byId
+        trackIndexById = indexById
+    }
+
+    private func rebuildOrderedQueueCache() {
+        if shuffle && tracks.count > 1 {
+            let ordered = PlaybackQueueResolver.orderedBaseTracks(
+                libraryTracks: tracks,
+                shuffle: true,
+                shuffleOrderIds: shuffleOrderIds,
+                tracksById: tracksById
+            )
+            var idxMap: [String: Int] = [:]
+            idxMap.reserveCapacity(ordered.count)
+            for (idx, item) in ordered.enumerated() where idxMap[item.id] == nil {
+                idxMap[item.id] = idx
+            }
+            orderedLibraryTracksCache = ordered
+            orderedIndexByIdCache = idxMap
+        } else {
+            orderedLibraryTracksCache = tracks
+            orderedIndexByIdCache = trackIndexById
         }
     }
 
-    public var currentTrack: TrackSummary? {
+    private func recomputeVisibleTracks(force: Bool) {
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !force && trimmed == lastNormalizedSearchQuery {
+            return
+        }
+        lastNormalizedSearchQuery = trimmed
+        if trimmed.isEmpty {
+            visibleTracks = tracks
+        } else {
+            visibleTracks = tracks.filter {
+                $0.name.lowercased().contains(trimmed) || $0.folderPath.lowercased().contains(trimmed)
+            }
+        }
+    }
+
+    package func isManualUpNext(trackId: String) -> Bool {
+        _ = upNextQueue.count
+        return upNextTrackIdSet.contains(trackId)
+    }
+
+    #if DEBUG
+    package nonisolated func invokeRemoteCommandForTesting(_ command: TestableRemoteCommand) -> Bool {
+        nowPlayingCoordinator.invokeRemoteCommandForTesting(command)
+    }
+    #endif
+
+    package var currentTrack: TrackSummary? {
         if let activeTrack, activeTrack.id == currentTrackId || currentTrackId == nil {
             return activeTrack
         }
         guard let currentTrackId else { return nil }
-        return tracks.first { $0.id == currentTrackId }
+        _ = tracks.count
+        return tracksById[currentTrackId]
             ?? cloudBrowser.payload?.audioFiles.first { $0.id == currentTrackId }
             ?? activeTrack
     }
 
-    public var upcomingTracks: [TrackSummary] {
-        PlaybackQueueResolver.upcomingPreview(
+    package var upcomingTracks: [TrackSummary] {
+        _ = tracks.count
+        _ = shuffleOrderIds.count
+        return PlaybackQueueResolver.upcomingPreview(
             currentTrack: currentTrack,
             libraryTracks: tracks,
             upNextQueue: upNextQueue,
             shuffle: shuffle,
             shuffleOrderIds: shuffleOrderIds,
             loopMode: loopMode,
-            limit: 20
+            limit: 20,
+            orderedTracks: orderedLibraryTracksCache,
+            orderedIndexById: orderedIndexByIdCache
         )
     }
 
-    public var canSkipNext: Bool {
-        PlaybackQueueResolver.canSkipNext(
+    package var canSkipNext: Bool {
+        _ = tracks.count
+        _ = shuffleOrderIds.count
+        return PlaybackQueueResolver.canSkipNext(
             currentTrack: currentTrack,
             libraryTracks: tracks,
             upNextQueue: upNextQueue,
             shuffle: shuffle,
             shuffleOrderIds: shuffleOrderIds,
-            loopMode: loopMode
+            loopMode: loopMode,
+            orderedTracks: orderedLibraryTracksCache,
+            orderedIndexById: orderedIndexByIdCache
         )
     }
 
-    public var canSkipPrevious: Bool {
-        PlaybackQueueResolver.canSkipPrevious(
+    package var canSkipPrevious: Bool {
+        _ = tracks.count
+        _ = shuffleOrderIds.count
+        return PlaybackQueueResolver.canSkipPrevious(
             currentTrack: currentTrack,
             libraryTracks: tracks,
             shuffle: shuffle,
             shuffleOrderIds: shuffleOrderIds,
-            loopMode: loopMode
+            loopMode: loopMode,
+            orderedTracks: orderedLibraryTracksCache,
+            orderedIndexById: orderedIndexByIdCache
         )
     }
 
-    public var downloadTransfers: [TransferStatus] {
+    package var downloadTransfers: [TransferStatus] {
         transferSnapshot.items.filter { $0.kind == "download" }
     }
 
-    public var activeStreamAndCacheTransfers: [TransferStatus] {
+    package var activeStreamAndCacheTransfers: [TransferStatus] {
         transferSnapshot.items.filter { $0.kind != "download" }
     }
 
-    public var downloadableBrowserFiles: [TrackSummary] {
+    package var downloadableBrowserFiles: [TrackSummary] {
         guard let payload = cloudBrowser.payload else { return [] }
         return payload.audioFiles + payload.videoFiles + payload.otherFiles
     }
 
-    public var qrHost: String? {
+    package var qrHost: String? {
         guard let qrContent, let url = URL(string: qrContent) else { return nil }
         return url.host
     }
 
     // MARK: - Settings Draft Safety & Checked Persistence
 
-    public func syncDraftsFromCommitted() {
+    package func syncDraftsFromCommitted() {
         applyDraftSync(.all)
     }
 
@@ -517,13 +638,13 @@ public final class CloudTuneViewModel {
         settingsValidationError = nil
     }
 
-    public var hasUnsavedSettingsDrafts: Bool {
+    package var hasUnsavedSettingsDrafts: Bool {
         cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb)
             || downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
             || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads)
     }
 
-    public func noteDraftEdited() {
+    package func noteDraftEdited() {
         if let previousError = settingsValidationError, statusMessage == previousError {
             statusMessage = nil
         }
@@ -531,7 +652,7 @@ public final class CloudTuneViewModel {
     }
 
     @discardableResult
-    public func canCloseSettingsSurface() -> Bool {
+    package func canCloseSettingsSurface() -> Bool {
         guard !hasUnsavedSettingsDrafts else {
             if settingsValidationError == nil {
                 let msg = "尚有未应用的设置草稿，请先点击「应用」或「还原修改」后再关闭。"
@@ -574,7 +695,7 @@ public final class CloudTuneViewModel {
     }
 
     @discardableResult
-    public func commitPendingSettingsDraftsIfNeeded() async -> Bool {
+    package func commitPendingSettingsDraftsIfNeeded() async -> Bool {
         let cacheDirty = cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb)
         let threadsDirty = downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
             || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads)
@@ -644,7 +765,7 @@ public final class CloudTuneViewModel {
     }
 
     @discardableResult
-    public func commitCacheLimitDraft() async -> Bool {
+    package func commitCacheLimitDraft() async -> Bool {
         guard let parsed = parseValidatedCacheLimitDraft() else {
             return false
         }
@@ -672,7 +793,7 @@ public final class CloudTuneViewModel {
     }
 
     @discardableResult
-    public func commitTransferThreadsDraft() async -> Bool {
+    package func commitTransferThreadsDraft() async -> Bool {
         guard let parsed = parseValidatedTransferThreadsDraft() else {
             return false
         }
@@ -686,14 +807,14 @@ public final class CloudTuneViewModel {
         )
     }
 
-    public func updatePlaybackMode(_ mode: PlaybackMode) async {
+    package func updatePlaybackMode(_ mode: PlaybackMode) async {
         let msg = mode == .downloadFirst ? "已切到优先缓存播放" : "已切到边播边缓存"
         _ = await mutateCommittedSettings(successMessage: msg, draftSync: .none) {
             $0.playbackMode = mode
         }
     }
 
-    public func setAppearanceMode(_ mode: AppearanceMode) async {
+    package func setAppearanceMode(_ mode: AppearanceMode) async {
         appearancePreference = mode
         _ = await mutateCommittedSettings(
             successMessage: nil,
@@ -838,7 +959,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func beginQrLogin() async {
+    package func beginQrLogin() async {
         qrPollTask?.cancel()
         let expectedAuthGen = authGeneration
         let assignedBusy = "生成二维码..."
@@ -950,7 +1071,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func completeEmbeddedWebLogin(callbackURL: URL, cookies: [HTTPCookie]) async {
+    package func completeEmbeddedWebLogin(callbackURL: URL, cookies: [HTTPCookie]) async {
         authGeneration += 1
         let loginAuthGen = authGeneration
         isBootstrapping = false
@@ -1012,7 +1133,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func activateAuthenticatedAccount(storageKey: String, displayName: String) async {
+    package func activateAuthenticatedAccount(storageKey: String, displayName: String) async {
         if enableLiveObservers {
             setupPlayerAndRemoteCommands()
         }
@@ -1084,7 +1205,7 @@ public final class CloudTuneViewModel {
         await handleTransferActivityChange(snapshot: snap, hasActive: snap.hasActiveItems)
     }
 
-    public func logout() async {
+    package func logout() async {
         authGeneration += 1
         isBootstrapping = false
         qrPollTask?.cancel()
@@ -1138,8 +1259,9 @@ public final class CloudTuneViewModel {
         nowPlayingMetadata = nil
         isPlaying = false
         loadingTrackId = nil
-        currentTime = 0
-        duration = 0
+        activeSeekToken &+= 1
+        isSeekingPlayback = false
+        timeline.reset()
         activeVideoURL = nil
         activeVideoTrack = nil
         shareFileURL = nil
@@ -1154,7 +1276,7 @@ public final class CloudTuneViewModel {
         setStatus("已退出登录并清理当前会话", kind: .info)
     }
 
-    public func shutdownForTermination() {
+    package func shutdownForTermination() {
         qrPollTask?.cancel()
         qrPollTask = nil
         transferRefreshTask?.cancel()
@@ -1197,7 +1319,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func browseTo(
+    package func browseTo(
         scope: BrowserScope = .cloud,
         folderId: String?,
         nextBreadcrumbs: [BreadcrumbItem],
@@ -1267,7 +1389,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func navigateBackInBrowser(scope: BrowserScope) async {
+    package func navigateBackInBrowser(scope: BrowserScope) async {
         let crumbs = (scope == .cloud) ? cloudBrowser.breadcrumbs : videoBrowser.breadcrumbs
         guard crumbs.count > 1 else { return }
         let nextCrumbs = Array(crumbs.dropLast())
@@ -1275,7 +1397,7 @@ public final class CloudTuneViewModel {
         await browseTo(scope: scope, folderId: targetId, nextBreadcrumbs: nextCrumbs)
     }
 
-    public func setFolderAsMusicLibrary(from pane: BrowserPaneState) async {
+    package func setFolderAsMusicLibrary(from pane: BrowserPaneState) async {
         guard let payload = pane.payload, let lastCrumb = pane.breadcrumbs.last, let accountId = activeAccountKey else { return }
         let displayName = (lastCrumb.id == payload.currentFolderId || (payload.isRoot && lastCrumb.id == nil))
             ? lastCrumb.name
@@ -1300,7 +1422,7 @@ public final class CloudTuneViewModel {
         await scanMusicLibrary(showBusy: false)
     }
 
-    public func scanMusicLibrary(showBusy: Bool = true) async {
+    package func scanMusicLibrary(showBusy: Bool = true) async {
         guard isAuthenticated, let folder = committedSettings.musicFolder, let accountId = activeAccountKey else {
             setStatus("请先在云盘目录中设为音乐库。", kind: .info)
             return
@@ -1345,7 +1467,7 @@ public final class CloudTuneViewModel {
 
     // MARK: - Playback, Queue & Write-Through Backfill
 
-    public func playNext(_ track: TrackSummary) {
+    package func playNext(_ track: TrackSummary) {
         cancelPrefetchTask()
         prefetchedTrackId = nil
         upNextQueue = PlaybackQueueResolver.insertPlayNext(upNext: upNextQueue, track: track)
@@ -1353,20 +1475,20 @@ public final class CloudTuneViewModel {
         triggerPrefetchIfNeeded()
     }
 
-    public func appendToQueue(_ track: TrackSummary) {
+    package func appendToQueue(_ track: TrackSummary) {
         upNextQueue = PlaybackQueueResolver.appendToQueue(upNext: upNextQueue, track: track)
         setStatus("已加入待播队列：《\(track.name)》", kind: .info)
     }
 
-    public func removeFromQueue(trackId: String) {
+    package func removeFromQueue(trackId: String) {
         upNextQueue = PlaybackQueueResolver.removeFromQueue(upNext: upNextQueue, trackId: trackId)
     }
 
-    public func clearUpNextQueue() {
+    package func clearUpNextQueue() {
         upNextQueue = []
     }
 
-    public func playFromUpcomingQueue(_ track: TrackSummary) async {
+    package func playFromUpcomingQueue(_ track: TrackSummary) async {
         if upNextQueue.contains(where: { $0.id == track.id }) {
             upNextQueue = PlaybackQueueResolver.removeFromQueue(upNext: upNextQueue, trackId: track.id)
             prefetchedTrackId = nil
@@ -1374,14 +1496,14 @@ public final class CloudTuneViewModel {
         await playTrack(track)
     }
 
-    public func toggleShuffle() {
+    package func toggleShuffle() {
         cancelPrefetchTask()
         prefetchedTrackId = nil
         shuffle.toggle()
         triggerPrefetchIfNeeded()
     }
 
-    public func cycleLoopMode() {
+    package func cycleLoopMode() {
         loopMode = switch loopMode {
         case .off: .all
         case .all: .one
@@ -1394,11 +1516,11 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func setVolume(_ nextVolume: Double) {
+    package func setVolume(_ nextVolume: Double) {
         volume = nextVolume
     }
 
-    public func playTrack(
+    package func playTrack(
         _ track: TrackSummary,
         modeOverride: PlaybackMode? = nil,
         forceStreamProxy: Bool = false,
@@ -1419,7 +1541,9 @@ public final class CloudTuneViewModel {
         currentTrackId = track.id
         loadingTrackId = track.id
         prefetchedTrackId = nil
-        if shuffle && !shuffleOrderIds.contains(track.id) && tracks.contains(where: { $0.id == track.id }) {
+        activeSeekToken &+= 1
+        isSeekingPlayback = false
+        if shuffle && orderedIndexByIdCache[track.id] == nil && tracksById[track.id] != nil {
             shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks: tracks, anchorTrackId: track.id)
         }
         if !isRecoveryRetry {
@@ -1599,8 +1723,10 @@ public final class CloudTuneViewModel {
         currentPlaybackIsLoopback = isLoopback
         activeTrack = track
         currentTrackId = track.id
-        duration = 0
-        currentTime = resumeTime
+        activeSeekToken &+= 1
+        isSeekingPlayback = false
+        timeline.duration = 0
+        timeline.currentTime = resumeTime
 
         let item = AVPlayerItem(url: url)
         itemStatusObservation?.invalidate()
@@ -1714,7 +1840,7 @@ public final class CloudTuneViewModel {
         )
     }
 
-    public func handleWriteThroughCompleted(accountHash: String, trackId: String, localFileURL: URL) async {
+    package func handleWriteThroughCompleted(accountHash: String, trackId: String, localFileURL: URL) async {
         guard isAuthenticated,
               let expectedAccount = activeAccountKey,
               Cloud189Protocol.accountBucketHash(for: expectedAccount) == accountHash else {
@@ -1769,7 +1895,7 @@ public final class CloudTuneViewModel {
         )
     }
 
-    public func handlePlaybackPreparationFailure(
+    package func handlePlaybackPreparationFailure(
         track: TrackSummary,
         error: Error,
         wasLoopback: Bool,
@@ -1887,7 +2013,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func togglePlayback() async {
+    package func togglePlayback() async {
         guard let currentTrack else {
             if let firstUpNext = upNextQueue.first {
                 upNextQueue = Array(upNextQueue.dropFirst())
@@ -1921,12 +2047,12 @@ public final class CloudTuneViewModel {
         )
     }
 
-    public func playIfPaused() async {
+    package func playIfPaused() async {
         guard !isPlaying else { return }
         await togglePlayback()
     }
 
-    public func pauseIfPlaying() {
+    package func pauseIfPlaying() {
         guard isPlaying else { return }
         _player?.pause()
         isPlaying = false
@@ -1939,7 +2065,7 @@ public final class CloudTuneViewModel {
         )
     }
 
-    public func playAdjacent(direction: Int, autoAdvanceAtEnd: Bool = false) async {
+    package func playAdjacent(direction: Int, autoAdvanceAtEnd: Bool = false) async {
         let step: QueueStepResult
         if direction >= 0 {
             step = PlaybackQueueResolver.resolveNext(
@@ -1949,7 +2075,9 @@ public final class CloudTuneViewModel {
                 shuffle: shuffle,
                 shuffleOrderIds: shuffleOrderIds,
                 loopMode: loopMode,
-                autoAdvanceAtEnd: autoAdvanceAtEnd
+                autoAdvanceAtEnd: autoAdvanceAtEnd,
+                orderedTracks: orderedLibraryTracksCache,
+                orderedIndexById: orderedIndexByIdCache
             )
         } else {
             step = PlaybackQueueResolver.resolvePrevious(
@@ -1958,7 +2086,9 @@ public final class CloudTuneViewModel {
                 upNextQueue: upNextQueue,
                 shuffle: shuffle,
                 shuffleOrderIds: shuffleOrderIds,
-                loopMode: loopMode
+                loopMode: loopMode,
+                orderedTracks: orderedLibraryTracksCache,
+                orderedIndexById: orderedIndexByIdCache
             )
         }
         upNextQueue = step.remainingUpNext
@@ -1976,11 +2106,19 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func seekPlayback(to seconds: Double) async {
+    package func seekPlayback(to seconds: Double) async {
         let expectedGen = playbackGeneration
         let expectedAccount = activeAccountKey
         let clamped = max(0, min(seconds, duration > 0 ? duration : seconds))
-        currentTime = clamped
+        activeSeekToken &+= 1
+        let mySeekToken = activeSeekToken
+        isSeekingPlayback = true
+        defer {
+            if activeSeekToken == mySeekToken {
+                isSeekingPlayback = false
+            }
+        }
+        timeline.currentTime = clamped
         await player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
         guard expectedGen == playbackGeneration,
               isAuthenticated,
@@ -1999,7 +2137,7 @@ public final class CloudTuneViewModel {
 
     // MARK: - Video (Loopback Proxy + Safe External Handoff) & Transfers
 
-    public func openVideoInApp(_ video: TrackSummary) async {
+    package func openVideoInApp(_ video: TrackSummary) async {
         guard isAuthenticated, let expectedAccount = activeAccountKey else { return }
         retrySleepTask?.cancel()
         retrySleepTask = nil
@@ -2097,7 +2235,7 @@ public final class CloudTuneViewModel {
 
     /// Returns a local cached `file://` URL immediately if available; otherwise prepares a loopback stream URL
     /// (when `prepareLoopbackStream` is `true`) and sets `pendingExternalVideoChoice` so callers NEVER hand raw `https://` URLs to a web browser.
-    public func requestExternalVideoPlayback(
+    package func requestExternalVideoPlayback(
         _ video: TrackSummary,
         prepareLoopbackStream: Bool = true
     ) async -> URL? {
@@ -2186,7 +2324,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func downloadVideoAndPrepareLocalFile(_ video: TrackSummary) async -> URL? {
+    package func downloadVideoAndPrepareLocalFile(_ video: TrackSummary) async -> URL? {
         guard isAuthenticated, let accountId = activeAccountKey, let capturedStore = cacheStore else {
             setStatus("请先登录后再缓存视频。", kind: .error)
             return nil
@@ -2241,7 +2379,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func enqueueTrackDownload(_ track: TrackSummary, explicitDirectoryURL: URL? = nil) async {
+    package func enqueueTrackDownload(_ track: TrackSummary, explicitDirectoryURL: URL? = nil) async {
         guard let accountId = activeAccountKey else { return }
         do {
             let taskId = try await transferEngine.enqueueExportDownload(
@@ -2261,7 +2399,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func enqueueFolderDownload(from pane: BrowserPaneState, explicitDirectoryURL: URL? = nil) async {
+    package func enqueueFolderDownload(from pane: BrowserPaneState, explicitDirectoryURL: URL? = nil) async {
         guard isAuthenticated, let payload = pane.payload, let accountId = activeAccountKey else { return }
         let expectedAuthGen = authGeneration
         let nonRootCrumbs = pane.breadcrumbs.filter { $0.id != nil && $0.id != Cloud189Constants.rootFolderId }
@@ -2323,23 +2461,23 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func pauseTransfer(_ id: String) async {
+    package func pauseTransfer(_ id: String) async {
         await transferEngine.pauseTransfer(id: id, accountStore: accountStore)
         transferSnapshot = await transferEngine.snapshot()
     }
 
-    public func resumeTransfer(_ id: String) async {
+    package func resumeTransfer(_ id: String) async {
         await transferEngine.resumeTransfer(id: id, accountStore: accountStore)
         transferSnapshot = await transferEngine.snapshot()
     }
 
-    public func deleteTransfer(_ id: String) async {
+    package func deleteTransfer(_ id: String) async {
         await transferEngine.deleteTransfer(id: id, accountStore: accountStore)
         transferSnapshot = await transferEngine.snapshot()
     }
 
     @discardableResult
-    public func saveExportDirectoryBookmark(_ url: URL) async -> Bool {
+    package func saveExportDirectoryBookmark(_ url: URL) async -> Bool {
         guard isAuthenticated, let accountId = activeAccountKey else { return false }
         let baseSnapshot = committedSettings
         do {
@@ -2427,11 +2565,17 @@ public final class CloudTuneViewModel {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 let secs = cmTime.seconds
-                if secs.isFinite && secs >= 0 {
-                    self.currentTime = secs
+                if !self.isSeekingPlayback,
+                   secs.isFinite,
+                   secs >= 0,
+                   abs(secs - self.timeline.currentTime) >= 0.05 {
+                    self.timeline.currentTime = secs
                 }
-                if let itemDur = self._player?.currentItem?.duration.seconds, itemDur.isFinite, itemDur > 0 {
-                    self.duration = itemDur
+                if let itemDur = self._player?.currentItem?.duration.seconds,
+                   itemDur.isFinite,
+                   itemDur > 0,
+                   abs(itemDur - self.timeline.duration) >= 0.05 {
+                    self.timeline.duration = itemDur
                 }
                 self.triggerPrefetchIfNeeded()
             }
@@ -2578,7 +2722,7 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func teardownPlayerAndRemoteCommands() {
+    package func teardownPlayerAndRemoteCommands() {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         timeControlObservation?.invalidate()
@@ -2600,7 +2744,7 @@ public final class CloudTuneViewModel {
         hasActivePlayerObservers = false
     }
 
-    public func triggerPrefetchIfNeeded() {
+    package func triggerPrefetchIfNeeded() {
         guard isAuthenticated,
               loopMode != .one,
               let capturedStore = cacheStore,
@@ -2619,7 +2763,9 @@ public final class CloudTuneViewModel {
             upNextQueue: upNextQueue,
             shuffle: shuffle,
             shuffleOrderIds: shuffleOrderIds,
-            loopMode: loopMode
+            loopMode: loopMode,
+            orderedTracks: orderedLibraryTracksCache,
+            orderedIndexById: orderedIndexByIdCache
         ),
         next.id != prefetchedTrackId,
         next.id != prefetchingTrackId else {

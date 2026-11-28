@@ -6,8 +6,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 extension Notification.Name {
-    public static let cloudTuneOpenPreferences = Notification.Name("com.gosu.cloudtune.openPreferences")
-    public static let cloudTuneFocusSearch = Notification.Name("com.gosu.cloudtune.focusSearch")
+    package static let cloudTuneOpenPreferences = Notification.Name("com.gosu.cloudtune.openPreferences")
+    package static let cloudTuneFocusSearch = Notification.Name("com.gosu.cloudtune.focusSearch")
 }
 
 @MainActor
@@ -29,9 +29,9 @@ private func presentMacPanelAsync(
     }
 }
 
-public enum MacShortcutFocusGuard {
+package enum MacShortcutFocusGuard {
     @MainActor
-    public static func shouldAllowSingleKeyPlaybackShortcut(in window: NSWindow?) -> Bool {
+    package static func shouldAllowSingleKeyPlaybackShortcut(in window: NSWindow?) -> Bool {
         guard let responder = window?.firstResponder else {
             return true
         }
@@ -55,18 +55,17 @@ private extension TrackSummary {
     }
 }
 
-public struct MacWorkspaceView: View {
-    @Bindable public var viewModel: CloudTuneViewModel
+package struct MacWorkspaceView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
     @Environment(\.colorScheme) private var colorScheme
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var selectedTrackIDs: Set<TrackSummary.ID> = []
     @State private var sortOrder: [KeyPathComparator<TrackSummary>] = [
         .init(\.name, order: .forward)
     ]
-    @State private var scrubPreviewSeconds: Double?
     @FocusState private var isSearchFocused: Bool
 
-    public init(viewModel: CloudTuneViewModel) {
+    package init(viewModel: CloudTuneViewModel) {
         self.viewModel = viewModel
     }
 
@@ -86,7 +85,7 @@ public struct MacWorkspaceView: View {
         [.music, .video, .cloud, .transfers]
     }
 
-    public var body: some View {
+    package var body: some View {
         let palette = CloudTunePalette(isDark: isDark)
         ZStack {
             palette.canvasBackground
@@ -330,7 +329,7 @@ public struct MacWorkspaceView: View {
 
             Divider().overlay(palette.separator)
 
-            macNowPlayingBar(palette: palette)
+            MacNowPlayingBarView(viewModel: viewModel, palette: palette)
         }
     }
 
@@ -399,7 +398,7 @@ public struct MacWorkspaceView: View {
                     )
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 8))
             }
 
             Spacer(minLength: 12)
@@ -430,7 +429,7 @@ public struct MacWorkspaceView: View {
                     )
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 8))
 
                 MacPopUpMenuButton(
                     systemImage: "ellipsis.circle",
@@ -498,21 +497,25 @@ public struct MacWorkspaceView: View {
                         .font(.system(size: 12.5))
                         .foregroundStyle(palette.inkPrimary)
                         .frame(width: 180)
-                    if !viewModel.searchQuery.isEmpty {
-                        Button {
-                            viewModel.searchQuery = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 12))
-                                .foregroundStyle(palette.inkTertiary)
-                                .frame(width: 20, height: 20)
-                                .contentShape(Rectangle())
+                    ZStack {
+                        if !viewModel.searchQuery.isEmpty {
+                            Button {
+                                viewModel.searchQuery = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(palette.inkTertiary)
+                                    .frame(width: 20, height: 20)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
+                            .accessibilityLabel("清除搜索过滤")
                         }
-                        .buttonStyle(.plain)
                     }
+                    .frame(width: 20, height: 20)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .frame(height: 32)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(palette.inputSurface)
@@ -641,7 +644,7 @@ public struct MacWorkspaceView: View {
                                 .frame(width: 26, height: 24)
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
 
                         MacPopUpMenuButton(
                             systemImage: "ellipsis",
@@ -760,6 +763,7 @@ public struct MacWorkspaceView: View {
                                             .foregroundStyle(palette.inkPrimary)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
+                                            .layoutPriority(1)
                                         if !video.fileExtensionUpper.isEmpty {
                                             Text(video.fileExtensionUpper)
                                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -767,24 +771,30 @@ public struct MacWorkspaceView: View {
                                                 .padding(.horizontal, 6)
                                                 .padding(.vertical, 2)
                                                 .background(Capsule().fill(palette.surfaceSecondary))
+                                                .fixedSize(horizontal: true, vertical: false)
                                         }
                                     }
                                     Text("\(video.folderPath) · \(CloudTuneFormatters.formatBytes(video.sizeBytes))")
                                         .font(.system(size: 12).monospacedDigit())
                                         .foregroundStyle(palette.inkTertiary)
                                         .lineLimit(1)
+                                        .truncationMode(.middle)
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+                                .layoutPriority(1)
 
-                                SecondaryActionButton("应用内播放", systemImage: "play.rectangle.fill", palette: palette) {
-                                    Task { await viewModel.openVideoInApp(video) }
+                                HStack(spacing: 8) {
+                                    SecondaryActionButton("应用内播放", systemImage: "play.rectangle.fill", palette: palette) {
+                                        Task { await viewModel.openVideoInApp(video) }
+                                    }
+                                    SecondaryActionButton("外部播放器", systemImage: "arrow.up.right.square", palette: palette) {
+                                        Task { await triggerExternalVideoFlow(video) }
+                                    }
+                                    SecondaryActionButton("导出", systemImage: "arrow.down.circle", palette: palette) {
+                                        Task { await enqueueDownloadEnsuringDirectory(video) }
+                                    }
                                 }
-                                SecondaryActionButton("外部播放器", systemImage: "arrow.up.right.square", palette: palette) {
-                                    Task { await triggerExternalVideoFlow(video) }
-                                }
-                                SecondaryActionButton("导出", systemImage: "arrow.down.circle", palette: palette) {
-                                    Task { await enqueueDownloadEnsuringDirectory(video) }
-                                }
+                                .fixedSize(horizontal: true, vertical: false)
                             }
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
@@ -986,7 +996,7 @@ public struct MacWorkspaceView: View {
                                 )
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 12))
                         .disabled(isLast)
                     }
                 }
@@ -1050,7 +1060,7 @@ public struct MacWorkspaceView: View {
                         .frame(width: 26, height: 26)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
             }
 
             VStack(spacing: 10) {
@@ -1100,14 +1110,14 @@ public struct MacWorkspaceView: View {
                             .padding(.vertical, 3)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
                 }
             }
 
             ScrollView {
                 VStack(spacing: 6) {
                     ForEach(viewModel.upcomingTracks) { item in
-                        let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
+                        let isManual = viewModel.isManualUpNext(trackId: item.id)
                         HStack(spacing: 8) {
                             Button {
                                 Task { await viewModel.playFromUpcomingQueue(item) }
@@ -1135,7 +1145,7 @@ public struct MacWorkspaceView: View {
                                 }
                                 .contentShape(Rectangle())
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6, pressScale: 0.992))
 
                             if isManual {
                                 Button {
@@ -1147,7 +1157,7 @@ public struct MacWorkspaceView: View {
                                         .frame(width: 24, height: 24)
                                         .contentShape(Rectangle())
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
                             }
                         }
                         .padding(.horizontal, 8)
@@ -1163,182 +1173,6 @@ public struct MacWorkspaceView: View {
         .padding(14)
         .frame(maxHeight: .infinity)
         .background(palette.surfacePrimary)
-    }
-
-    @ViewBuilder
-    private func macNowPlayingBar(palette: CloudTunePalette) -> some View {
-        let track = viewModel.currentTrack
-        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "尚未选择曲目"
-        let subtitle = [
-            viewModel.nowPlayingMetadata?.artist,
-            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
-        ]
-        .compactMap { $0?.isEmpty == false ? $0 : nil }
-        .joined(separator: " · ")
-
-        HStack(spacing: 18) {
-            // Left: Artwork + Track metadata
-            Button {
-                viewModel.isShowingNowPlaying.toggle()
-            } label: {
-                HStack(spacing: 11) {
-                    ArtworkView(
-                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
-                        seedText: title,
-                        size: 44,
-                        cornerRadius: 9,
-                        palette: palette
-                    )
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(title)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(palette.inkPrimary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            if let track {
-                                LosslessBadge(track: track, palette: palette)
-                            }
-                        }
-                        Text(subtitle.isEmpty ? "点击曲目或按播放键开始收听" : subtitle)
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(palette.inkTertiary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-                .frame(width: 310, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            // Center: Transport controls + Scrub slider
-            VStack(spacing: 4) {
-                HStack(spacing: 14) {
-                    barIconButton(
-                        systemImage: "shuffle",
-                        isActive: viewModel.shuffle,
-                        palette: palette
-                    ) {
-                        viewModel.toggleShuffle()
-                    }
-                    barIconButton(
-                        systemImage: "backward.fill",
-                        isDisabled: !viewModel.canSkipPrevious,
-                        palette: palette
-                    ) {
-                        Task { await viewModel.playAdjacent(direction: -1) }
-                    }
-                    Button {
-                        Task { await viewModel.togglePlayback() }
-                    } label: {
-                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(palette.primaryForeground)
-                            .frame(width: 34, height: 34)
-                            .background(Circle().fill(palette.accent))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    barIconButton(
-                        systemImage: "forward.fill",
-                        isDisabled: !viewModel.canSkipNext,
-                        palette: palette
-                    ) {
-                        Task { await viewModel.playAdjacent(direction: 1) }
-                    }
-                    barIconButton(
-                        systemImage: viewModel.loopMode == .one ? "repeat.1" : "repeat",
-                        isActive: viewModel.loopMode != .off,
-                        palette: palette
-                    ) {
-                        viewModel.cycleLoopMode()
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Text(CloudTuneFormatters.formatClock(scrubPreviewSeconds ?? viewModel.currentTime))
-                        .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .foregroundStyle(palette.inkTertiary)
-                        .frame(width: 40, alignment: .trailing)
-
-                    InteractiveScrubSlider(
-                        value: viewModel.currentTime,
-                        total: viewModel.duration,
-                        palette: palette,
-                        onPreviewChange: { preview in
-                            scrubPreviewSeconds = preview
-                        },
-                        onSeek: { targetSeconds in
-                            Task { await viewModel.seekPlayback(to: targetSeconds) }
-                        }
-                    )
-
-                    Text(CloudTuneFormatters.formatClock(viewModel.duration))
-                        .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .foregroundStyle(palette.inkTertiary)
-                        .frame(width: 40, alignment: .leading)
-                }
-            }
-            .frame(maxWidth: .infinity)
-
-            // Right: Volume + AirPlay + Queue toggle
-            HStack(spacing: 10) {
-                Image(systemName: viewModel.volume <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 12))
-                    .foregroundStyle(palette.inkSecondary)
-                Slider(
-                    value: Binding(
-                        get: { viewModel.volume },
-                        set: { viewModel.setVolume($0) }
-                    ),
-                    in: 0.0...1.0
-                )
-                .tint(palette.accent)
-                .frame(width: 84)
-
-                AirPlayRoutePicker()
-                    .frame(width: 26, height: 26)
-
-                barIconButton(
-                    systemImage: "list.bullet",
-                    isActive: viewModel.isShowingNowPlaying,
-                    palette: palette
-                ) {
-                    viewModel.isShowingNowPlaying.toggle()
-                }
-            }
-            .frame(width: 210, alignment: .trailing)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .background(palette.surfacePrimary.opacity(0.88))
-    }
-
-    @ViewBuilder
-    private func barIconButton(
-        systemImage: String,
-        isActive: Bool = false,
-        isDisabled: Bool = false,
-        palette: CloudTunePalette,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 13, weight: isActive ? .bold : .medium))
-                .foregroundStyle(isActive ? palette.accent : palette.inkSecondary)
-                .frame(width: 28, height: 28)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isActive ? palette.accentSoft : Color.clear)
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .opacity(isDisabled ? 0.4 : 1.0)
     }
 
     private func triggerExternalVideoFlow(_ video: TrackSummary) async {
@@ -1377,18 +1211,178 @@ public struct MacWorkspaceView: View {
                 try pngData.write(to: url, options: .atomic)
                 viewModel.setStatus("二维码已保存至 \(url.lastPathComponent)", kind: .info)
             } catch {
-                viewModel.setStatus("保存二维码失败：\(error.localizedDescription)", kind: .error)
+        viewModel.setStatus("保存二维码失败：\(error.localizedDescription)", kind: .error)
             }
         }
     }
 }
 
-public struct MacPreferencesView: View {
-    @Bindable public var viewModel: CloudTuneViewModel
-    public let onClose: (() -> Void)?
+package struct MacNowPlayingBarView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let palette: CloudTunePalette
+
+    package init(viewModel: CloudTuneViewModel, palette: CloudTunePalette) {
+        self.viewModel = viewModel
+        self.palette = palette
+    }
+
+    package var body: some View {
+        let track = viewModel.currentTrack
+        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "尚未选择曲目"
+        let subtitle = [
+            viewModel.nowPlayingMetadata?.artist,
+            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
+        ]
+        .compactMap { $0?.isEmpty == false ? $0 : nil }
+        .joined(separator: " · ")
+
+        HStack(spacing: 18) {
+            Button {
+                viewModel.isShowingNowPlaying.toggle()
+            } label: {
+                HStack(spacing: 11) {
+                    ArtworkView(
+                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
+                        seedText: title,
+                        size: 44,
+                        cornerRadius: 9,
+                        palette: palette
+                    )
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(palette.inkPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let track {
+                                LosslessBadge(track: track, palette: palette)
+                            }
+                        }
+                        Text(subtitle.isEmpty ? "点击曲目或按播放键开始收听" : subtitle)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(palette.inkTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .frame(width: 310, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 10, pressScale: 0.992))
+
+            VStack(spacing: 4) {
+                HStack(spacing: 14) {
+                    barIconButton(
+                        systemImage: "shuffle",
+                        isActive: viewModel.shuffle
+                    ) {
+                        viewModel.toggleShuffle()
+                    }
+                    barIconButton(
+                        systemImage: "backward.fill",
+                        isDisabled: !viewModel.canSkipPrevious
+                    ) {
+                        Task { await viewModel.playAdjacent(direction: -1) }
+                    }
+                    Button {
+                        Task { await viewModel.togglePlayback() }
+                    } label: {
+                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(palette.primaryForeground)
+                            .frame(width: 34, height: 34)
+                            .background(Circle().fill(palette.accent))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: Color.white.opacity(0.08), cornerRadius: 17))
+
+                    barIconButton(
+                        systemImage: "forward.fill",
+                        isDisabled: !viewModel.canSkipNext
+                    ) {
+                        Task { await viewModel.playAdjacent(direction: 1) }
+                    }
+                    barIconButton(
+                        systemImage: viewModel.loopMode == .one ? "repeat.1" : "repeat",
+                        isActive: viewModel.loopMode != .off
+                    ) {
+                        viewModel.cycleLoopMode()
+                    }
+                }
+
+                NowPlayingScrubberView(
+                    timeline: viewModel.timeline,
+                    palette: palette,
+                    layout: .macHorizontal
+                ) { targetSeconds in
+                    await viewModel.seekPlayback(to: targetSeconds)
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            HStack(spacing: 10) {
+                Image(systemName: viewModel.volume <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.inkSecondary)
+                Slider(
+                    value: Binding(
+                        get: { viewModel.volume },
+                        set: { viewModel.setVolume($0) }
+                    ),
+                    in: 0.0...1.0
+                )
+                .tint(palette.accent)
+                .frame(width: 84)
+
+                AirPlayRoutePicker()
+                    .frame(width: 26, height: 26)
+
+                barIconButton(
+                    systemImage: "list.bullet",
+                    isActive: viewModel.isShowingNowPlaying
+                ) {
+                    viewModel.isShowingNowPlaying.toggle()
+                }
+            }
+            .frame(width: 210, alignment: .trailing)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .background(palette.surfacePrimary.opacity(0.88))
+    }
+
+    @ViewBuilder
+    private func barIconButton(
+        systemImage: String,
+        isActive: Bool = false,
+        isDisabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: isActive ? .bold : .medium))
+                .foregroundStyle(isActive ? palette.accent : palette.inkSecondary)
+                .frame(width: 28, height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(isActive ? palette.accentSoft : Color.clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 6))
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.4 : 1.0)
+    }
+}
+
+package struct MacPreferencesView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let onClose: (() -> Void)?
     @Environment(\.colorScheme) private var colorScheme
 
-    public init(viewModel: CloudTuneViewModel, onClose: (() -> Void)? = nil) {
+    package init(viewModel: CloudTuneViewModel, onClose: (() -> Void)? = nil) {
         self.viewModel = viewModel
         self.onClose = onClose
     }
@@ -1401,7 +1395,7 @@ public struct MacPreferencesView: View {
         }
     }
 
-    public var body: some View {
+    package var body: some View {
         let palette = CloudTunePalette(isDark: isDark)
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 8) {

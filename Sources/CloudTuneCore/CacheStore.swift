@@ -1,23 +1,23 @@
 import Foundation
 
-public struct CacheEntry: Codable, Equatable, Sendable {
-    public var fileName: String
-    public var sizeBytes: UInt64
-    public var lastAccessedMs: Int64
+package struct CacheEntry: Codable, Equatable, Sendable {
+    package var fileName: String
+    package var sizeBytes: UInt64
+    package var lastAccessedMs: Int64
 
-    public init(fileName: String, sizeBytes: UInt64, lastAccessedMs: Int64) {
+    package init(fileName: String, sizeBytes: UInt64, lastAccessedMs: Int64) {
         self.fileName = fileName
         self.sizeBytes = sizeBytes
         self.lastAccessedMs = lastAccessedMs
     }
 }
 
-public actor CacheStore {
+package actor CacheStore {
     private static let flushDirtyThreshold = 16
     private static let flushInterval: Duration = .seconds(5)
 
-    public let cacheDirectory: URL
-    public let indexURL: URL
+    package let cacheDirectory: URL
+    package let indexURL: URL
     private var entries: [String: CacheEntry] = [:]
     private var totalBytes: UInt64 = 0
     private var dirtyAccessCount: Int = 0
@@ -26,7 +26,7 @@ public actor CacheStore {
     private var activeWriters: Set<String> = []
     private let fm = FileManager.default
 
-    public init(cacheDirectory: URL, indexURL: URL? = nil) throws {
+    package init(cacheDirectory: URL, indexURL: URL? = nil) throws {
         self.cacheDirectory = cacheDirectory
         let resolvedIndexURL = indexURL ?? cacheDirectory.appendingPathComponent("index.json")
         self.indexURL = resolvedIndexURL
@@ -79,26 +79,26 @@ public actor CacheStore {
         }
     }
 
-    public func beginWriteThroughIfIdle(trackId: String) -> Bool {
+    package func beginWriteThroughIfIdle(trackId: String) -> Bool {
         guard !activeWriters.contains(trackId) else { return false }
         activeWriters.insert(trackId)
         return true
     }
 
-    public func finishWriteThrough(trackId: String) {
+    package func finishWriteThrough(trackId: String) {
         activeWriters.remove(trackId)
     }
 
-    public func setProtectedTrackIDs(_ ids: Set<String>) {
+    package func setProtectedTrackIDs(_ ids: Set<String>) {
         protectedTrackIDs = ids
     }
 
-    public func cacheFileURL(trackId: String, originalFileName: String) -> URL {
+    package func cacheFileURL(trackId: String, originalFileName: String) -> URL {
         let safe = Cloud189Protocol.sanitizeFileName(originalFileName)
         return cacheDirectory.appendingPathComponent("\(trackId)-\(safe)")
     }
 
-    public func existingCachedFile(trackId: String) -> URL? {
+    package func existingCachedFile(trackId: String) -> URL? {
         guard var entry = entries[trackId] else { return nil }
         let path = cacheDirectory.appendingPathComponent(entry.fileName)
         guard let attrs = try? fm.attributesOfItem(atPath: path.path),
@@ -127,7 +127,7 @@ public actor CacheStore {
     }
 
     @discardableResult
-    public func recordCompletedFile(
+    package func recordCompletedFile(
         trackId: String,
         fileURL: URL,
         sizeBytes: UInt64,
@@ -157,23 +157,23 @@ public actor CacheStore {
         return usage
     }
 
-    public func usageBytes() -> UInt64 {
+    package func usageBytes() -> UInt64 {
         totalBytes
     }
 
     @discardableResult
-    public func evictIfNeeded(limitBytes: UInt64, extraProtected: Set<String> = []) throws -> UInt64 {
+    package func evictIfNeeded(limitBytes: UInt64, extraProtected: Set<String> = []) throws -> UInt64 {
         let usage = evictIfNeededInternal(limitBytes: limitBytes, extraProtected: extraProtected)
         try flushIndexNow()
         return usage
     }
 
     @discardableResult
-    public func pruneToLimit(limitBytes: UInt64, extraProtected: Set<String> = []) throws -> UInt64 {
+    package func pruneToLimit(limitBytes: UInt64, extraProtected: Set<String> = []) throws -> UInt64 {
         try evictIfNeeded(limitBytes: limitBytes, extraProtected: extraProtected)
     }
 
-    public func clearAll() throws {
+    package func clearAll() throws {
         var retained: [String: CacheEntry] = [:]
         var retainedBytes: UInt64 = 0
         for (trackId, entry) in entries {

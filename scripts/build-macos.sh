@@ -22,11 +22,11 @@ SWIFT_BUILD_FLAGS=(
   -Xcc "-ffile-prefix-map=/var/folders=/build/var-folders"
 )
 if [[ "${BUILD_CONFIG}" == "release" ]]; then
-  SWIFT_BUILD_FLAGS+=(-Xswiftc -O -Xswiftc -whole-module-optimization)
+  SWIFT_BUILD_FLAGS+=(-Xswiftc -O -Xswiftc -whole-module-optimization -Xlinker -dead_strip)
 fi
 
 swift build --product "${APP_NAME}" "${SWIFT_BUILD_FLAGS[@]}"
-BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
+BIN_DIR="$(swift build --product "${APP_NAME}" "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 EXECUTABLE="${BIN_DIR}/${APP_NAME}"
 
 python3 - "${APP_BUNDLE}" <<'PY'

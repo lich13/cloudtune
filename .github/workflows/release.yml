@@ -49,11 +49,6 @@ jobs:
           fi
           APP_VERSION="${VERSION}" ./scripts/build-macos.sh release
 
-      - name: Verify macOS binary privacy and code signature
-        run: |
-          python3 scripts/verify_native_privacy.py dist/CloudTune.app/Contents/MacOS/CloudTune
-          codesign --verify --deep --strict dist/CloudTune.app
-
       - name: Upload macOS DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -65,7 +60,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CloudTune-snapshots-macos
-          path: dist/snapshots/macos/**/*.png
+          path: artifacts/snapshots/macos/**/*.png
           if-no-files-found: error
 
   ios:

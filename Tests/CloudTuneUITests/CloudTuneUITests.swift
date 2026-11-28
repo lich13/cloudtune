@@ -1,6 +1,7 @@
 import CloudTuneCore
 import CloudTuneUI
 import Foundation
+import Observation
 import Testing
 #if os(macOS)
 import AppKit
@@ -1196,21 +1197,227 @@ struct CloudTuneUITests {
         #expect(try Data(contentsOf: expectedCacheURL) == mediaPayload)
     }
 
+    @Test("Slice 3: PlaybackTimeline observation isolation, visibleTracks/tracksById memoization, rapid playTrack switch + logout race, and MacPopUpMenuButton geometry")
+    @MainActor
+    func verifyPlaybackTimelineIsolationMemoizationAndRapidPlayLogoutRace() async throws {
+        let fixtureURL = repoRootURL().appendingPathComponent("contracts/representative-state.json")
+        let fixture = try RepresentativeFixture.load(from: fixtureURL)
+        let vm = CloudTuneViewModel.fixture(scene: .music, fixture: fixture)
+
+        // 1) PlaybackTimeline reactive isolation: mutating timeline.currentTime / duration MUST NOT invalidate workspace/table observation
+        final class FlagBox: @unchecked Sendable {
+            var fired = false
+        }
+        let workspaceFlag = FlagBox()
+        let timelineFlag = FlagBox()
+
+        withObservationTracking {
+            _ = vm.isAuthenticated
+            _ = vm.activeModule
+            _ = vm.visibleTracks
+            _ = vm.currentTrackId
+            _ = vm.currentTrack
+            _ = vm.isPlaying
+            _ = vm.shuffle
+            _ = vm.loopMode
+            _ = vm.upcomingTracks
+            _ = vm.canSkipNext
+            _ = vm.canSkipPrevious
+        } onChange: {
+            workspaceFlag.fired = true
+        }
+
+        withObservationTracking {
+            _ = vm.timeline.currentTime
+            _ = vm.timeline.duration
+        } onChange: {
+            timelineFlag.fired = true
+        }
+
+        vm.timeline.currentTime = 142.75
+        vm.timeline.duration = 416.0
+        vm.currentTime = 185.25
+        #expect(timelineFlag.fired == true)
+        #expect(workspaceFlag.fired == false)
+
+        // 2) O(1) tracksById / trackIndexById & memoized visibleTracks
+        #expect(vm.tracksById.count == fixture.libraryTracks.count)
+        for (idx, item) in fixture.libraryTracks.enumerated() {
+            #expect(vm.tracksById[item.id] == item)
+            #expect(vm.trackIndexById[item.id] == idx)
+        }
+        vm.searchQuery = "   "
+        #expect(vm.visibleTracks.count == fixture.libraryTracks.count)
+        let visibleQueryFlag = FlagBox()
+        withObservationTracking {
+            _ = vm.visibleTracks
+        } onChange: {
+            visibleQueryFlag.fired = true
+        }
+        // Whitespace-equivalent query change does NOT re-trigger visibleTracks observers
+        vm.searchQuery = " "
+        #expect(visibleQueryFlag.fired == false)
+
+        vm.searchQuery = "waltz"
+        #expect(visibleQueryFlag.fired == true)
+        #expect(vm.visibleTracks.map(\.id) == ["track-waltz-02"])
+        vm.searchQuery = ""
+        #expect(vm.visibleTracks.count == fixture.libraryTracks.count)
+
+        #if os(macOS)
+        // 3) MacPopUpMenuButton PopUpTriggerNSView coordinate orientation, accessibilityPerformPress, and hover reset
+        let triggerView = MacPopUpMenuButton.PopUpTriggerNSView(frame: NSRect(x: 0, y: 0, width: 28, height: 28))
+        triggerView.configure(systemImage: "ellipsis.circle", accessibilityTitle: "账户操作")
+        #expect(triggerView.isFlipped == true)
+        #expect(triggerView.menuPopUpAnchorPoint == NSPoint(x: 0, y: 32))
+        var pressedViaAccessibility = false
+        triggerView.onTrigger = { view in
+            pressedViaAccessibility = true
+            view.resetInteractionState()
+        }
+        triggerView.mouseEntered(with: NSEvent())
+        #expect(triggerView.isHovered == true)
+        #expect(triggerView.accessibilityPerformPress() == true)
+        #expect(pressedViaAccessibility == true)
+        #expect(triggerView.isHovered == false)
+        #endif
+
+        // 4) Rapid playTrack switching + concurrent logout race + live ViewModel off-MainActor remote command dispatch
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-s3-race-\(UUID().uuidString)")
+        let suiteName = "com.gosu.cloudtune.s3.race.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        actor RapidSwitchTransport: CloudHTTPTransport {
+            private var holdUrls = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+            private(set) var enteredCount = 0
+
+            func setHold(_ hold: Bool) {
+                holdUrls = hold
+                if !hold {
+                    let current = waiters
+                    waiters.removeAll()
+                    for w in current { w.resume() }
+                }
+            }
+
+            func waitUntilEntered(atLeast target: Int) async {
+                let deadline = ContinuousClock.now + .seconds(3)
+                while enteredCount < target && ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(5))
+                }
+            }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                if url.path.contains("getSessionForPC.action") {
+                    let b = #"{"res_code":0,"loginName":"rapid@example.invalid","accessToken":"at","refreshToken":"rt","sessionKey":"sk","sessionSecret":"ss"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                if url.path.contains("getFileDownloadUrl.action") {
+                    enteredCount += 1
+                    if holdUrls {
+                        await withCheckedContinuation { cont in waiters.append(cont) }
+                    }
+                    let fid = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                        .queryItems?.first(where: { $0.name == "fileId" })?.value ?? "x"
+                    let b = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/\#(fid).flac"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let transport = RapidSwitchTransport()
+        let store = try AccountScopedStore(rootDirectory: root)
+        let liveVM = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: transport),
+            accountStore: store,
+            keychainBackend: InMemoryKeychainBackend(),
+            upstreamFetcher: URLSessionUpstreamStreamFetcher(),
+            userDefaults: defaults,
+            enableLiveObservers: true
+        )
+        defer { liveVM.shutdownForTermination() }
+
+        await liveVM.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=rapid")!,
+            cookies: []
+        )
+        await liveVM.updatePlaybackMode(.streamCache)
+        let r1 = TrackSummary(id: "r-1", name: "Rapid1.flac", folderPath: "Music", sizeBytes: 4096)
+        let r2 = TrackSummary(id: "r-2", name: "Rapid2.flac", folderPath: "Music", sizeBytes: 4096)
+        let r3 = TrackSummary(id: "r-3", name: "Rapid3.flac", folderPath: "Music", sizeBytes: 4096)
+        liveVM.tracks = [r1, r2, r3]
+
+        await transport.setHold(true)
+        let switch1 = Task { @MainActor in await liveVM.playTrack(r1) }
+        let switch2 = Task { @MainActor in await liveVM.playTrack(r2) }
+        let switch3 = Task { @MainActor in await liveVM.playTrack(r3) }
+        await transport.waitUntilEntered(atLeast: 3)
+        await transport.setHold(false)
+        await switch1.value
+        await switch2.value
+        await switch3.value
+
+        #expect(liveVM.currentTrackId == r3.id)
+        #expect(liveVM.activeTrack?.id == r3.id)
+        #expect(await liveVM.streamServer?.registeredSourceCount == 1)
+
+        // Invoke liveVM's remote command target off-MainActor
+        #if canImport(MediaPlayer)
+        let remotePauseResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: (!Thread.isMainThread, liveVM.invokeRemoteCommandForTesting(.pause)))
+            }
+        }
+        #expect(remotePauseResult.0 == true)
+        #expect(remotePauseResult.1 == true)
+        #endif
+
+        // Rapid playTrack burst raced concurrently with logout()
+        await transport.setHold(true)
+        let racePlayA = Task { @MainActor in await liveVM.playTrack(r1) }
+        let racePlayB = Task { @MainActor in await liveVM.playTrack(r2) }
+        await transport.waitUntilEntered(atLeast: 5)
+        async let logoutOp: Void = liveVM.logout()
+        await transport.setHold(false)
+        _ = await logoutOp
+        await racePlayA.value
+        await racePlayB.value
+
+        #expect(liveVM.isAuthenticated == false)
+        #expect(liveVM.currentTrack == nil)
+        #expect(liveVM.activeTrack == nil)
+        #expect(liveVM.isPlaying == false)
+        #expect(liveVM.loadingTrackId == nil)
+        #expect(liveVM.timeline.currentTime == 0)
+        #expect(await liveVM.streamServer?.registeredSourceCount == 0)
+        #expect(liveVM.transferSnapshot.items.isEmpty)
+    }
+
     #if os(macOS)
     @Test("macOS full-state Light & Dark offscreen PNG rendering and glyph pixel contrast")
     @MainActor
     func verifyMacOSLightAndDarkSnapshots() async throws {
-        guard ProcessInfo.processInfo.environment["CLOUDTUNE_RENDER_SNAPSHOTS"] == "1" else {
-            return
-        }
         let root = repoRootURL()
         let fixture = try RepresentativeFixture.load(from: root.appendingPathComponent("contracts/representative-state.json"))
+        let shouldWriteDisk = ProcessInfo.processInfo.environment["CLOUDTUNE_RENDER_SNAPSHOTS"] == "1"
         let outRoot = URL(
             fileURLWithPath: ProcessInfo.processInfo.environment["CLOUDTUNE_SNAPSHOT_DIR"]
-                ?? root.appendingPathComponent("dist/snapshots/macos").path
+                ?? root.appendingPathComponent("artifacts/snapshots/macos").path
         )
-        try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("light"), withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("dark"), withIntermediateDirectories: true)
+        if shouldWriteDisk {
+            try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("light"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("dark"), withIntermediateDirectories: true)
+        }
 
         #expect(SnapshotScene.allCases.count == 9)
 
@@ -1218,8 +1425,10 @@ struct CloudTuneUITests {
             let lightPNG = try SnapshotRenderer.renderMacScenePNG(scene: scene, fixture: fixture, isDark: false)
             let darkPNG = try SnapshotRenderer.renderMacScenePNG(scene: scene, fixture: fixture, isDark: true)
 
-            try lightPNG.write(to: outRoot.appendingPathComponent("light/\(scene.rawValue).png"), options: .atomic)
-            try darkPNG.write(to: outRoot.appendingPathComponent("dark/\(scene.rawValue).png"), options: .atomic)
+            if shouldWriteDisk {
+                try lightPNG.write(to: outRoot.appendingPathComponent("light/\(scene.rawValue).png"), options: .atomic)
+                try darkPNG.write(to: outRoot.appendingPathComponent("dark/\(scene.rawValue).png"), options: .atomic)
+            }
 
             let lightMetrics = try SnapshotRenderer.analyzePNGData(lightPNG)
             let darkMetrics = try SnapshotRenderer.analyzePNGData(darkPNG)

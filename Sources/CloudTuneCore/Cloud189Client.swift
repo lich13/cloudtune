@@ -1,24 +1,24 @@
 import Foundation
 
-public struct CloudHTTPResponse: Sendable {
-    public let statusCode: Int
-    public let headers: [String: String]
-    public let body: Data
-    public let finalURL: URL
+package struct CloudHTTPResponse: Sendable {
+    package let statusCode: Int
+    package let headers: [String: String]
+    package let body: Data
+    package let finalURL: URL
 
-    public init(statusCode: Int, headers: [String: String] = [:], body: Data, finalURL: URL) {
+    package init(statusCode: Int, headers: [String: String] = [:], body: Data, finalURL: URL) {
         self.statusCode = statusCode
         self.headers = headers
         self.body = body
         self.finalURL = finalURL
     }
 
-    public var text: String {
+    package var text: String {
         String(decoding: body, as: UTF8.self)
     }
 }
 
-public protocol CloudHTTPTransport: Sendable {
+package protocol CloudHTTPTransport: Sendable {
     func send(_ request: URLRequest) async throws -> CloudHTTPResponse
     func importCookies(_ cookies: [HTTPCookie]) async
     func clearCookies() async
@@ -96,7 +96,7 @@ private final class PerRequestRedirectGuard: NSObject, URLSessionTaskDelegate, @
     }
 }
 
-public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked Sendable {
+package final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var session: URLSession
     private var cookieStorage: HTTPCookieStorage
@@ -113,13 +113,13 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
         return (URLSession(configuration: config), storage)
     }
 
-    public init() {
+    package init() {
         let created = Self.makeSessionAndCookieStorage()
         self.session = created.session
         self.cookieStorage = created.cookieStorage
     }
 
-    public func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+    package func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
         let activeSession = lock.withLock { session }
         let redirectGuard = PerRequestRedirectGuard(initialRequest: request)
         let (data, response) = try await activeSession.data(for: request, delegate: redirectGuard)
@@ -141,7 +141,7 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
         )
     }
 
-    public func importCookies(_ cookies: [HTTPCookie]) async {
+    package func importCookies(_ cookies: [HTTPCookie]) async {
         lock.withLock {
             for cookie in cookies {
                 let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
@@ -164,7 +164,7 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
         }
     }
 
-    public func clearCookies() async {
+    package func clearCookies() async {
         let oldSession = lock.withLock { () -> URLSession in
             let previous = session
             let created = Self.makeSessionAndCookieStorage()
@@ -176,7 +176,7 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
     }
 }
 
-public actor Cloud189Client {
+package actor Cloud189Client {
     private struct PendingQrLogin: Sendable {
         let lt: String
         let paramId: String
@@ -186,28 +186,28 @@ public actor Cloud189Client {
     }
 
     private let transport: CloudHTTPTransport
-    public private(set) var activeSession: ActiveCloudSession?
-    public private(set) var persistedCredential: PersistedRefreshCredential?
+    package private(set) var activeSession: ActiveCloudSession?
+    package private(set) var persistedCredential: PersistedRefreshCredential?
     private var pendingQr: PendingQrLogin?
     private var sessionEpoch: UInt64 = 0
 
-    public init(transport: CloudHTTPTransport = URLSessionCloudHTTPTransport()) {
+    package init(transport: CloudHTTPTransport = URLSessionCloudHTTPTransport()) {
         self.transport = transport
     }
 
-    public var currentSessionEpoch: UInt64 {
+    package var currentSessionEpoch: UInt64 {
         sessionEpoch
     }
 
-    public var isAuthenticated: Bool {
+    package var isAuthenticated: Bool {
         activeSession != nil
     }
 
-    public var accountName: String? {
+    package var accountName: String? {
         activeSession?.loginName ?? persistedCredential?.accountName
     }
 
-    public func clearSession(ifEpoch expectedEpoch: UInt64? = nil) async {
+    package func clearSession(ifEpoch expectedEpoch: UInt64? = nil) async {
         if let expectedEpoch {
             guard sessionEpoch == expectedEpoch else { return }
         }
@@ -218,28 +218,28 @@ public actor Cloud189Client {
         await transport.clearCookies()
     }
 
-    public func invalidateInFlightAuth() {
+    package func invalidateInFlightAuth() {
         sessionEpoch &+= 1
         pendingQr = nil
     }
 
-    public func sessionSnapshot(forEpoch expectedEpoch: UInt64?) -> (active: ActiveCloudSession?, persisted: PersistedRefreshCredential?)? {
+    package func sessionSnapshot(forEpoch expectedEpoch: UInt64?) -> (active: ActiveCloudSession?, persisted: PersistedRefreshCredential?)? {
         if let expectedEpoch, sessionEpoch != expectedEpoch {
             return nil
         }
         return (activeSession, persistedCredential)
     }
 
-    public func importWebCookies(_ cookies: [HTTPCookie]) async {
+    package func importWebCookies(_ cookies: [HTTPCookie]) async {
         await transport.importCookies(cookies)
     }
 
     /// Cold-start session restoration: only sets `activeSession` AFTER network exchange succeeds.
-    public func restoreFromRefreshCredential(_ credential: PersistedRefreshCredential) async throws -> Cloud189Protocol.ParsedSessionPayload {
+    package func restoreFromRefreshCredential(_ credential: PersistedRefreshCredential) async throws -> Cloud189Protocol.ParsedSessionPayload {
         try await restoreSessionWithEpoch(credential).payload
     }
 
-    public func restoreSessionWithEpoch(
+    package func restoreSessionWithEpoch(
         _ credential: PersistedRefreshCredential
     ) async throws -> (payload: Cloud189Protocol.ParsedSessionPayload, epoch: UInt64) {
         let startEpoch = sessionEpoch
@@ -288,7 +288,7 @@ public actor Cloud189Client {
         return (parsed, committedEpoch)
     }
 
-    public func startQrLogin() async throws -> QrLoginStart {
+    package func startQrLogin() async throws -> QrLoginStart {
         let startEpoch = sessionEpoch
         let entryURL = Cloud189Protocol.webLoginEntryURL()
         var initReq = URLRequest(url: entryURL)
@@ -337,7 +337,7 @@ public actor Cloud189Client {
         return QrLoginStart(qrContent: uuid, message: "请使用天翼云盘 App 扫码，并在手机端确认登录")
     }
 
-    public func pollQrLogin() async throws -> QrPollResponse {
+    package func pollQrLogin() async throws -> QrPollResponse {
         guard let pending = pendingQr else {
             throw CloudTuneError.invalidRequest("请先生成二维码，再轮询登录状态")
         }
@@ -391,12 +391,12 @@ public actor Cloud189Client {
     }
 
     @discardableResult
-    public func exchangeRedirectForSession(redirectURL: String) async throws -> Cloud189Protocol.ParsedSessionPayload {
+    package func exchangeRedirectForSession(redirectURL: String) async throws -> Cloud189Protocol.ParsedSessionPayload {
         try await exchangeRedirectForSessionWithEpoch(redirectURL: redirectURL).payload
     }
 
     @discardableResult
-    public func exchangeRedirectForSessionWithEpoch(
+    package func exchangeRedirectForSessionWithEpoch(
         redirectURL: String
     ) async throws -> (payload: Cloud189Protocol.ParsedSessionPayload, epoch: UInt64) {
         let startEpoch = sessionEpoch
@@ -432,7 +432,7 @@ public actor Cloud189Client {
         return (parsed, committedEpoch)
     }
 
-    public func listRemoteFolder(
+    package func listRemoteFolder(
         folderId: String?,
         folderName: String? = nil,
         folderPath: String? = nil
@@ -539,15 +539,15 @@ public actor Cloud189Client {
         )
     }
 
-    public func scanMusicLibrary(folderId: String, folderName: String) async throws -> [TrackSummary] {
+    package func scanMusicLibrary(folderId: String, folderName: String) async throws -> [TrackSummary] {
         try await scanRecursive(folderId: folderId, folderName: folderName, audioOnly: true)
     }
 
-    public func scanAllFiles(folderId: String, folderName: String) async throws -> [TrackSummary] {
+    package func scanAllFiles(folderId: String, folderName: String) async throws -> [TrackSummary] {
         try await scanRecursive(folderId: folderId, folderName: folderName, audioOnly: false)
     }
 
-    public func resolveDownloadURL(fileId: String) async throws -> URL {
+    package func resolveDownloadURL(fileId: String) async throws -> URL {
         let json = try await signedGetJSON(
             path: "/getFileDownloadUrl.action",
             query: [("fileId", fileId), ("dt", "3"), ("flag", "1")]

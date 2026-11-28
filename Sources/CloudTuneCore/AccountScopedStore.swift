@@ -1,18 +1,18 @@
 import Foundation
 
-public struct AccountPaths: Equatable, Sendable {
-    public let accountId: String
-    public let bucketHash: String
-    public let accountDir: URL
-    public let cacheDir: URL
-    public let stagingDir: URL
-    public let settingsURL: URL
-    public let libraryURL: URL
-    public let cacheIndexURL: URL
-    public let transfersURL: URL
-    public let exportBookmarkURL: URL
+package struct AccountPaths: Equatable, Sendable {
+    package let accountId: String
+    package let bucketHash: String
+    package let accountDir: URL
+    package let cacheDir: URL
+    package let stagingDir: URL
+    package let settingsURL: URL
+    package let libraryURL: URL
+    package let cacheIndexURL: URL
+    package let transfersURL: URL
+    package let exportBookmarkURL: URL
 
-    public init(baseRoot: URL, accountId: String) {
+    package init(baseRoot: URL, accountId: String) {
         let hash = Cloud189Protocol.accountBucketHash(for: accountId)
         let dir = baseRoot.appendingPathComponent("accounts/\(hash)", isDirectory: true)
         self.accountId = accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -28,12 +28,12 @@ public struct AccountPaths: Equatable, Sendable {
     }
 }
 
-public actor AccountScopedStore {
-    public let rootDirectory: URL
+package actor AccountScopedStore {
+    package let rootDirectory: URL
     private let fm = FileManager.default
     private var settingsMutationSequence: UInt64 = 0
 
-    public init(rootDirectory: URL? = nil) throws {
+    package init(rootDirectory: URL? = nil) throws {
         if let rootDirectory {
             self.rootDirectory = rootDirectory
         } else {
@@ -57,7 +57,7 @@ public actor AccountScopedStore {
         }
     }
 
-    public static func resolveOrFallback(_ explicit: AccountScopedStore?) -> (store: AccountScopedStore, warning: String?) {
+    package static func resolveOrFallback(_ explicit: AccountScopedStore?) -> (store: AccountScopedStore, warning: String?) {
         if let explicit {
             return (explicit, nil)
         }
@@ -73,7 +73,7 @@ public actor AccountScopedStore {
         }
     }
 
-    public func paths(for accountId: String) throws -> AccountPaths {
+    package func paths(for accountId: String) throws -> AccountPaths {
         let resolved = AccountPaths(baseRoot: rootDirectory, accountId: accountId)
         for dir in [resolved.accountDir, resolved.cacheDir, resolved.stagingDir] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -81,7 +81,7 @@ public actor AccountScopedStore {
         return resolved
     }
 
-    public func loadSettingsIfPresent(for accountId: String) throws -> AccountSettings? {
+    package func loadSettingsIfPresent(for accountId: String) throws -> AccountSettings? {
         let p = try paths(for: accountId)
         guard fm.fileExists(atPath: p.settingsURL.path),
               let data = try? Data(contentsOf: p.settingsURL) else {
@@ -90,14 +90,14 @@ public actor AccountScopedStore {
         return try? JSONDecoder().decode(AccountSettings.self, from: data)
     }
 
-    public func saveSettings(_ settings: AccountSettings, for accountId: String) throws {
+    package func saveSettings(_ settings: AccountSettings, for accountId: String) throws {
         let p = try paths(for: accountId)
         let data = try JSONEncoder().encode(settings)
         try data.write(to: p.settingsURL, options: .atomic)
     }
 
     @discardableResult
-    public func mutateSettings(
+    package func mutateSettings(
         for accountId: String,
         base: AccountSettings = AccountSettings(),
         _ transform: @Sendable (inout AccountSettings) -> Void
@@ -109,7 +109,7 @@ public actor AccountScopedStore {
         return (settings, settingsMutationSequence)
     }
 
-    public func loadLibrary(for accountId: String) throws -> [TrackSummary] {
+    package func loadLibrary(for accountId: String) throws -> [TrackSummary] {
         let p = try paths(for: accountId)
         guard let data = try? Data(contentsOf: p.libraryURL) else {
             return []
@@ -138,14 +138,14 @@ public actor AccountScopedStore {
         return recovered
     }
 
-    public func saveLibrary(_ tracks: [TrackSummary], for accountId: String) throws {
+    package func saveLibrary(_ tracks: [TrackSummary], for accountId: String) throws {
         let p = try paths(for: accountId)
         let data = try JSONEncoder().encode(tracks)
         try data.write(to: p.libraryURL, options: .atomic)
     }
 
     @discardableResult
-    public func saveExportDirectoryBookmarkAndSettings(
+    package func saveExportDirectoryBookmarkAndSettings(
         _ folderURL: URL,
         baseSettings: AccountSettings? = nil,
         for accountId: String
@@ -175,7 +175,7 @@ public actor AccountScopedStore {
         return (displayName, mutated.settings, mutated.sequence)
     }
 
-    public func captureExportBookmarkData(
+    package func captureExportBookmarkData(
         explicitDirectoryURL: URL? = nil,
         for accountId: String
     ) -> Data? {
@@ -205,7 +205,7 @@ public actor AccountScopedStore {
 
     /// Exports ordered staged part files sequentially (single-pass `128 KB` streaming) into the user-selected folder
     /// using security-scoped bookmark + off-actor `NSFileCoordinator`.
-    public func exportStagedParts(
+    package func exportStagedParts(
         partURLs: [URL],
         expectedTotalBytes: UInt64? = nil,
         relativeSubpath: String,
@@ -230,7 +230,7 @@ public actor AccountScopedStore {
     }
 
     /// Exports a verified staged file into the user-selected folder using security-scoped bookmark + NSFileCoordinator.
-    public func exportStagedFile(
+    package func exportStagedFile(
         stagedFileURL: URL,
         relativeSubpath: String,
         explicitDirectoryURL: URL? = nil,
@@ -446,7 +446,7 @@ public actor AccountScopedStore {
 
     /// Non-destructive migration from legacy Tauri directories (`com.gosu.cloudtune` flat root,
     /// `/Applications/CloudTune.app/Contents/MacOS/data`, and `com.cloudtune.desktop`) if present.
-    public func migrateLegacyTauriDataIfPresent(
+    package func migrateLegacyTauriDataIfPresent(
         legacyRoot: URL? = nil,
         candidateRoots: [URL]? = nil
     ) -> PersistedRefreshCredential? {

@@ -1,17 +1,17 @@
 import Darwin
 import Foundation
 
-public struct StreamSourceRegistration: Sendable {
-    public let token: String
-    public let accountHash: String
-    public let trackId: String
-    public var remoteURL: URL
-    public let cacheDestinationURL: URL
-    public let expectedSize: UInt64
-    public let fileName: String
-    public let cacheLimitBytes: UInt64
+package struct StreamSourceRegistration: Sendable {
+    package let token: String
+    package let accountHash: String
+    package let trackId: String
+    package var remoteURL: URL
+    package let cacheDestinationURL: URL
+    package let expectedSize: UInt64
+    package let fileName: String
+    package let cacheLimitBytes: UInt64
 
-    public init(
+    package init(
         token: String = UUID().uuidString.lowercased(),
         accountHash: String,
         trackId: String,
@@ -32,7 +32,7 @@ public struct StreamSourceRegistration: Sendable {
     }
 }
 
-public protocol UpstreamStreamFetcher: Sendable {
+package protocol UpstreamStreamFetcher: Sendable {
     func openStream(url: URL, rangeHeader: String?) async throws -> (
         statusCode: Int,
         headers: [String: String],
@@ -411,11 +411,11 @@ private final class UpstreamSessionMultiplexer: NSObject, URLSessionDataDelegate
     }
 }
 
-public struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
-    public let highWaterMarkBytes: Int
-    public let lowWaterMarkBytes: Int
+package struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
+    package let highWaterMarkBytes: Int
+    package let lowWaterMarkBytes: Int
 
-    public init(
+    package init(
         highWaterMarkBytes: Int = 512 * 1024,
         lowWaterMarkBytes: Int = 128 * 1024
     ) {
@@ -423,11 +423,11 @@ public struct URLSessionUpstreamStreamFetcher: UpstreamStreamFetcher {
         self.lowWaterMarkBytes = lowWaterMarkBytes
     }
 
-    public static var activePooledTaskCount: Int {
+    package static var activePooledTaskCount: Int {
         UpstreamSessionMultiplexer.shared.activeTaskCount
     }
 
-    public func openStream(url: URL, rangeHeader: String?) async throws -> (
+    package func openStream(url: URL, rangeHeader: String?) async throws -> (
         statusCode: Int,
         headers: [String: String],
         chunks: AsyncThrowingStream<Data, Error>
@@ -548,12 +548,12 @@ private final class ConnectionRegistry: @unchecked Sendable {
 }
 
 /// Localhost (`127.0.0.1:0`) HTTP/1.1 Range streaming proxy with strict write-through & `206` resume validation.
-public actor StreamProxyServer {
+package actor StreamProxyServer {
     private static let maxRegisteredSources = 128
     private static let localCacheSliceBytes = 64 * 1024
     private static let writeThroughBufferBytes = 256 * 1024
 
-    public nonisolated let port: UInt16
+    package nonisolated let port: UInt16
     private nonisolated let acceptQueue: DispatchQueue
     private nonisolated let clientIOQueue: DispatchQueue
     private nonisolated let acceptSource: DispatchSourceRead
@@ -567,7 +567,7 @@ public actor StreamProxyServer {
     private var tokenInsertionOrder: [String] = []
     private var cacheStoresByAccount: [String: CacheStore] = [:]
 
-    public init(
+    package init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)? = nil,
@@ -675,11 +675,11 @@ public actor StreamProxyServer {
         acceptSource.cancel()
     }
 
-    public var registeredSourceCount: Int {
+    package var registeredSourceCount: Int {
         sourcesByToken.count
     }
 
-    public func registerSource(_ registration: StreamSourceRegistration, cacheStore: CacheStore) -> URL {
+    package func registerSource(_ registration: StreamSourceRegistration, cacheStore: CacheStore) -> URL {
         if sourcesByToken[registration.token] != nil {
             tokenInsertionOrder.removeAll { $0 == registration.token }
         }
@@ -708,7 +708,7 @@ public actor StreamProxyServer {
         }
     }
 
-    public func revokeSource(token: String) {
+    package func revokeSource(token: String) {
         sourcesByToken.removeValue(forKey: token)
         tokenInsertionOrder.removeAll { $0 == token }
         for conn in connectionRegistry.removeAll(matchingToken: token) {
@@ -716,7 +716,7 @@ public actor StreamProxyServer {
         }
     }
 
-    public func revokeAllSources(forAccountHash accountHash: String) {
+    package func revokeAllSources(forAccountHash accountHash: String) {
         sourcesByToken = sourcesByToken.filter { $0.value.accountHash != accountHash }
         tokenInsertionOrder.removeAll { sourcesByToken[$0] == nil }
         cacheStoresByAccount.removeValue(forKey: accountHash)
@@ -725,7 +725,7 @@ public actor StreamProxyServer {
         }
     }
 
-    public func shutdown() {
+    package func shutdown() {
         sourcesByToken.removeAll()
         tokenInsertionOrder.removeAll()
         cacheStoresByAccount.removeAll()
@@ -735,7 +735,7 @@ public actor StreamProxyServer {
         acceptSource.cancel()
     }
 
-    public nonisolated func shutdownImmediate() {
+    package nonisolated func shutdownImmediate() {
         for conn in connectionRegistry.drainAll() {
             conn.revokeAndShutdownSocket()
         }

@@ -43,6 +43,8 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             onShowPreferences: { [weak self] in self?.showOrCreatePreferencesWindow() },
             onQuitApp: { [weak self] in self?.quitExplicitly() }
         )
+        applyAppearancePreference()
+        observeAppearanceState()
         observeAuthenticationState()
         Task {
             await viewModel.bootstrap()
@@ -55,6 +57,33 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             prefsNotificationToken = nil
         }
         viewModel.shutdownForTermination()
+    }
+
+    private func applyAppearancePreference() {
+        let resolvedAppearance: NSAppearance? = switch viewModel.appearancePreference {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+        NSApp.appearance = resolvedAppearance
+        mainWindow?.appearance = resolvedAppearance
+        preferencesWindow?.appearance = resolvedAppearance
+    }
+
+    private func observeAppearanceState() {
+        withObservationTracking {
+            _ = viewModel.appearancePreference
+            _ = viewModel.committedSettings.appearanceMode
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.applyAppearancePreference()
+                self.observeAppearanceState()
+            }
+        }
     }
 
     private func observeAuthenticationState() {
@@ -153,6 +182,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func showOrCreateMainWindow() {
         if let window = mainWindow {
+            applyAppearancePreference()
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -171,6 +201,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         window.delegate = self
         window.center()
         self.mainWindow = window
+        applyAppearancePreference()
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -179,6 +210,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     func showOrCreatePreferencesWindow() {
         viewModel.isShowingSettingsSheet = false
         if let existing = preferencesWindow {
+            applyAppearancePreference()
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -207,6 +239,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         window.delegate = self
         window.center()
         self.preferencesWindow = window
+        applyAppearancePreference()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

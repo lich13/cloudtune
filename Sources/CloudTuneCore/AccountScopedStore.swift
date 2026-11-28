@@ -138,7 +138,7 @@ public actor AccountScopedStore {
             relativeTo: nil
         )
         try bookmarkData.write(to: p.exportBookmarkURL, options: .atomic)
-        var settings = try baseSettings ?? loadSettingsIfPresent(for: accountId) ?? AccountSettings()
+        var settings = (try loadSettingsIfPresent(for: accountId)) ?? baseSettings ?? AccountSettings()
         settings.exportFolderDisplayName = folderURL.lastPathComponent
         try saveSettings(settings, for: accountId)
         return folderURL.lastPathComponent

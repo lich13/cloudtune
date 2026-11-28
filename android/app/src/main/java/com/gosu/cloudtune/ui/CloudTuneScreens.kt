@@ -1241,7 +1241,7 @@ private fun TabletNowPlayingQueuePane(
                 modifier = Modifier
                     .weight(1f)
                     .clip(RoundedCornerShape(14.dp))
-                    .clickable { runtime.isShowingNowPlayingSheet = true },
+                    .clickable(onClickLabel = "展开正在播放详情") { runtime.isShowingNowPlayingSheet = true },
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {

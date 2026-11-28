@@ -842,6 +842,7 @@ public final class CloudTuneViewModel {
         credentialMachine.clear(backend: keychainBackend)
 
         isAuthenticated = false
+        busyLabel = nil
         accountName = nil
         accountStorageKey = nil
         cacheStore = nil
@@ -1434,8 +1435,13 @@ public final class CloudTuneViewModel {
         let gen = playbackGeneration
         recoveryAttempts = 0
         pauseIfPlaying()
-        busyLabel = "准备视频流 \(video.name)..."
-        defer { if gen == playbackGeneration { busyLabel = nil } }
+        let assignedBusy = "准备视频流 \(video.name)..."
+        busyLabel = assignedBusy
+        defer {
+            if busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         do {
             if let cacheStore, let cached = await cacheStore.existingCachedFile(trackId: video.id) {
                 guard gen == playbackGeneration, isAuthenticated else { return }
@@ -1450,6 +1456,7 @@ public final class CloudTuneViewModel {
             if let streamServer, let cacheStore, let accountId = activeAccountKey {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
                 let destURL = await cacheStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
+                guard gen == playbackGeneration, isAuthenticated, activeAccountKey == accountId else { return }
                 playbackURL = await streamServer.registerSource(
                     StreamSourceRegistration(
                         accountHash: accountHash,
@@ -1485,9 +1492,10 @@ public final class CloudTuneViewModel {
         externalVideoGeneration += 1
         let extGen = externalVideoGeneration
         let expectedAccount = activeAccountKey
-        busyLabel = "检查本地视频缓存 \(video.name)..."
+        let assignedBusy = "检查本地视频缓存 \(video.name)..."
+        busyLabel = assignedBusy
         defer {
-            if gen == playbackGeneration && extGen == externalVideoGeneration {
+            if busyLabel == assignedBusy {
                 busyLabel = nil
             }
         }
@@ -1565,9 +1573,10 @@ public final class CloudTuneViewModel {
         externalVideoGeneration += 1
         let extGen = externalVideoGeneration
         pendingExternalVideoChoice = nil
-        busyLabel = "正在下载视频至本地缓存：《\(video.name)》..."
+        let assignedBusy = "正在下载视频至本地缓存：《\(video.name)》..."
+        busyLabel = assignedBusy
         defer {
-            if gen == playbackGeneration && extGen == externalVideoGeneration {
+            if busyLabel == assignedBusy {
                 busyLabel = nil
             }
         }
@@ -1695,11 +1704,13 @@ public final class CloudTuneViewModel {
                 baseSettings: committedSettings,
                 for: accountId
             )
+            guard isAuthenticated, activeAccountKey == accountId else { return }
             var next = committedSettings
             next.exportFolderDisplayName = name
             committedSettings = next
             statusMessage = "下载导出目录已设为 \(name)"
         } catch {
+            guard isAuthenticated, activeAccountKey == accountId else { return }
             statusMessage = error.localizedDescription
         }
     }

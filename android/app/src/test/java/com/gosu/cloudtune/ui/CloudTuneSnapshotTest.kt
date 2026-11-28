@@ -200,8 +200,8 @@ class CloudTuneSnapshotTest {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
         try {
             val activity = controller.get()
-            val enteredResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
-            val releaseResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var enteredResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var releaseResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
             val transport = object : com.gosu.cloudtune.core.CloudHttpTransport {
                 override suspend fun send(
                     url: String,
@@ -216,6 +216,10 @@ class CloudTuneSnapshotTest {
                         }
                         url.contains("getSessionForPC.action") -> {
                             val b = """{"res_code":0,"loginName":"guard@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt_1"}"""
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("listFiles.action") -> {
+                            val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
                             com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
                         }
                         url.contains("getFileDownloadUrl.action") -> {
@@ -244,20 +248,48 @@ class CloudTuneSnapshotTest {
                 limiter = com.gosu.cloudtune.core.GlobalTransferLimiter(8),
                 enableLiveLoops = false,
                 dispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
-                ioDispatcher = kotlinx.coroutines.Dispatchers.IO
+                ioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
             )
             runtime.bootstrap().await()
             assertTrue(runtime.isAuthenticated)
 
+            // 1) openVideoExternally completing/cancelled across logout() must not set pendingExternalVideoAction, launch intent, or leave busyLabel stuck
             val video = com.gosu.cloudtune.core.TrackSummary("vid-race", "Concert.mp4", "Videos", 4096L)
             runtime.openVideoExternally(activity, video)
+            val extJob1 = runtime.lastExternalVideoJob
             kotlinx.coroutines.withTimeout(5000L) { enteredResolve.await() }
+            assertTrue(runtime.busyLabel != null)
             runtime.logout()
+            assertTrue(runtime.busyLabel == null)
             releaseResolve.complete(Unit)
-            kotlinx.coroutines.delay(40L)
+            extJob1?.join()
+            runtime.cookieCleanupDeferred?.await()
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             assertTrue("External video preparation completing after logout must not set pendingExternalVideoAction", runtime.pendingExternalVideoAction == null)
             assertTrue("External video preparation completing after logout must not launch intent", Shadows.shadowOf(activity as android.app.Activity).nextStartedActivity == null)
+            assertTrue("busyLabel must remain null after logout", runtime.busyLabel == null)
+
+            // 2) downloadVideoAndOpenExternally racing against logout() must not launch intent, overwrite logout statusMessage, or leave busyLabel stuck
+            enteredResolve = kotlinx.coroutines.CompletableDeferred()
+            releaseResolve = kotlinx.coroutines.CompletableDeferred()
+            savedCred = com.gosu.cloudtune.core.PersistedRefreshCredential.createOrNull("rt_init_2", "guard@example.invalid")
+            runtime.bootstrap().await()
+            assertTrue(runtime.isAuthenticated)
+
+            val dlVideo = com.gosu.cloudtune.core.TrackSummary("vid-dl-race", "Clip.mp4", "Videos", 128L)
+            runtime.downloadVideoAndOpenExternally(activity, dlVideo)
+            val extJob2 = runtime.lastExternalVideoJob
+            kotlinx.coroutines.withTimeout(5000L) { enteredResolve.await() }
+            assertTrue(runtime.busyLabel != null)
+            runtime.logout()
+            assertTrue(runtime.busyLabel == null)
+            releaseResolve.complete(Unit)
+            extJob2?.join()
+            runtime.cookieCleanupDeferred?.await()
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("Download-and-open completing after logout must not launch intent", Shadows.shadowOf(activity as android.app.Activity).nextStartedActivity == null)
+            assertTrue("busyLabel must remain null after logout", runtime.busyLabel == null)
+            assertTrue("statusMessage must keep logout notice", runtime.statusMessage == "已退出登录并清理当前会话")
             Unit
         } finally {
             controller.pause().stop().destroy()

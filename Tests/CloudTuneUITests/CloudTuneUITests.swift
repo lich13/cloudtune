@@ -354,12 +354,19 @@ struct CloudTuneUITests {
         #expect(noProxyVM.canCloseSettingsSurface() == true)
         #expect(noProxyVM.isShowingSettingsSheet == false)
 
-        // 2d) External video request completing after logout() MUST NOT mutate pendingExternalVideoChoice or shareFileURL
+        // 2d) External video request & download completing after logout() MUST NOT mutate pendingExternalVideoChoice, shareFileURL, or leave busyLabel stuck
         actor GatedVideoTransport: CloudHTTPTransport {
             private var enteredContinuation: CheckedContinuation<Void, Never>?
             private var releaseContinuation: CheckedContinuation<Void, Never>?
             private var hasEntered = false
             private var isReleased = false
+
+            func resetGate() {
+                hasEntered = false
+                isReleased = false
+                enteredContinuation = nil
+                releaseContinuation = nil
+            }
 
             func waitUntilEnteredDownloadURL() async {
                 if hasEntered { return }
@@ -412,12 +419,36 @@ struct CloudTuneUITests {
             await raceVM.requestExternalVideoPlayback(concertVideo)
         }
         await gatedTransport.waitUntilEnteredDownloadURL()
+        #expect(raceVM.busyLabel != nil)
         await raceVM.logout()
+        #expect(raceVM.busyLabel == nil)
         await gatedTransport.releaseDownloadURL()
         let lateExternalResult = await inFlightExternalTask.value
         #expect(lateExternalResult == nil)
         #expect(raceVM.pendingExternalVideoChoice == nil)
         #expect(raceVM.shareFileURL == nil)
+        #expect(raceVM.busyLabel == nil)
+
+        // Also test downloadVideoAndPrepareLocalFile racing against logout()
+        await gatedTransport.resetGate()
+        await raceVM.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=race2")!,
+            cookies: []
+        )
+        let smallUncachedVideo = TrackSummary(id: "vid-dl-race", name: "Clip.mp4", folderPath: "Videos", sizeBytes: 128)
+        let inFlightDownloadVideoTask = Task { @MainActor in
+            await raceVM.downloadVideoAndPrepareLocalFile(smallUncachedVideo)
+        }
+        await gatedTransport.waitUntilEnteredDownloadURL()
+        #expect(raceVM.busyLabel != nil)
+        await raceVM.logout()
+        #expect(raceVM.busyLabel == nil)
+        await gatedTransport.releaseDownloadURL()
+        let lateDownloadResult = await inFlightDownloadVideoTask.value
+        #expect(lateDownloadResult == nil)
+        #expect(raceVM.shareFileURL == nil)
+        #expect(raceVM.busyLabel == nil)
+        #expect(raceVM.statusMessage == "已退出登录并清理当前会话")
 
         // 3) Logout tears down observers, closes sheets/modals, resets module, and re-login re-registers idempotently
         vm.isShowingSettingsSheet = true

@@ -108,10 +108,12 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard !isQuittingExplicitly else { return true }
         if sender === preferencesWindow {
+            _ = sender.makeFirstResponder(nil)
             return viewModel.canCloseSettingsSurface()
         }
         if sender === mainWindow {
             if viewModel.isShowingSettingsSheet {
+                _ = sender.makeFirstResponder(nil)
                 _ = viewModel.canCloseSettingsSurface()
                 return false
             }
@@ -164,12 +166,15 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
                 }
             }
         )
-        let hosting = NSHostingController(rootView: prefsView)
+        let hosting = NSHostingController(rootView: prefsView.frame(width: 520))
+        hosting.sizingOptions = [.intrinsicContentSize]
         let window = NSWindow(contentViewController: hosting)
         window.identifier = NSUserInterfaceItemIdentifier("cloudtune.preferences")
         window.title = "偏好设置"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 520, height: 470))
+        hosting.view.layoutSubtreeIfNeeded()
+        let fitted = hosting.view.fittingSize
+        window.setContentSize(NSSize(width: 520, height: max(480, fitted.height)))
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
@@ -313,6 +318,16 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     /// Smart `Cmd+W`: dismiss active Sheet or Preferences window first; only hide main window to preserve playback.
     @objc private func handleMenuSmartCloseWindow() {
+        if let keyWin = NSApp.keyWindow {
+            if keyWin.isSheet, keyWin.sheetParent === preferencesWindow, let parent = keyWin.sheetParent {
+                parent.endSheet(keyWin)
+                return
+            }
+            if keyWin === preferencesWindow {
+                keyWin.performClose(nil)
+                return
+            }
+        }
         if viewModel.isShowingWebLoginSheet {
             viewModel.isShowingWebLoginSheet = false
             return
@@ -327,16 +342,13 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             return
         }
         if viewModel.isShowingSettingsSheet {
+            _ = mainWindow?.makeFirstResponder(nil)
             _ = viewModel.canCloseSettingsSurface()
             return
         }
         if let keyWin = NSApp.keyWindow {
             if keyWin.isSheet, let parent = keyWin.sheetParent {
                 parent.endSheet(keyWin)
-                return
-            }
-            if keyWin === preferencesWindow {
-                keyWin.performClose(nil)
                 return
             }
             if keyWin !== mainWindow {

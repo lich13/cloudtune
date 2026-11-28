@@ -1573,6 +1573,7 @@ struct MacAVPlayerRepresentable: NSViewRepresentable {
 
     static func dismantleNSView(_ nsView: AVPlayerView, coordinator: ()) {
         nsView.player?.pause()
+        nsView.player?.replaceCurrentItem(with: nil)
         nsView.player = nil
     }
 }
@@ -1627,7 +1628,10 @@ struct MacVideoPlayerSheet: View {
                     videoPlayer.replaceCurrentItem(with: AVPlayerItem(url: nextURL))
                     videoPlayer.play()
                 }
-                .onDisappear { videoPlayer.pause() }
+                .onDisappear {
+                    videoPlayer.pause()
+                    videoPlayer.replaceCurrentItem(with: nil)
+                }
         }
     }
 }

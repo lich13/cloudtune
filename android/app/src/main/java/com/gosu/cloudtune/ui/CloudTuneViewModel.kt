@@ -218,10 +218,11 @@ class CloudTuneAppRuntime(
     private var transferRefreshJob: Job? = null
     private var uiProgressClockJob: Job? = null
     private var scheduledPrefetchJob: Job? = null
+    internal var lastExternalVideoJob: Job? = null
     private var prefetchedTrackId: String? = null
     private var prefetchingTrackId: String? = null
-    private var playbackGeneration: Int = 0
-    private var externalVideoGeneration: Int = 0
+    @Volatile private var playbackGeneration: Int = 0
+    @Volatile private var externalVideoGeneration: Int = 0
     private var recoveryAttempts = 0
     private var currentPlaybackIsLoopback = false
     private var attachedUiCount = 0
@@ -781,6 +782,8 @@ class CloudTuneAppRuntime(
         uiProgressClockJob = null
         scheduledPrefetchJob?.cancel()
         scheduledPrefetchJob = null
+        lastExternalVideoJob?.cancel()
+        lastExternalVideoJob = null
         playbackGeneration += 1
         externalVideoGeneration += 1
         recoveryAttempts = 0
@@ -805,6 +808,7 @@ class CloudTuneAppRuntime(
         }
 
         isAuthenticated = false
+        busyLabel = null
         accountName = null
         accountStorageKey = null
         cacheManager = null
@@ -1402,7 +1406,8 @@ class CloudTuneAppRuntime(
         updateUiProgressClock()
 
         scope.launch {
-            busyLabel = "准备视频播放 ${video.name}..."
+            val assignedBusy = "准备视频播放 ${video.name}..."
+            busyLabel = assignedBusy
             try {
                 val cm = cacheManager
                 val acct = activeAccountKey
@@ -1444,7 +1449,7 @@ class CloudTuneAppRuntime(
                     statusMessage = e.message
                 }
             } finally {
-                if (gen == playbackGeneration) {
+                if (busyLabel == assignedBusy) {
                     busyLabel = null
                 }
             }
@@ -1508,14 +1513,18 @@ class CloudTuneAppRuntime(
         externalVideoGeneration += 1
         val extGen = externalVideoGeneration
         val expectedAccount = activeAccountKey
-        scope.launch {
+        val appContextRef = context.applicationContext
+        lastExternalVideoJob?.cancel()
+        lastExternalVideoJob = scope.launch {
+            val assignedBusy = "准备外部播放《${video.name}》..."
+            busyLabel = assignedBusy
             try {
                 val cached = withContext(ioDispatcher) { cacheManager?.existingCachedFile(video.id) }
                 if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
                     return@launch
                 }
                 if (cached != null) {
-                    launchFileProviderVideoIntent(context, cached, video.name)
+                    launchFileProviderVideoIntent(appContextRef, cached, video.name)
                     return@launch
                 }
                 val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
@@ -1552,6 +1561,10 @@ class CloudTuneAppRuntime(
                 if (gen == playbackGeneration && extGen == externalVideoGeneration && isAuthenticated && activeAccountKey == expectedAccount) {
                     statusMessage = "准备外部播放失败：${e.message}"
                 }
+            } finally {
+                if (busyLabel == assignedBusy) {
+                    busyLabel = null
+                }
             }
         }
     }
@@ -1565,8 +1578,10 @@ class CloudTuneAppRuntime(
         val extGen = externalVideoGeneration
         pendingExternalVideoAction = null
         val appContextRef = context.applicationContext
-        scope.launch {
-            busyLabel = "正在缓存视频《${video.name}》..."
+        lastExternalVideoJob?.cancel()
+        lastExternalVideoJob = scope.launch {
+            val assignedBusy = "正在缓存视频《${video.name}》..."
+            busyLabel = assignedBusy
             try {
                 val localFile = transferEngine.downloadTrackToCache(
                     track = video,
@@ -1592,7 +1607,7 @@ class CloudTuneAppRuntime(
                     statusMessage = "缓存视频失败：${e.message}"
                 }
             } finally {
-                if (gen == playbackGeneration && extGen == externalVideoGeneration) {
+                if (busyLabel == assignedBusy) {
                     busyLabel = null
                 }
             }

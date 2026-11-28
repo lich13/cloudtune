@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-public enum CloudTuneError: LocalizedError, Equatable, Sendable {
+package enum CloudTuneError: LocalizedError, Equatable, Sendable {
     case unauthenticated
     case invalidRequest(String)
     case protocolError(String)
@@ -11,7 +11,7 @@ public enum CloudTuneError: LocalizedError, Equatable, Sendable {
     case exportPermissionRevoked(String)
     case unsupportedLocalMediaFormat(String)
 
-    public var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .unauthenticated:
             return "请先登录天翼云盘"
@@ -29,36 +29,36 @@ public enum CloudTuneError: LocalizedError, Equatable, Sendable {
     }
 }
 
-public enum Cloud189Constants {
-    public static let rootFolderId = "-11"
-    public static let rootFolderName = "我的云盘"
-    public static let defaultAccountDisplayName = "天翼云盘用户"
-    public static let webURL = "https://cloud.189.cn"
-    public static let authURL = "https://open.e.189.cn"
-    public static let apiURL = "https://api.cloud.189.cn"
-    public static let appId = "8025431004"
-    public static let clientType = "10020"
-    public static let returnURL = "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html"
-    public static let pcClient = "TELEPC"
-    public static let version = "6.2"
-    public static let channelId = "web_cloud.189.cn"
-    public static let userAgent = "CloudTune/1.0.0"
-    public static let referer = "https://cloud.189.cn/"
+package enum Cloud189Constants {
+    package static let rootFolderId = "-11"
+    package static let rootFolderName = "我的云盘"
+    package static let defaultAccountDisplayName = "天翼云盘用户"
+    package static let webURL = "https://cloud.189.cn"
+    package static let authURL = "https://open.e.189.cn"
+    package static let apiURL = "https://api.cloud.189.cn"
+    package static let appId = "8025431004"
+    package static let clientType = "10020"
+    package static let returnURL = "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html"
+    package static let pcClient = "TELEPC"
+    package static let version = "6.2"
+    package static let channelId = "web_cloud.189.cn"
+    package static let userAgent = "CloudTune/1.0.0"
+    package static let referer = "https://cloud.189.cn/"
 }
 
-public enum Cloud189Protocol {
-    public struct LoginPageParameters: Equatable, Sendable {
-        public let lt: String
-        public let paramId: String
-        public let reqId: String
+package enum Cloud189Protocol {
+    package struct LoginPageParameters: Equatable, Sendable {
+        package let lt: String
+        package let paramId: String
+        package let reqId: String
     }
 
-    public struct ParsedSessionPayload: Equatable, Sendable {
-        public let activeSession: ActiveCloudSession
-        public let persistedCredential: PersistedRefreshCredential?
+    package struct ParsedSessionPayload: Equatable, Sendable {
+        package let activeSession: ActiveCloudSession
+        package let persistedCredential: PersistedRefreshCredential?
     }
 
-    public static func webLoginEntryURL(timestampMillis: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> URL {
+    package static func webLoginEntryURL(timestampMillis: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> URL {
         var comps = URLComponents(string: "\(Cloud189Constants.webURL)/api/portal/unifyLoginForPC.action")!
         comps.queryItems = [
             URLQueryItem(name: "appId", value: Cloud189Constants.appId),
@@ -70,7 +70,7 @@ public enum Cloud189Protocol {
     }
 
     /// Distinguishes intermediate Tianyi login pages from the post-login callback redirect URL.
-    public static func isInterceptableWebLoginCallback(_ url: URL) -> Bool {
+    package static func isInterceptableWebLoginCallback(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
               let host = url.host?.lowercased() else {
             return false
@@ -140,13 +140,13 @@ public enum Cloud189Protocol {
         return String(decoding: out, as: UTF8.self)
     }
 
-    public static func formatHTTPDate(_ date: Date = Date()) -> String {
+    package static func formatHTTPDate(_ date: Date = Date()) -> String {
         formatterLock.withLock {
             httpDateFormatter.string(from: date)
         }
     }
 
-    public static func formatQrPollDate(_ date: Date = Date(), timeZone: TimeZone = .current) -> String {
+    package static func formatQrPollDate(_ date: Date = Date(), timeZone: TimeZone = .current) -> String {
         formatterLock.withLock {
             if qrPollDateFormatter.timeZone != timeZone {
                 qrPollDateFormatter.timeZone = timeZone
@@ -155,7 +155,7 @@ public enum Cloud189Protocol {
         }
     }
 
-    public static func computeSignature(
+    package static func computeSignature(
         sessionKey: String,
         sessionSecret: String,
         method: String,
@@ -174,7 +174,7 @@ public enum Cloud189Protocol {
     }
 
     /// Uses word boundaries (`\blt\b`) so attributes like `alt="二维码登录成功"` never match `lt`.
-    public static func extractLoginParameters(from html: String) throws -> LoginPageParameters {
+    package static func extractLoginParameters(from html: String) throws -> LoginPageParameters {
         let lt = try matchFirst(in: html, regex: ltRegex, label: "lt")
         let paramId = try matchFirst(in: html, regex: paramIdRegex, label: "paramId")
         let reqId = try matchFirst(in: html, regex: reqIdRegex, label: "reqId")
@@ -191,7 +191,7 @@ public enum Cloud189Protocol {
         return String(text[range])
     }
 
-    public static func parseQrPollPayload(_ body: String, statusCode: Int) throws -> QrPollResponse {
+    package static func parseQrPollPayload(_ body: String, statusCode: Int) throws -> QrPollResponse {
         let cleaned = normalizeBody(body)
         guard !cleaned.isEmpty else {
             throw CloudTuneError.protocolError("二维码轮询返回空响应，HTTP \(statusCode)")
@@ -223,7 +223,7 @@ public enum Cloud189Protocol {
         }
     }
 
-    public static func parseSessionResponse(
+    package static func parseSessionResponse(
         _ body: String,
         statusCode: Int,
         fallbackAccessToken: String = "",
@@ -298,7 +298,7 @@ public enum Cloud189Protocol {
         return ParsedSessionPayload(activeSession: active, persistedCredential: persisted)
     }
 
-    public static func isTrustedTianyiOrigin(_ url: URL) -> Bool {
+    package static func isTrustedTianyiOrigin(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "https",
               let rawHost = url.host?.lowercased() else {
             return false
@@ -313,7 +313,7 @@ public enum Cloud189Protocol {
             || host.hasSuffix(".e.189.cn")
     }
 
-    public static func isSameOrigin(_ a: URL, _ b: URL) -> Bool {
+    package static func isSameOrigin(_ a: URL, _ b: URL) -> Bool {
         guard let schemeA = a.scheme?.lowercased(),
               let schemeB = b.scheme?.lowercased(),
               schemeA == schemeB,
@@ -335,7 +335,7 @@ public enum Cloud189Protocol {
         return portA == portB
     }
 
-    public static func deriveFallbackAccountKey(
+    package static func deriveFallbackAccountKey(
         refreshToken: String? = nil,
         accessToken: String? = nil,
         sessionKey: String
@@ -348,7 +348,7 @@ public enum Cloud189Protocol {
         )
     }
 
-    public static func deriveFallbackAccountKey(
+    package static func deriveFallbackAccountKey(
         userId: String?,
         refreshToken: String? = nil,
         accessToken: String? = nil,
@@ -362,7 +362,7 @@ public enum Cloud189Protocol {
         return "acct:\(hex)"
     }
 
-    public static func resolveAccountIdentity(
+    package static func resolveAccountIdentity(
         activeSession: ActiveCloudSession,
         persistedCredential: PersistedRefreshCredential? = nil,
         priorAccountKey: String? = nil
@@ -385,7 +385,7 @@ public enum Cloud189Protocol {
         return (derived, Cloud189Constants.defaultAccountDisplayName)
     }
 
-    public static func extractAPIErrorMessage(_ body: String) -> String? {
+    package static func extractAPIErrorMessage(_ body: String) -> String? {
         guard let data = normalizeBody(body).data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
@@ -410,13 +410,13 @@ public enum Cloud189Protocol {
         return nil
     }
 
-    public static func accountBucketHash(for accountId: String) -> String {
+    package static func accountBucketHash(for accountId: String) -> String {
         let normalized = accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let digest = SHA256.hash(data: Data(normalized.utf8))
         return hexEncoded(digest, uppercase: false)
     }
 
-    public static func sanitizeFileName(_ raw: String) -> String {
+    package static func sanitizeFileName(_ raw: String) -> String {
         let mapped = String(raw.unicodeScalars.map { forbiddenFileNameCharacters.contains($0) ? "_" : Character($0) })
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if mapped.isEmpty {
@@ -480,22 +480,22 @@ public enum Cloud189Protocol {
         return mediaDescriptorsByExtension[ext.lowercased()]
     }
 
-    public static func isAudioFile(_ name: String) -> Bool {
+    package static func isAudioFile(_ name: String) -> Bool {
         if case .audio = mediaDescriptor(for: name)?.kind {
             return true
         }
         return false
     }
 
-    public static func isLosslessAudioFile(_ name: String) -> Bool {
+    package static func isLosslessAudioFile(_ name: String) -> Bool {
         mediaDescriptor(for: name)?.kind == .audio(isLossless: true)
     }
 
-    public static func isVideoFile(_ name: String) -> Bool {
+    package static func isVideoFile(_ name: String) -> Bool {
         mediaDescriptor(for: name)?.kind == .video
     }
 
-    public static func guessMimeType(for fileName: String) -> String {
+    package static func guessMimeType(for fileName: String) -> String {
         mediaDescriptor(for: fileName)?.mimeType ?? "application/octet-stream"
     }
 

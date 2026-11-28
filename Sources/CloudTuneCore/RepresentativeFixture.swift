@@ -2,49 +2,49 @@ import Foundation
 
 #if DEBUG
 public struct RepresentativeFixture: Codable, Equatable, Sendable {
-    public struct QrLoginFixture: Codable, Equatable, Sendable {
-        public var qrContent: String
-        public var message: String
-        public var host: String
+    package struct QrLoginFixture: Codable, Equatable, Sendable {
+        package var qrContent: String
+        package var message: String
+        package var host: String
     }
 
-    public struct SettingsFixture: Codable, Equatable, Sendable {
-        public var cacheLimitMb: UInt64
-        public var downloadThreads: Int
-        public var cacheThreads: Int
-        public var playbackMode: PlaybackMode
-        public var cacheUsageBytes: UInt64
-        public var appearanceMode: AppearanceMode?
-        public var dynamicColorEnabled: Bool?
+    package struct SettingsFixture: Codable, Equatable, Sendable {
+        package var cacheLimitMb: UInt64
+        package var downloadThreads: Int
+        package var cacheThreads: Int
+        package var playbackMode: PlaybackMode
+        package var cacheUsageBytes: UInt64
+        package var appearanceMode: AppearanceMode?
+        package var dynamicColorEnabled: Bool?
     }
 
-    public struct NowPlayingFixture: Codable, Equatable, Sendable {
-        public var trackId: String
-        public var title: String
-        public var artist: String
-        public var album: String
-        public var isPlaying: Bool
-        public var currentTimeSeconds: Double
-        public var durationSeconds: Double
-        public var shuffle: Bool
-        public var loopMode: LoopMode
-        public var statusMessage: String
+    package struct NowPlayingFixture: Codable, Equatable, Sendable {
+        package var trackId: String
+        package var title: String
+        package var artist: String
+        package var album: String
+        package var isPlaying: Bool
+        package var currentTimeSeconds: Double
+        package var durationSeconds: Double
+        package var shuffle: Bool
+        package var loopMode: LoopMode
+        package var statusMessage: String
     }
 
-    public struct ErrorBannerFixture: Codable, Equatable, Sendable {
-        public var statusMessage: String
+    package struct ErrorBannerFixture: Codable, Equatable, Sendable {
+        package var statusMessage: String
     }
 
-    public var accountName: String
-    public var currentFolder: FolderSelection
-    public var settings: SettingsFixture
-    public var qrLogin: QrLoginFixture
-    public var breadcrumbs: [BreadcrumbItem]
-    public var browser: FolderBrowsePayload
-    public var libraryTracks: [TrackSummary]
-    public var nowPlaying: NowPlayingFixture
-    public var transferSnapshot: TransferSnapshotPayload
-    public var errorBanner: ErrorBannerFixture
+    package var accountName: String
+    package var currentFolder: FolderSelection
+    package var settings: SettingsFixture
+    package var qrLogin: QrLoginFixture
+    package var breadcrumbs: [BreadcrumbItem]
+    package var browser: FolderBrowsePayload
+    package var libraryTracks: [TrackSummary]
+    package var nowPlaying: NowPlayingFixture
+    package var transferSnapshot: TransferSnapshotPayload
+    package var errorBanner: ErrorBannerFixture
 
     public static func load(from url: URL) throws -> RepresentativeFixture {
         let data = try Data(contentsOf: url)
@@ -53,8 +53,8 @@ public struct RepresentativeFixture: Codable, Equatable, Sendable {
 }
 #endif
 
-public enum CloudTuneFormatters {
-    public static func formatBytes(_ value: UInt64) -> String {
+package enum CloudTuneFormatters {
+    package static func formatBytes(_ value: UInt64) -> String {
         if value == 0 { return "0 MB" }
         let units = ["B", "KB", "MB", "GB", "TB"]
         var size = Double(value)
@@ -69,7 +69,7 @@ public enum CloudTuneFormatters {
         return String(format: "%.0f %@", size, units[index])
     }
 
-    public static func formatClock(_ seconds: Double) -> String {
+    package static func formatClock(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "00:00" }
         let total = Int(seconds.rounded(.down))
         let mins = total / 60
@@ -77,7 +77,7 @@ public enum CloudTuneFormatters {
         return String(format: "%02d:%02d", mins, secs)
     }
 
-    public static func formatPercent(transferred: UInt64, total: UInt64?) -> Double? {
+    package static func formatPercent(transferred: UInt64, total: UInt64?) -> Double? {
         guard let total, total > 0 else { return nil }
         return min(100.0, (Double(transferred) / Double(total)) * 100.0)
     }

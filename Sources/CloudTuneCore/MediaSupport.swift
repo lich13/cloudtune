@@ -13,12 +13,12 @@ import AppKit
 import UIKit
 #endif
 
-public enum QRCodeGenerator {
+package enum QRCodeGenerator {
     private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private static let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     /// Fixed warm-parchment `#F6F1E8` substrate and deep-pine `#13271F` modules across light & dark themes.
-    public static func generatePNGData(content: String, dimension: Int = 512) -> Data? {
+    package static func generatePNGData(content: String, dimension: Int = 512) -> Data? {
         guard !content.isEmpty,
               let filter = CIFilter(name: "CIQRCodeGenerator") else {
             return nil
@@ -40,8 +40,8 @@ public enum QRCodeGenerator {
     }
 }
 
-public enum AudioMetadataReader {
-    public static func readMetadata(
+package enum AudioMetadataReader {
+    package static func readMetadata(
         from fileURL: URL,
         fallbackTitle: String,
         fallbackAlbum: String
@@ -92,7 +92,7 @@ public enum AudioMetadataReader {
         )
     }
 
-    public static func compactArtworkData(_ rawArtwork: Data, maxPixelSize: Int = 1024) -> Data {
+    package static func compactArtworkData(_ rawArtwork: Data, maxPixelSize: Int = 1024) -> Data {
         guard !rawArtwork.isEmpty,
               let source = CGImageSourceCreateWithData(
                   rawArtwork as CFData,
@@ -155,19 +155,19 @@ public enum AudioMetadataReader {
     }
 }
 
-public struct RemoteCommandCallbacks: Sendable {
-    public var onPlay: @Sendable () -> Void
-    public var onPause: @Sendable () -> Void
-    public var onTogglePlayPause: @Sendable () -> Void
-    public var onNextTrack: @Sendable () -> Void
-    public var onPreviousTrack: @Sendable () -> Void
-    public var onSeekDelta: @Sendable (TimeInterval) -> Void
-    public var onSeekToPosition: @Sendable (TimeInterval) -> Void
-    public var onInterruptionBegan: @Sendable () -> Void
-    public var onInterruptionEndedShouldResume: @Sendable () -> Void
-    public var onOldAudioDeviceUnavailable: @Sendable () -> Void
+package struct RemoteCommandCallbacks: Sendable {
+    package var onPlay: @Sendable () -> Void
+    package var onPause: @Sendable () -> Void
+    package var onTogglePlayPause: @Sendable () -> Void
+    package var onNextTrack: @Sendable () -> Void
+    package var onPreviousTrack: @Sendable () -> Void
+    package var onSeekDelta: @Sendable (TimeInterval) -> Void
+    package var onSeekToPosition: @Sendable (TimeInterval) -> Void
+    package var onInterruptionBegan: @Sendable () -> Void
+    package var onInterruptionEndedShouldResume: @Sendable () -> Void
+    package var onOldAudioDeviceUnavailable: @Sendable () -> Void
 
-    public init(
+    package init(
         onPlay: @escaping @Sendable () -> Void,
         onPause: @escaping @Sendable () -> Void,
         onTogglePlayPause: @escaping @Sendable () -> Void,
@@ -192,20 +192,46 @@ public struct RemoteCommandCallbacks: Sendable {
     }
 }
 
+#if DEBUG
+package enum TestableRemoteCommand: Sendable {
+    case play
+    case pause
+    case togglePlayPause
+    case nextTrack
+    case previousTrack
+    case skipForward(TimeInterval)
+    case skipBackward(TimeInterval)
+    case changePlaybackPosition(TimeInterval?)
+}
+private typealias RemoteCommandDebugInvoker = @Sendable (TestableRemoteCommand) -> Bool
+#else
+private typealias RemoteCommandDebugInvoker = @Sendable (Never) -> Bool
+#endif
+
 private final class RegistrationBox: @unchecked Sendable {
     private let lock = NSLock()
     #if canImport(MediaPlayer)
     private var targets: [(MPRemoteCommand, Any)] = []
     #endif
     private var observers: [NSObjectProtocol] = []
+    #if DEBUG
+    private var debugInvoker: RemoteCommandDebugInvoker?
+    #endif
 
     #if canImport(MediaPlayer)
-    func replace(targets newTargets: [(MPRemoteCommand, Any)], observers newObservers: [NSObjectProtocol]) {
+    func replace(
+        targets newTargets: [(MPRemoteCommand, Any)],
+        observers newObservers: [NSObjectProtocol],
+        debugInvoker newDebugInvoker: RemoteCommandDebugInvoker? = nil
+    ) {
         let (oldTargets, oldObservers) = lock.withLock { () -> ([(MPRemoteCommand, Any)], [NSObjectProtocol]) in
             let prevT = targets
             let prevO = observers
             targets = newTargets
             observers = newObservers
+            #if DEBUG
+            debugInvoker = newDebugInvoker
+            #endif
             return (prevT, prevO)
         }
         for (cmd, target) in oldTargets {
@@ -217,6 +243,13 @@ private final class RegistrationBox: @unchecked Sendable {
     }
     #endif
 
+    #if DEBUG
+    func invokeForTesting(_ command: TestableRemoteCommand) -> Bool {
+        let invoker = lock.withLock { debugInvoker }
+        return invoker?(command) ?? false
+    }
+    #endif
+
     func clearAll() {
         #if canImport(MediaPlayer)
         let (oldTargets, oldObservers) = lock.withLock { () -> ([(MPRemoteCommand, Any)], [NSObjectProtocol]) in
@@ -224,6 +257,9 @@ private final class RegistrationBox: @unchecked Sendable {
             let prevO = observers
             targets.removeAll()
             observers.removeAll()
+            #if DEBUG
+            debugInvoker = nil
+            #endif
             return (prevT, prevO)
         }
         for (cmd, target) in oldTargets {
@@ -233,6 +269,9 @@ private final class RegistrationBox: @unchecked Sendable {
         let oldObservers = lock.withLock { () -> [NSObjectProtocol] in
             let prevO = observers
             observers.removeAll()
+            #if DEBUG
+            debugInvoker = nil
+            #endif
             return prevO
         }
         #endif
@@ -245,7 +284,7 @@ private final class RegistrationBox: @unchecked Sendable {
 /// Shared system media-center coordinator for BOTH macOS (Control Center / media keys while window hidden)
 /// and iOS/iPadOS (Lock Screen / Dynamic Island).
 @MainActor
-public final class NowPlayingCoordinator {
+package final class NowPlayingCoordinator {
     private struct PublishedNowPlayingKey: Equatable {
         let title: String
         let artist: String?
@@ -267,14 +306,14 @@ public final class NowPlayingCoordinator {
     private var lastPublishedUptime: TimeInterval = 0
     private var lastCommandAvailability: (next: Bool, prev: Bool, seek: Bool)?
 
-    public init() {}
+    package init() {}
 
     deinit {
         registrations.clearAll()
     }
 
     @discardableResult
-    public func configureAudioSessionIfNeeded() -> String? {
+    package func configureAudioSessionIfNeeded() -> String? {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
@@ -289,59 +328,114 @@ public final class NowPlayingCoordinator {
         #endif
     }
 
-    public func registerRemoteCommands(_ callbacks: RemoteCommandCallbacks) {
+    package func registerRemoteCommands(_ callbacks: RemoteCommandCallbacks) {
         #if canImport(MediaPlayer)
         unregisterRemoteCommands()
         let center = MPRemoteCommandCenter.shared()
         let installed = Self.installRemoteHandlers(center: center, callbacks: callbacks)
-        registrations.replace(targets: installed.targets, observers: installed.observers)
+        registrations.replace(
+            targets: installed.targets,
+            observers: installed.observers,
+            debugInvoker: installed.debugInvoker
+        )
         #endif
     }
+
+    #if DEBUG
+    package nonisolated func invokeRemoteCommandForTesting(_ command: TestableRemoteCommand) -> Bool {
+        registrations.invokeForTesting(command)
+    }
+    #endif
 
     #if canImport(MediaPlayer)
     nonisolated private static func installRemoteHandlers(
         center: MPRemoteCommandCenter,
         callbacks: RemoteCommandCallbacks
-    ) -> (targets: [(MPRemoteCommand, Any)], observers: [NSObjectProtocol]) {
-        let playTarget = center.playCommand.addTarget { _ in
+    ) -> (
+        targets: [(MPRemoteCommand, Any)],
+        observers: [NSObjectProtocol],
+        debugInvoker: RemoteCommandDebugInvoker?
+    ) {
+        let handlePlay: @Sendable () -> MPRemoteCommandHandlerStatus = {
             callbacks.onPlay()
             return .success
         }
-        let pauseTarget = center.pauseCommand.addTarget { _ in
+        let handlePause: @Sendable () -> MPRemoteCommandHandlerStatus = {
             callbacks.onPause()
             return .success
         }
-        let toggleTarget = center.togglePlayPauseCommand.addTarget { _ in
+        let handleToggle: @Sendable () -> MPRemoteCommandHandlerStatus = {
             callbacks.onTogglePlayPause()
             return .success
         }
-        let nextTarget = center.nextTrackCommand.addTarget { _ in
+        let handleNext: @Sendable () -> MPRemoteCommandHandlerStatus = {
             callbacks.onNextTrack()
             return .success
         }
-        let prevTarget = center.previousTrackCommand.addTarget { _ in
+        let handlePrev: @Sendable () -> MPRemoteCommandHandlerStatus = {
             callbacks.onPreviousTrack()
             return .success
         }
-        center.skipForwardCommand.preferredIntervals = [15]
-        let skipFwdTarget = center.skipForwardCommand.addTarget { event in
-            let delta = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+        let handleSkipForward: @Sendable (TimeInterval) -> MPRemoteCommandHandlerStatus = { delta in
             callbacks.onSeekDelta(delta)
             return .success
         }
-        center.skipBackwardCommand.preferredIntervals = [15]
-        let skipBackTarget = center.skipBackwardCommand.addTarget { event in
-            let delta = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+        let handleSkipBackward: @Sendable (TimeInterval) -> MPRemoteCommandHandlerStatus = { delta in
             callbacks.onSeekDelta(-delta)
             return .success
         }
-        let seekTarget = center.changePlaybackPositionCommand.addTarget { event in
-            if let pos = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime {
+        let handleSeekPosition: @Sendable (TimeInterval?) -> MPRemoteCommandHandlerStatus = { pos in
+            if let pos {
                 callbacks.onSeekToPosition(pos)
                 return .success
             }
             return .commandFailed
         }
+
+        let playTarget = center.playCommand.addTarget { _ in handlePlay() }
+        let pauseTarget = center.pauseCommand.addTarget { _ in handlePause() }
+        let toggleTarget = center.togglePlayPauseCommand.addTarget { _ in handleToggle() }
+        let nextTarget = center.nextTrackCommand.addTarget { _ in handleNext() }
+        let prevTarget = center.previousTrackCommand.addTarget { _ in handlePrev() }
+        center.skipForwardCommand.preferredIntervals = [15]
+        let skipFwdTarget = center.skipForwardCommand.addTarget { event in
+            let delta = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            return handleSkipForward(delta)
+        }
+        center.skipBackwardCommand.preferredIntervals = [15]
+        let skipBackTarget = center.skipBackwardCommand.addTarget { event in
+            let delta = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            return handleSkipBackward(delta)
+        }
+        let seekTarget = center.changePlaybackPositionCommand.addTarget { event in
+            handleSeekPosition((event as? MPChangePlaybackPositionCommandEvent)?.positionTime)
+        }
+
+        #if DEBUG
+        let debugInvoker: @Sendable (TestableRemoteCommand) -> Bool = { command in
+            let status: MPRemoteCommandHandlerStatus = switch command {
+            case .play:
+                handlePlay()
+            case .pause:
+                handlePause()
+            case .togglePlayPause:
+                handleToggle()
+            case .nextTrack:
+                handleNext()
+            case .previousTrack:
+                handlePrev()
+            case let .skipForward(delta):
+                handleSkipForward(delta)
+            case let .skipBackward(delta):
+                handleSkipBackward(delta)
+            case let .changePlaybackPosition(pos):
+                handleSeekPosition(pos)
+            }
+            return status == .success
+        }
+        #else
+        let debugInvoker: RemoteCommandDebugInvoker? = nil
+        #endif
 
         let targets: [(MPRemoteCommand, Any)] = [
             (center.playCommand, playTarget),
@@ -391,16 +485,16 @@ public final class NowPlayingCoordinator {
         }
         observers = [interruptionToken, routeToken]
         #endif
-        return (targets: targets, observers: observers)
+        return (targets: targets, observers: observers, debugInvoker: debugInvoker)
     }
     #endif
 
-    public func unregisterRemoteCommands() {
+    package func unregisterRemoteCommands() {
         registrations.clearAll()
         lastCommandAvailability = nil
     }
 
-    public func updateCommandAvailability(canSkipNext: Bool, canSkipPrevious: Bool, hasActiveTrack: Bool) {
+    package func updateCommandAvailability(canSkipNext: Bool, canSkipPrevious: Bool, hasActiveTrack: Bool) {
         #if canImport(MediaPlayer)
         let nextTuple = (next: canSkipNext, prev: canSkipPrevious, seek: hasActiveTrack)
         if let prev = lastCommandAvailability,
@@ -419,7 +513,7 @@ public final class NowPlayingCoordinator {
         #endif
     }
 
-    public func updateNowPlaying(
+    package func updateNowPlaying(
         metadata: NowPlayingMetadata?,
         isPlaying: Bool,
         elapsedSeconds: TimeInterval,
@@ -508,7 +602,7 @@ public final class NowPlayingCoordinator {
         return created
     }
 
-    nonisolated public static func makeMediaArtwork(from data: Data) -> MPMediaItemArtwork? {
+    nonisolated package static func makeMediaArtwork(from data: Data) -> MPMediaItemArtwork? {
         guard !data.isEmpty,
               let src = CGImageSourceCreateWithData(
                   data as CFData,

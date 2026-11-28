@@ -1,25 +1,25 @@
 import CryptoKit
 import Foundation
 
-public enum LoopMode: String, Codable, CaseIterable, Sendable {
+package enum LoopMode: String, Codable, CaseIterable, Sendable {
     case off
     case all
     case one
 }
 
-public enum StatusKind: String, Codable, Equatable, Sendable {
+package enum StatusKind: String, Codable, Equatable, Sendable {
     case info
     case error
 }
 
-public enum AppearanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
+package enum AppearanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case system
     case light
     case dark
 
-    public var id: String { rawValue }
+    package var id: String { rawValue }
 
-    public var title: String {
+    package var title: String {
         switch self {
         case .system: return "跟随系统"
         case .light: return "浅色"
@@ -27,18 +27,18 @@ public enum AppearanceMode: String, Codable, CaseIterable, Identifiable, Sendabl
         }
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = (try? container.decode(String.self))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "system"
         self = AppearanceMode(rawValue: raw) ?? .system
     }
 }
 
-public enum PlaybackMode: String, Codable, CaseIterable, Sendable {
+package enum PlaybackMode: String, Codable, CaseIterable, Sendable {
     case downloadFirst = "download_first"
     case streamCache = "stream_cache"
 
-    public var displayTitle: String {
+    package var displayTitle: String {
         switch self {
         case .downloadFirst: return "优先缓存"
         case .streamCache: return "边播边缓存"
@@ -46,16 +46,16 @@ public enum PlaybackMode: String, Codable, CaseIterable, Sendable {
     }
 }
 
-public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
+package enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
     case music
     case video
     case cloud
     case transfers
     case settings
 
-    public var id: String { rawValue }
+    package var id: String { rawValue }
 
-    public var title: String {
+    package var title: String {
         switch self {
         case .music: return "曲库"
         case .video: return "视频"
@@ -65,7 +65,7 @@ public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    public var systemImage: String {
+    package var systemImage: String {
         switch self {
         case .music: return "music.note.list"
         case .video: return "film"
@@ -75,7 +75,7 @@ public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = (try? container.decode(String.self))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "music"
         if raw == "download" {
@@ -87,13 +87,13 @@ public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 /// Active authenticated session with non-empty signing keys for the current process run.
-public struct ActiveCloudSession: Equatable, Sendable {
-    public let accessToken: String
-    public let sessionKey: String
-    public let sessionSecret: String
-    public let loginName: String?
+package struct ActiveCloudSession: Equatable, Sendable {
+    package let accessToken: String
+    package let sessionKey: String
+    package let sessionSecret: String
+    package let loginName: String?
 
-    public init?(
+    package init?(
         accessToken: String = "",
         sessionKey: String,
         sessionSecret: String,
@@ -110,12 +110,12 @@ public struct ActiveCloudSession: Equatable, Sendable {
 }
 
 /// Persisted cold-start refresh credential. Only created when a non-empty refreshToken exists.
-public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
-    public let refreshToken: String
-    public let accountName: String?
-    public let accountKey: String?
+package struct PersistedRefreshCredential: Codable, Equatable, Sendable {
+    package let refreshToken: String
+    package let accountName: String?
+    package let accountKey: String?
 
-    public init?(refreshToken: String, accountName: String?, accountKey: String? = nil) {
+    package init?(refreshToken: String, accountName: String?, accountKey: String? = nil) {
         let trimmed = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         self.refreshToken = trimmed
@@ -125,7 +125,7 @@ public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
         self.accountKey = normalizedKey ?? normalizedName
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let rawToken = (try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -138,39 +138,39 @@ public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
         self.accountKey = (try c.decodeIfPresent(String.self, forKey: .accountKey))?.trimmedNilIfEmpty ?? decodedName
     }
 
-    public func withAccountKey(_ key: String) -> PersistedRefreshCredential {
+    package func withAccountKey(_ key: String) -> PersistedRefreshCredential {
         PersistedRefreshCredential(refreshToken: refreshToken, accountName: accountName, accountKey: key) ?? self
     }
 }
 
-public struct FolderSelection: Codable, Equatable, Hashable, Sendable {
-    public var id: String
-    public var name: String
+package struct FolderSelection: Codable, Equatable, Hashable, Sendable {
+    package var id: String
+    package var name: String
 
-    public init(id: String, name: String) {
+    package init(id: String, name: String) {
         self.id = id
         self.name = name
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? Cloud189Constants.rootFolderId
         self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? Cloud189Constants.rootFolderName
     }
 }
 
-public struct RemoteFolder: Codable, Equatable, Identifiable, Sendable {
-    public var id: String
-    public var name: String
-    public var parentId: String?
+package struct RemoteFolder: Codable, Equatable, Identifiable, Sendable {
+    package var id: String
+    package var name: String
+    package var parentId: String?
 
-    public init(id: String, name: String, parentId: String? = nil) {
+    package init(id: String, name: String, parentId: String? = nil) {
         self.id = id
         self.name = name
         self.parentId = parentId
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
@@ -178,26 +178,26 @@ public struct RemoteFolder: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-public struct BreadcrumbItem: Codable, Equatable, Hashable, Sendable {
-    public var id: String?
-    public var name: String
+package struct BreadcrumbItem: Codable, Equatable, Hashable, Sendable {
+    package var id: String?
+    package var name: String
 
-    public init(id: String?, name: String) {
+    package init(id: String?, name: String) {
         self.id = id
         self.name = name
     }
 
-    public static let root = BreadcrumbItem(id: nil, name: Cloud189Constants.rootFolderName)
+    package static let root = BreadcrumbItem(id: nil, name: Cloud189Constants.rootFolderName)
 }
 
-public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable {
-    public var id: String
-    public var name: String
-    public var folderPath: String
-    public var sizeBytes: UInt64
-    public var modifiedAt: String?
+package struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable {
+    package var id: String
+    package var name: String
+    package var folderPath: String
+    package var sizeBytes: UInt64
+    package var modifiedAt: String?
 
-    public init(
+    package init(
         id: String,
         name: String,
         folderPath: String,
@@ -211,7 +211,7 @@ public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable
         self.modifiedAt = modifiedAt
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
@@ -220,27 +220,27 @@ public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable
         self.modifiedAt = try c.decodeIfPresent(String.self, forKey: .modifiedAt)
     }
 
-    public var fileExtensionUpper: String {
+    package var fileExtensionUpper: String {
         let ext = (name as NSString).pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
         return ext.uppercased()
     }
 
-    public var isLosslessAudio: Bool {
+    package var isLosslessAudio: Bool {
         Cloud189Protocol.isLosslessAudioFile(name)
     }
 }
 
-public struct FolderBrowsePayload: Codable, Equatable, Sendable {
-    public var currentFolderId: String
-    public var currentFolderName: String
-    public var parentFolderId: String?
-    public var isRoot: Bool
-    public var folders: [RemoteFolder]
-    public var audioFiles: [TrackSummary]
-    public var videoFiles: [TrackSummary]
-    public var otherFiles: [TrackSummary]
+package struct FolderBrowsePayload: Codable, Equatable, Sendable {
+    package var currentFolderId: String
+    package var currentFolderName: String
+    package var parentFolderId: String?
+    package var isRoot: Bool
+    package var folders: [RemoteFolder]
+    package var audioFiles: [TrackSummary]
+    package var videoFiles: [TrackSummary]
+    package var otherFiles: [TrackSummary]
 
-    public init(
+    package init(
         currentFolderId: String,
         currentFolderName: String,
         parentFolderId: String? = nil,
@@ -260,7 +260,7 @@ public struct FolderBrowsePayload: Codable, Equatable, Sendable {
         self.otherFiles = otherFiles
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.currentFolderId = try c.decodeIfPresent(String.self, forKey: .currentFolderId) ?? Cloud189Constants.rootFolderId
         self.currentFolderName = try c.decodeIfPresent(String.self, forKey: .currentFolderName) ?? Cloud189Constants.rootFolderName
@@ -273,21 +273,21 @@ public struct FolderBrowsePayload: Codable, Equatable, Sendable {
     }
 }
 
-public struct AccountSettings: Codable, Equatable, Sendable {
-    public static let minCacheLimitMB: UInt64 = 256
-    public static let maxDownloadThreads: Int = 16
-    public static let maxCacheThreads: Int = 8
+package struct AccountSettings: Codable, Equatable, Sendable {
+    package static let minCacheLimitMB: UInt64 = 256
+    package static let maxDownloadThreads: Int = 16
+    package static let maxCacheThreads: Int = 8
 
-    public var musicFolder: FolderSelection?
-    public var cacheLimitMb: UInt64
-    public var downloadThreads: Int
-    public var cacheThreads: Int
-    public var playbackMode: PlaybackMode
-    public var exportFolderDisplayName: String?
-    public var appearanceMode: AppearanceMode
-    public var dynamicColorEnabled: Bool
+    package var musicFolder: FolderSelection?
+    package var cacheLimitMb: UInt64
+    package var downloadThreads: Int
+    package var cacheThreads: Int
+    package var playbackMode: PlaybackMode
+    package var exportFolderDisplayName: String?
+    package var appearanceMode: AppearanceMode
+    package var dynamicColorEnabled: Bool
 
-    public init(
+    package init(
         musicFolder: FolderSelection? = nil,
         cacheLimitMb: UInt64 = 1024,
         downloadThreads: Int = 8,
@@ -307,11 +307,11 @@ public struct AccountSettings: Codable, Equatable, Sendable {
         self.dynamicColorEnabled = dynamicColorEnabled
     }
 
-    public var cacheLimitBytes: UInt64 {
+    package var cacheLimitBytes: UInt64 {
         cacheLimitMb * 1024 * 1024
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.musicFolder = try c.decodeIfPresent(FolderSelection.self, forKey: .musicFolder)
         let rawLimit = try c.decodeIfPresent(UInt64.self, forKey: .cacheLimitMb) ?? 1024
@@ -327,20 +327,20 @@ public struct AccountSettings: Codable, Equatable, Sendable {
     }
 }
 
-public struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
-    public var id: String
-    public var label: String
-    public var kind: String
-    public var state: String
-    public var path: String?
-    public var canPause: Bool
-    public var canResume: Bool
-    public var canDelete: Bool
-    public var bytesPerSecond: UInt64
-    public var transferredBytes: UInt64
-    public var totalBytes: UInt64?
+package struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
+    package var id: String
+    package var label: String
+    package var kind: String
+    package var state: String
+    package var path: String?
+    package var canPause: Bool
+    package var canResume: Bool
+    package var canDelete: Bool
+    package var bytesPerSecond: UInt64
+    package var transferredBytes: UInt64
+    package var totalBytes: UInt64?
 
-    public init(
+    package init(
         id: String,
         label: String,
         kind: String,
@@ -366,7 +366,7 @@ public struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
         self.totalBytes = totalBytes
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         self.label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
@@ -381,7 +381,7 @@ public struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
         self.totalBytes = try c.decodeIfPresent(UInt64.self, forKey: .totalBytes)
     }
 
-    public var localizedStateLabel: String {
+    package var localizedStateLabel: String {
         switch state {
         case "running":
             return "传输中"
@@ -403,32 +403,32 @@ public struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-public struct TransferSnapshotPayload: Codable, Equatable, Sendable {
-    public var totalSpeedBytesPerSecond: UInt64
-    public var items: [TransferStatus]
+package struct TransferSnapshotPayload: Codable, Equatable, Sendable {
+    package var totalSpeedBytesPerSecond: UInt64
+    package var items: [TransferStatus]
 
-    public init(totalSpeedBytesPerSecond: UInt64 = 0, items: [TransferStatus] = []) {
+    package init(totalSpeedBytesPerSecond: UInt64 = 0, items: [TransferStatus] = []) {
         self.totalSpeedBytesPerSecond = totalSpeedBytesPerSecond
         self.items = items
     }
 
-    public var hasActiveItems: Bool {
+    package var hasActiveItems: Bool {
         items.contains { $0.state == "running" || $0.state == "streaming" }
     }
 }
 
-public struct QueueStepResult: Equatable, Sendable {
-    public let track: TrackSummary?
-    public let remainingUpNext: [TrackSummary]
+package struct QueueStepResult: Equatable, Sendable {
+    package let track: TrackSummary?
+    package let remainingUpNext: [TrackSummary]
 
-    public init(track: TrackSummary?, remainingUpNext: [TrackSummary]) {
+    package init(track: TrackSummary?, remainingUpNext: [TrackSummary]) {
         self.track = track
         self.remainingUpNext = remainingUpNext
     }
 }
 
-public enum PlaybackQueueResolver {
-    public static func buildShuffleOrder(tracks: [TrackSummary], anchorTrackId: String?) -> [String] {
+package enum PlaybackQueueResolver {
+    package static func buildShuffleOrder(tracks: [TrackSummary], anchorTrackId: String?) -> [String] {
         guard !tracks.isEmpty else { return [] }
         var rest = tracks.map(\.id)
         if let anchorTrackId, let idx = rest.firstIndex(of: anchorTrackId) {
@@ -440,24 +440,32 @@ public enum PlaybackQueueResolver {
         return rest
     }
 
-    public static func orderedBaseTracks(
+    package static func orderedBaseTracks(
         libraryTracks: [TrackSummary],
         shuffle: Bool,
-        shuffleOrderIds: [String]
+        shuffleOrderIds: [String],
+        tracksById: [String: TrackSummary]? = nil
     ) -> [TrackSummary] {
         guard shuffle, libraryTracks.count > 1 else {
             return libraryTracks
         }
-        var byId: [String: TrackSummary] = [:]
-        byId.reserveCapacity(libraryTracks.count)
-        for track in libraryTracks where byId[track.id] == nil {
-            byId[track.id] = track
+        let lookup: [String: TrackSummary]
+        if let tracksById {
+            lookup = tracksById
+        } else {
+            var byId: [String: TrackSummary] = [:]
+            byId.reserveCapacity(libraryTracks.count)
+            for track in libraryTracks where byId[track.id] == nil {
+                byId[track.id] = track
+            }
+            lookup = byId
         }
         var result: [TrackSummary] = []
         result.reserveCapacity(libraryTracks.count)
         var seen = Set<String>()
+        seen.reserveCapacity(libraryTracks.count)
         for id in shuffleOrderIds {
-            if let track = byId[id], seen.insert(id).inserted {
+            if let track = lookup[id], seen.insert(id).inserted {
                 result.append(track)
             }
         }
@@ -467,38 +475,52 @@ public enum PlaybackQueueResolver {
         return result
     }
 
-    public static func insertPlayNext(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
+    package static func insertPlayNext(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
         [track] + upNext.filter { $0.id != track.id }
     }
 
-    public static func appendToQueue(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
+    package static func appendToQueue(upNext: [TrackSummary], track: TrackSummary) -> [TrackSummary] {
         if upNext.contains(where: { $0.id == track.id }) {
             return upNext
         }
         return upNext + [track]
     }
 
-    public static func removeFromQueue(upNext: [TrackSummary], trackId: String) -> [TrackSummary] {
+    package static func removeFromQueue(upNext: [TrackSummary], trackId: String) -> [TrackSummary] {
         upNext.filter { $0.id != trackId }
     }
 
-    public static func canSkipNext(
+    private static func resolveIndex(
+        of trackId: String,
+        in ordered: [TrackSummary],
+        indexById: [String: Int]?
+    ) -> Int? {
+        if let indexById {
+            return indexById[trackId]
+        }
+        return ordered.firstIndex { $0.id == trackId }
+    }
+
+    package static func canSkipNext(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         upNextQueue: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> Bool {
         if !upNextQueue.isEmpty {
             return true
         }
-        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        let ordered = orderedTracks
+            ?? orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
         guard !ordered.isEmpty else {
             return currentTrack != nil && loopMode == .one
         }
         guard let currentId = currentTrack?.id,
-              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+              let idx = resolveIndex(of: currentId, in: ordered, indexById: orderedIndexById) else {
             return true
         }
         if idx + 1 < ordered.count {
@@ -507,19 +529,22 @@ public enum PlaybackQueueResolver {
         return loopMode != .off
     }
 
-    public static func canSkipPrevious(
+    package static func canSkipPrevious(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> Bool {
-        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        let ordered = orderedTracks
+            ?? orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
         guard !ordered.isEmpty else {
             return currentTrack != nil && loopMode == .one
         }
         guard let currentId = currentTrack?.id,
-              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+              let idx = resolveIndex(of: currentId, in: ordered, indexById: orderedIndexById) else {
             return true
         }
         if idx > 0 {
@@ -528,14 +553,16 @@ public enum PlaybackQueueResolver {
         return loopMode != .off
     }
 
-    public static func resolveNext(
+    package static func resolveNext(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         upNextQueue: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
         loopMode: LoopMode,
-        autoAdvanceAtEnd: Bool = false
+        autoAdvanceAtEnd: Bool = false,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> QueueStepResult {
         if autoAdvanceAtEnd && loopMode == .one {
             return QueueStepResult(track: currentTrack, remainingUpNext: upNextQueue)
@@ -543,13 +570,14 @@ public enum PlaybackQueueResolver {
         if let firstUpNext = upNextQueue.first {
             return QueueStepResult(track: firstUpNext, remainingUpNext: Array(upNextQueue.dropFirst()))
         }
-        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        let ordered = orderedTracks
+            ?? orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
         guard !ordered.isEmpty else {
             let fallback = loopMode == .one ? currentTrack : nil
             return QueueStepResult(track: fallback, remainingUpNext: upNextQueue)
         }
         guard let currentId = currentTrack?.id,
-              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+              let idx = resolveIndex(of: currentId, in: ordered, indexById: orderedIndexById) else {
             return QueueStepResult(track: ordered.first, remainingUpNext: upNextQueue)
         }
         if idx + 1 < ordered.count {
@@ -565,21 +593,24 @@ public enum PlaybackQueueResolver {
         }
     }
 
-    public static func resolvePrevious(
+    package static func resolvePrevious(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         upNextQueue: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> QueueStepResult {
-        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        let ordered = orderedTracks
+            ?? orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
         guard !ordered.isEmpty else {
             let fallback = loopMode == .one ? currentTrack : nil
             return QueueStepResult(track: fallback, remainingUpNext: upNextQueue)
         }
         guard let currentId = currentTrack?.id,
-              let idx = ordered.firstIndex(where: { $0.id == currentId }) else {
+              let idx = resolveIndex(of: currentId, in: ordered, indexById: orderedIndexById) else {
             return QueueStepResult(track: ordered.last ?? ordered.first, remainingUpNext: upNextQueue)
         }
         if idx > 0 {
@@ -595,13 +626,15 @@ public enum PlaybackQueueResolver {
         }
     }
 
-    public static func peekPrefetchCandidate(
+    package static func peekPrefetchCandidate(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         upNextQueue: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
-        loopMode: LoopMode
+        loopMode: LoopMode,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> TrackSummary? {
         guard loopMode != .one else { return nil }
         return resolveNext(
@@ -611,24 +644,29 @@ public enum PlaybackQueueResolver {
             shuffle: shuffle,
             shuffleOrderIds: shuffleOrderIds,
             loopMode: loopMode,
-            autoAdvanceAtEnd: true
+            autoAdvanceAtEnd: true,
+            orderedTracks: orderedTracks,
+            orderedIndexById: orderedIndexById
         ).track
     }
 
-    public static func upcomingPreview(
+    package static func upcomingPreview(
         currentTrack: TrackSummary?,
         libraryTracks: [TrackSummary],
         upNextQueue: [TrackSummary],
         shuffle: Bool,
         shuffleOrderIds: [String],
         loopMode: LoopMode,
-        limit: Int = 20
+        limit: Int = 20,
+        orderedTracks: [TrackSummary]? = nil,
+        orderedIndexById: [String: Int]? = nil
     ) -> [TrackSummary] {
         guard limit > 0 else { return [] }
         var out: [TrackSummary] = Array(upNextQueue.prefix(limit))
         if out.count >= limit { return out }
 
-        let ordered = orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
+        let ordered = orderedTracks
+            ?? orderedBaseTracks(libraryTracks: libraryTracks, shuffle: shuffle, shuffleOrderIds: shuffleOrderIds)
         guard !ordered.isEmpty else { return out }
 
         var queuedIds = Set(out.map(\.id))
@@ -638,7 +676,7 @@ public enum PlaybackQueueResolver {
 
         let anchorId = upNextQueue.last?.id ?? currentTrack?.id
         let startIndex: Int
-        if let anchorId, let idx = ordered.firstIndex(where: { $0.id == anchorId }) {
+        if let anchorId, let idx = resolveIndex(of: anchorId, in: ordered, indexById: orderedIndexById) {
             startIndex = idx + 1
         } else {
             startIndex = 0
@@ -660,31 +698,31 @@ public enum PlaybackQueueResolver {
     }
 }
 
-public struct QrLoginStart: Codable, Equatable, Sendable {
-    public var qrContent: String
-    public var message: String
+package struct QrLoginStart: Codable, Equatable, Sendable {
+    package var qrContent: String
+    package var message: String
 
-    public init(qrContent: String, message: String) {
+    package init(qrContent: String, message: String) {
         self.qrContent = qrContent
         self.message = message
     }
 }
 
-public enum QrLoginState: String, Codable, Equatable, Sendable {
+package enum QrLoginState: String, Codable, Equatable, Sendable {
     case waitingScan = "waiting_scan"
     case waitingConfirm = "waiting_confirm"
     case authenticated = "authenticated"
     case expired = "expired"
 }
 
-public struct QrPollResponse: Equatable, Sendable {
-    public var state: QrLoginState
-    public var message: String
-    public var accountName: String?
-    public var redirectURL: String?
-    public var sessionEpoch: UInt64?
+package struct QrPollResponse: Equatable, Sendable {
+    package var state: QrLoginState
+    package var message: String
+    package var accountName: String?
+    package var redirectURL: String?
+    package var sessionEpoch: UInt64?
 
-    public init(
+    package init(
         state: QrLoginState,
         message: String,
         accountName: String? = nil,
@@ -699,18 +737,18 @@ public struct QrPollResponse: Equatable, Sendable {
     }
 }
 
-public struct NowPlayingMetadata: Equatable, Sendable {
-    public var title: String
-    public var artist: String?
-    public var album: String?
-    public var artworkData: Data? {
+package struct NowPlayingMetadata: Equatable, Sendable {
+    package var title: String
+    package var artist: String?
+    package var album: String?
+    package var artworkData: Data? {
         didSet {
             artworkDigest = artworkData.map { SHA256.hash(data: $0) }
         }
     }
-    public private(set) var artworkDigest: SHA256Digest?
+    package private(set) var artworkDigest: SHA256Digest?
 
-    public init(title: String, artist: String? = nil, album: String? = nil, artworkData: Data? = nil) {
+    package init(title: String, artist: String? = nil, album: String? = nil, artworkData: Data? = nil) {
         self.title = title
         self.artist = artist
         self.album = album
@@ -719,7 +757,7 @@ public struct NowPlayingMetadata: Equatable, Sendable {
     }
 }
 
-public extension String {
+package extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }

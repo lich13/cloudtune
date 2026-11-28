@@ -8,8 +8,9 @@ import UIKit
 import UniformTypeIdentifiers
 
 public struct IOSRootView: View {
-    @Bindable public var viewModel: CloudTuneViewModel
+    @Bindable private var viewModel: CloudTuneViewModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.colorScheme) private var colorScheme
     @State private var isShowingFolderPicker = false
     @State private var isShowingShareSheet = false
@@ -17,12 +18,13 @@ public struct IOSRootView: View {
     @State private var pendingExportPane: BrowserPaneState?
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var hapticCounter: Int = 0
-    @State private var scrubPreviewSeconds: Double?
     @State private var pendingIPadSearchFocus: Bool = false
+    @State private var isRevertingInvalidSettingsTabSwitch: Bool = false
     @FocusState private var isIPadSearchFocused: Bool
 
     public init(viewModel: CloudTuneViewModel) {
         self.viewModel = viewModel
+        IOSTabBarAppearance.apply()
     }
 
     private var isDark: Bool {
@@ -50,11 +52,6 @@ public struct IOSRootView: View {
             } else {
                 iphoneAdaptiveLayout(palette: palette)
             }
-
-            if viewModel.isAuthenticated && viewModel.isShowingNowPlaying && !viewModel.hasActivePlayerObservers {
-                iosFullPlayerView(palette: palette)
-                    .transition(.move(edge: .bottom))
-            }
         }
         .tint(palette.accent)
         .preferredColorScheme(viewModel.appearancePreference.preferredColorScheme)
@@ -62,15 +59,14 @@ public struct IOSRootView: View {
         .sheet(isPresented: $viewModel.isShowingWebLoginSheet) {
             TianyiWebLoginSheet(viewModel: viewModel)
         }
-        .sheet(
-            isPresented: Binding(
-                get: { viewModel.isShowingNowPlaying && viewModel.hasActivePlayerObservers },
-                set: { viewModel.isShowingNowPlaying = $0 }
+        .sheet(isPresented: $viewModel.isShowingNowPlaying) {
+            IOSFullPlayerView(
+                viewModel: viewModel,
+                palette: palette,
+                onHaptic: { hapticCounter += 1 }
             )
-        ) {
-            iosFullPlayerView(palette: palette)
-                .presentationDetents([.large])
-                .presentationDragIndicator(.visible)
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $isShowingFolderPicker, onDismiss: {
             pendingExportTrack = nil
@@ -114,10 +110,26 @@ public struct IOSRootView: View {
                 isIPadSearchFocused = false
             }
         }
-        .onChange(of: viewModel.activeModule) { _, nextModule in
+        .onChange(of: viewModel.activeModule) { oldModule, nextModule in
             if nextModule != .music {
                 pendingIPadSearchFocus = false
                 isIPadSearchFocused = false
+            }
+            if isRevertingInvalidSettingsTabSwitch {
+                isRevertingInvalidSettingsTabSwitch = false
+                return
+            }
+            if horizontalSizeClass == .regular {
+                if nextModule == .settings {
+                    viewModel.isShowingSettingsSheet = true
+                }
+            } else if oldModule == .settings, nextModule != .settings, viewModel.isAuthenticated, viewModel.hasUnsavedSettingsDrafts {
+                Task { @MainActor in
+                    if !(await viewModel.commitPendingSettingsDraftsIfNeeded()) {
+                        isRevertingInvalidSettingsTabSwitch = true
+                        viewModel.activeModule = .settings
+                    }
+                }
             }
         }
         .sheet(isPresented: $isShowingShareSheet) {
@@ -257,7 +269,7 @@ public struct IOSRootView: View {
     private func iphoneAdaptiveLayout(palette: CloudTunePalette) -> some View {
         if viewModel.activeModule == .settings {
             NavigationStack {
-                iosSettingsContent(palette: palette)
+                IOSSettingsFormView(viewModel: viewModel, palette: palette)
                     .navigationTitle("设置")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbarBackground(.visible, for: .navigationBar)
@@ -265,48 +277,66 @@ public struct IOSRootView: View {
                     .toolbar {
                         ToolbarItem(placement: .topBarLeading) {
                             Button("完成") {
-                                viewModel.activeModule = .music
+                                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                Task { @MainActor in
+                                    if await viewModel.commitPendingSettingsDraftsIfNeeded() {
+                                        viewModel.activeModule = .music
+                                    }
+                                }
+                            }
+                        }
+                        if viewModel.hasUnsavedSettingsDrafts {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("还原修改") {
+                                    viewModel.syncDraftsFromCommitted()
+                                }
                             }
                         }
                     }
             }
         } else {
-            TabView(selection: $viewModel.activeModule) {
-                ForEach(iphoneTabs) { tab in
-                    NavigationStack {
-                        moduleBody(for: tab, palette: palette)
-                            .navigationTitle(tab.title)
-                            .navigationBarTitleDisplayMode(.inline)
-                            .toolbarBackground(.visible, for: .navigationBar)
-                            .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
-                            .toolbarBackground(.visible, for: .tabBar)
-                            .toolbarBackground(palette.surfacePrimary, for: .tabBar)
-                            .toolbar {
-                                ToolbarItem(placement: .topBarTrailing) {
-                                    Button {
-                                        viewModel.activeModule = .settings
-                                    } label: {
-                                        Image(systemName: "gearshape")
+            let tabBarHeight: CGFloat = verticalSizeClass == .compact ? 32 : 49
+            let miniPlayerReservedHeight: CGFloat = 68
+            ZStack(alignment: .bottom) {
+                TabView(selection: $viewModel.activeModule) {
+                    ForEach(iphoneTabs) { tab in
+                        NavigationStack {
+                            moduleBody(for: tab, palette: palette)
+                                .contentMargins(.bottom, miniPlayerReservedHeight, for: .scrollContent)
+                                .navigationTitle(tab.title)
+                                .navigationBarTitleDisplayMode(.inline)
+                                .toolbarBackground(.visible, for: .navigationBar)
+                                .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
+                                .toolbar {
+                                    ToolbarItem(placement: .topBarTrailing) {
+                                        Button {
+                                            viewModel.activeModule = .settings
+                                        } label: {
+                                            Image(systemName: "gearshape")
+                                        }
+                                        .accessibilityLabel("设置")
                                     }
-                                    .accessibilityLabel("设置")
                                 }
-                            }
-                            .safeAreaInset(edge: .bottom, spacing: 0) {
-                                VStack(spacing: 0) {
-                                    Divider().overlay(palette.separator)
-                                    iosMiniPlayerBar(palette: palette)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                }
-                                .background(palette.canvasBackground)
-                            }
-                            .background(IOSTabBarConfigurator(palette: palette))
+                        }
+                        .tabItem {
+                            Label(tab.title, systemImage: tab.systemImage)
+                        }
+                        .tag(tab)
                     }
-                    .tabItem {
-                        Label(tab.title, systemImage: tab.systemImage)
-                    }
-                    .tag(tab)
                 }
+
+                VStack(spacing: 0) {
+                    Divider().overlay(palette.separator)
+                    IOSMiniPlayerBarView(
+                        viewModel: viewModel,
+                        palette: palette,
+                        onHaptic: { hapticCounter += 1 }
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                }
+                .background(palette.canvasBackground)
+                .padding(.bottom, tabBarHeight)
             }
         }
     }
@@ -315,45 +345,74 @@ public struct IOSRootView: View {
 
     @ViewBuilder
     private func ipadSplitLayout(palette: CloudTunePalette) -> some View {
+        let effectiveDetailTab: ModuleTab = viewModel.activeModule == .settings ? .music : viewModel.activeModule
         NavigationSplitView(columnVisibility: $splitVisibility) {
             List {
                 Section {
-                    ForEach(ModuleTab.allCases) { tab in
+                    ForEach(iphoneTabs) { tab in
+                        let isSelected = effectiveDetailTab == tab && !viewModel.isShowingSettingsSheet
                         Button {
+                            viewModel.isShowingSettingsSheet = false
                             viewModel.activeModule = tab
                         } label: {
                             HStack(spacing: 10) {
                                 Image(systemName: tab.systemImage)
-                                    .foregroundStyle(viewModel.activeModule == tab ? palette.accent : palette.inkSecondary)
+                                    .foregroundStyle(isSelected ? palette.accent : palette.inkSecondary)
                                     .frame(width: 20)
                                 Text(tab.title)
-                                    .font(.system(size: 14.5, weight: viewModel.activeModule == tab ? .semibold : .regular))
-                                    .foregroundStyle(viewModel.activeModule == tab ? palette.inkPrimary : palette.inkSecondary)
+                                    .font(.system(size: 14.5, weight: isSelected ? .semibold : .regular))
+                                    .foregroundStyle(isSelected ? palette.inkPrimary : palette.inkSecondary)
                                 Spacer()
                             }
                             .padding(.vertical, 4)
                             .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 8))
                         .listRowBackground(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(viewModel.activeModule == tab ? palette.rowActiveSurface : Color.clear)
+                                .fill(isSelected ? palette.rowActiveSurface : Color.clear)
                         )
                     }
+                }
+
+                Section {
+                    let settingsSelected = viewModel.isShowingSettingsSheet || viewModel.activeModule == .settings
+                    Button {
+                        viewModel.isShowingSettingsSheet = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: ModuleTab.settings.systemImage)
+                                .foregroundStyle(settingsSelected ? palette.accent : palette.inkSecondary)
+                                .frame(width: 20)
+                            Text(ModuleTab.settings.title)
+                                .font(.system(size: 14.5, weight: settingsSelected ? .semibold : .regular))
+                                .foregroundStyle(settingsSelected ? palette.inkPrimary : palette.inkSecondary)
+                            Spacer()
+                        }
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: palette.rowHoverSurface, cornerRadius: 8))
+                    .listRowBackground(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(settingsSelected ? palette.rowActiveSurface : Color.clear)
+                    )
                 }
             }
             .listStyle(.sidebar)
             .navigationTitle("CloudTune")
         } detail: {
             HStack(spacing: 0) {
-                moduleBody(for: viewModel.activeModule, palette: palette)
+                moduleBody(for: effectiveDetailTab, palette: palette)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                if viewModel.activeModule != .settings {
-                    Divider().overlay(palette.separator)
-                    ipadInspectorColumn(palette: palette)
-                        .frame(width: 320)
-                }
+                Divider().overlay(palette.separator)
+                IPadNowPlayingInspectorView(
+                    viewModel: viewModel,
+                    palette: palette,
+                    onHaptic: { hapticCounter += 1 }
+                )
+                .frame(width: 320)
             }
             .background(palette.canvasBackground)
             .background {
@@ -365,11 +424,57 @@ public struct IOSRootView: View {
             .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Text(viewModel.activeModule.title)
+                    Text(effectiveDetailTab.title)
                         .font(.system(size: 17, weight: .bold))
                         .foregroundStyle(palette.inkPrimary)
                 }
             }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { viewModel.isShowingSettingsSheet },
+                set: { next in
+                    if next {
+                        viewModel.isShowingSettingsSheet = true
+                    } else if viewModel.canCloseSettingsSurface() {
+                        if viewModel.activeModule == .settings {
+                            viewModel.activeModule = .music
+                        }
+                    }
+                }
+            )
+        ) {
+            NavigationStack {
+                IOSSettingsFormView(viewModel: viewModel, palette: palette)
+                    .navigationTitle("设置")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbarBackground(.visible, for: .navigationBar)
+                    .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
+                    .toolbar {
+                        if viewModel.hasUnsavedSettingsDrafts {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button("还原修改") {
+                                    viewModel.syncDraftsFromCommitted()
+                                }
+                            }
+                        }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("完成") {
+                                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                Task { @MainActor in
+                                    if await viewModel.commitPendingSettingsDraftsIfNeeded() {
+                                        viewModel.isShowingSettingsSheet = false
+                                        if viewModel.activeModule == .settings {
+                                            viewModel.activeModule = .music
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
+            .preferredColorScheme(viewModel.appearancePreference.preferredColorScheme)
+            .interactiveDismissDisabled(viewModel.hasUnsavedSettingsDrafts)
         }
     }
 
@@ -412,546 +517,13 @@ public struct IOSRootView: View {
                 .keyboardShortcut("3", modifiers: [.command])
             Button("") { viewModel.activeModule = .transfers }
                 .keyboardShortcut("4", modifiers: [.command])
-            Button("") { viewModel.activeModule = .settings }
+            Button("") { viewModel.isShowingSettingsSheet = true }
                 .keyboardShortcut("5", modifiers: [.command])
+            Button("") { viewModel.isShowingSettingsSheet = true }
+                .keyboardShortcut(",", modifiers: [.command])
         }
         .opacity(0)
         .allowsHitTesting(false)
-    }
-
-    @ViewBuilder
-    private func ipadInspectorColumn(palette: CloudTunePalette) -> some View {
-        let track = viewModel.currentTrack
-        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "未选择曲目"
-        let subtitle = [
-            viewModel.nowPlayingMetadata?.artist,
-            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
-        ]
-        .compactMap { $0?.isEmpty == false ? $0 : nil }
-        .joined(separator: " · ")
-
-        VStack(spacing: 14) {
-            HStack {
-                Text("正在播放")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(palette.inkPrimary)
-                Spacer()
-                AirPlayRoutePicker(tint: UIColor(palette.inkSecondary))
-                    .frame(width: 28, height: 28)
-            }
-
-            Button {
-                hapticCounter += 1
-                viewModel.isShowingNowPlaying = true
-            } label: {
-                VStack(spacing: 14) {
-                    ArtworkView(
-                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
-                        seedText: title,
-                        size: 168,
-                        cornerRadius: 18,
-                        palette: palette
-                    )
-                    .scaleEffect(viewModel.isPlaying ? 1.0 : 0.94)
-                    .animation(.spring(response: 0.35, dampingFraction: 0.78), value: viewModel.isPlaying)
-
-                    VStack(spacing: 4) {
-                        HStack(spacing: 6) {
-                            Text(title)
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(palette.inkPrimary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            if let track {
-                                LosslessBadge(track: track, palette: palette)
-                            }
-                        }
-                        Text(subtitle.isEmpty ? "选择左侧曲目开始播放" : subtitle)
-                            .font(.system(size: 12))
-                            .foregroundStyle(palette.inkSecondary)
-                            .lineLimit(1)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("展开全屏正在播放视图")
-
-            VStack(spacing: 4) {
-                InteractiveScrubSlider(
-                    value: viewModel.currentTime,
-                    total: viewModel.duration,
-                    palette: palette,
-                    onPreviewChange: { preview in
-                        scrubPreviewSeconds = preview
-                    },
-                    onSeek: { sec in
-                        Task { await viewModel.seekPlayback(to: sec) }
-                    }
-                )
-                HStack {
-                    Text(CloudTuneFormatters.formatClock(scrubPreviewSeconds ?? viewModel.currentTime))
-                    Spacer()
-                    Text(CloudTuneFormatters.formatClock(viewModel.duration))
-                }
-                .font(.system(size: 11.5).monospacedDigit())
-                .foregroundStyle(palette.inkTertiary)
-            }
-
-            HStack(spacing: 16) {
-                Button {
-                    hapticCounter += 1
-                    viewModel.toggleShuffle()
-                } label: {
-                    Image(systemName: "shuffle")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(viewModel.shuffle ? palette.accent : palette.inkTertiary)
-                        .frame(width: 36, height: 36)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    hapticCounter += 1
-                    Task { await viewModel.playAdjacent(direction: -1) }
-                } label: {
-                    Image(systemName: "backward.fill")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(palette.inkPrimary)
-                        .frame(width: 38, height: 38)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(!viewModel.canSkipPrevious)
-
-                Button {
-                    hapticCounter += 1
-                    Task { await viewModel.togglePlayback() }
-                } label: {
-                    Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 18, weight: .bold))
-                        .foregroundStyle(palette.primaryForeground)
-                        .frame(width: 46, height: 46)
-                        .background(Circle().fill(palette.accent))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    hapticCounter += 1
-                    Task { await viewModel.playAdjacent(direction: 1) }
-                } label: {
-                    Image(systemName: "forward.fill")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(palette.inkPrimary)
-                        .frame(width: 38, height: 38)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(!viewModel.canSkipNext)
-
-                Button {
-                    hapticCounter += 1
-                    viewModel.cycleLoopMode()
-                } label: {
-                    Image(systemName: viewModel.loopMode == .one ? "repeat.1" : "repeat")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(viewModel.loopMode != .off ? palette.accent : palette.inkTertiary)
-                        .frame(width: 36, height: 36)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-
-            Divider().overlay(palette.separator)
-
-            HStack {
-                Text("待播队列 (\(viewModel.upcomingTracks.count))")
-                    .font(.system(size: 12.5, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(palette.inkSecondary)
-                Spacer()
-                if !viewModel.upNextQueue.isEmpty {
-                    Button("清空插播") {
-                        viewModel.clearUpNextQueue()
-                    }
-                    .font(.system(size: 11.5, weight: .semibold))
-                }
-            }
-
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(viewModel.upcomingTracks) { item in
-                        let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
-                        Button {
-                            Task { await viewModel.playFromUpcomingQueue(item) }
-                        } label: {
-                            HStack(spacing: 8) {
-                                ArtworkView(
-                                    artworkData: nil,
-                                    seedText: item.name,
-                                    size: 30,
-                                    cornerRadius: 6,
-                                    palette: palette
-                                )
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.name)
-                                        .font(.system(size: 12.5, weight: .medium))
-                                        .foregroundStyle(palette.inkPrimary)
-                                        .lineLimit(1)
-                                    Text(isManual ? "插播 · \(item.folderPath)" : item.folderPath)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(isManual ? palette.accent : palette.inkTertiary)
-                                        .lineLimit(1)
-                                }
-                                Spacer(minLength: 4)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(palette.surfaceSecondary)
-                            )
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-        .padding(16)
-        .frame(maxHeight: .infinity)
-        .background(palette.surfacePrimary)
-    }
-
-    // MARK: - Frosted Mini Player & Interactive Full-Screen Now Playing
-
-    @ViewBuilder
-    private func iosMiniPlayerBar(palette: CloudTunePalette) -> some View {
-        let track = viewModel.currentTrack
-        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "点击选择或随机播放"
-        let sub = viewModel.nowPlayingMetadata?.artist
-            ?? "\(CloudTuneFormatters.formatClock(viewModel.currentTime)) / \(CloudTuneFormatters.formatClock(viewModel.duration))"
-
-        HStack(spacing: 10) {
-            Button {
-                hapticCounter += 1
-                viewModel.isShowingNowPlaying = true
-            } label: {
-                HStack(spacing: 10) {
-                    ArtworkView(
-                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
-                        seedText: title,
-                        size: 38,
-                        cornerRadius: 8,
-                        palette: palette
-                    )
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 5) {
-                            Text(title)
-                                .font(.system(size: 13.5, weight: .semibold))
-                                .foregroundStyle(palette.inkPrimary)
-                                .lineLimit(1)
-                            if let track {
-                                LosslessBadge(track: track, palette: palette)
-                            }
-                        }
-                        Text(sub)
-                            .font(.system(size: 11.5).monospacedDigit())
-                            .foregroundStyle(palette.inkTertiary)
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                hapticCounter += 1
-                Task { await viewModel.togglePlayback() }
-            } label: {
-                Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(palette.primaryForeground)
-                    .frame(width: 36, height: 36)
-                    .background(Circle().fill(palette.accent))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                hapticCounter += 1
-                Task { await viewModel.playAdjacent(direction: 1) }
-            } label: {
-                Image(systemName: "forward.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(palette.inkPrimary)
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(!viewModel.canSkipNext)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .fill(palette.surfaceElevated)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .strokeBorder(palette.cardBorder, lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.06), radius: 8, x: 0, y: 3)
-        .gesture(
-            DragGesture(minimumDistance: 28)
-                .onEnded { gesture in
-                    let dx = gesture.translation.width
-                    guard abs(dx) > abs(gesture.translation.height), abs(dx) >= 36 else { return }
-                    hapticCounter += 1
-                    Task {
-                        await viewModel.playAdjacent(direction: dx < 0 ? 1 : -1)
-                    }
-                }
-        )
-    }
-
-    @ViewBuilder
-    private func iosFullPlayerView(palette: CloudTunePalette) -> some View {
-        let track = viewModel.currentTrack
-        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "未选择曲目"
-        let artistLine = [
-            viewModel.nowPlayingMetadata?.artist,
-            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
-        ]
-        .compactMap { $0?.isEmpty == false ? $0 : nil }
-        .joined(separator: " · ")
-
-        ScrollView {
-            VStack(spacing: 20) {
-                HStack {
-                    Button {
-                        viewModel.isShowingNowPlaying = false
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(palette.inkSecondary)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Spacer()
-                    Text("正在播放")
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(palette.inkSecondary)
-                    Spacer()
-
-                    AirPlayRoutePicker(tint: UIColor(palette.inkPrimary))
-                        .frame(width: 36, height: 36)
-                }
-
-                ArtworkView(
-                    artworkData: viewModel.nowPlayingMetadata?.artworkData,
-                    seedText: title,
-                    size: 236,
-                    cornerRadius: 24,
-                    palette: palette
-                )
-                .scaleEffect(viewModel.isPlaying ? 1.0 : 0.91)
-                .animation(.spring(response: 0.36, dampingFraction: 0.78), value: viewModel.isPlaying)
-
-                VStack(spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text(title)
-                            .font(.system(size: 19, weight: .bold))
-                            .foregroundStyle(palette.inkPrimary)
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                        if let track {
-                            LosslessBadge(track: track, palette: palette)
-                        }
-                    }
-                    Text(artistLine.isEmpty ? "CloudTune" : artistLine)
-                        .font(.system(size: 13.5))
-                        .foregroundStyle(palette.inkSecondary)
-                        .lineLimit(1)
-                }
-
-                VStack(spacing: 4) {
-                    InteractiveScrubSlider(
-                        value: viewModel.currentTime,
-                        total: viewModel.duration,
-                        palette: palette,
-                        onPreviewChange: { preview in
-                            scrubPreviewSeconds = preview
-                        },
-                        onSeek: { sec in
-                            Task { await viewModel.seekPlayback(to: sec) }
-                        }
-                    )
-                    HStack {
-                        Text(CloudTuneFormatters.formatClock(scrubPreviewSeconds ?? viewModel.currentTime))
-                        Spacer()
-                        Text(CloudTuneFormatters.formatClock(viewModel.duration))
-                    }
-                    .font(.system(size: 12).monospacedDigit())
-                    .foregroundStyle(palette.inkTertiary)
-                }
-
-                HStack(spacing: 22) {
-                    Button {
-                        hapticCounter += 1
-                        viewModel.toggleShuffle()
-                    } label: {
-                        Image(systemName: "shuffle")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(viewModel.shuffle ? palette.accent : palette.inkTertiary)
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        hapticCounter += 1
-                        Task { await viewModel.playAdjacent(direction: -1) }
-                    } label: {
-                        Image(systemName: "backward.fill")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundStyle(palette.inkPrimary)
-                            .frame(width: 48, height: 48)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!viewModel.canSkipPrevious)
-
-                    Button {
-                        hapticCounter += 1
-                        Task { await viewModel.togglePlayback() }
-                    } label: {
-                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 24, weight: .bold))
-                            .foregroundStyle(palette.primaryForeground)
-                            .frame(width: 62, height: 62)
-                            .background(Circle().fill(palette.accent))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        hapticCounter += 1
-                        Task { await viewModel.playAdjacent(direction: 1) }
-                    } label: {
-                        Image(systemName: "forward.fill")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundStyle(palette.inkPrimary)
-                            .frame(width: 48, height: 48)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!viewModel.canSkipNext)
-
-                    Button {
-                        hapticCounter += 1
-                        viewModel.cycleLoopMode()
-                    } label: {
-                        Image(systemName: viewModel.loopMode == .one ? "repeat.1" : "repeat")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(viewModel.loopMode != .off ? palette.accent : palette.inkTertiary)
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                HStack(spacing: 10) {
-                    Image(systemName: "speaker.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(palette.inkTertiary)
-                    Slider(
-                        value: Binding(
-                            get: { viewModel.volume },
-                            set: { viewModel.setVolume($0) }
-                        ),
-                        in: 0.0...1.0
-                    )
-                    .tint(palette.accent)
-                    Image(systemName: "speaker.wave.3.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(palette.inkTertiary)
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("待播队列 (\(viewModel.upcomingTracks.count))")
-                            .font(.system(size: 14, weight: .bold).monospacedDigit())
-                            .foregroundStyle(palette.inkPrimary)
-                        Spacer()
-                        if !viewModel.upNextQueue.isEmpty {
-                            Button("清空插播") {
-                                viewModel.clearUpNextQueue()
-                            }
-                            .font(.system(size: 12.5, weight: .semibold))
-                        }
-                    }
-
-                    ForEach(viewModel.upcomingTracks.prefix(8)) { item in
-                        let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
-                        HStack(spacing: 10) {
-                            Button {
-                                Task { await viewModel.playFromUpcomingQueue(item) }
-                            } label: {
-                                HStack(spacing: 10) {
-                                    ArtworkView(
-                                        artworkData: nil,
-                                        seedText: item.name,
-                                        size: 34,
-                                        cornerRadius: 7,
-                                        palette: palette
-                                    )
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.name)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundStyle(palette.inkPrimary)
-                                            .lineLimit(1)
-                                        Text(isManual ? "插播 · \(item.folderPath)" : item.folderPath)
-                                            .font(.system(size: 11.5))
-                                            .foregroundStyle(isManual ? palette.accent : palette.inkTertiary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer(minLength: 4)
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            if isManual {
-                                Button {
-                                    viewModel.removeFromQueue(trackId: item.id)
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundStyle(palette.inkTertiary)
-                                        .frame(width: 32, height: 32)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(palette.surfaceSecondary)
-                        )
-                    }
-                }
-            }
-            .padding(22)
-            .frame(maxWidth: 640)
-            .frame(maxWidth: .infinity)
-        }
-        .background(palette.surfacePrimary.ignoresSafeArea())
     }
 
     // MARK: - Module Screens (Music / Video / Cloud / Transfers / Settings)
@@ -968,7 +540,7 @@ public struct IOSRootView: View {
         case .transfers:
             iosTransfersContent(palette: palette)
         case .settings:
-            iosSettingsContent(palette: palette)
+            IOSSettingsFormView(viewModel: viewModel, palette: palette)
         }
     }
 
@@ -1035,7 +607,7 @@ public struct IOSRootView: View {
                         .padding(4)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 6))
                 .accessibilityLabel("清除搜索词")
             }
         }
@@ -1176,7 +748,7 @@ public struct IOSRootView: View {
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8, pressScale: 0.992))
         .listRowBackground(isCurrent ? palette.rowActiveSurface : palette.surfacePrimary)
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             Button {
@@ -1257,13 +829,13 @@ public struct IOSRootView: View {
                             .padding(.vertical, 4)
                             .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8))
                         .listRowBackground(palette.surfacePrimary)
                     }
                 }
             }
 
-            Section("当前目录视频 (\(videos.count))") {
+            Section {
                 if videos.isEmpty {
                     Text("当前目录没有视频文件。")
                         .font(.system(size: 13.5))
@@ -1277,19 +849,46 @@ public struct IOSRootView: View {
                                 .foregroundStyle(palette.inkPrimary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            HStack(spacing: 8) {
-                                Text(CloudTuneFormatters.formatBytes(video.sizeBytes))
-                                    .font(.system(size: 12).monospacedDigit())
-                                    .foregroundStyle(palette.inkTertiary)
-                                Spacer()
-                                SecondaryActionButton("应用内播放", systemImage: "play.fill", palette: palette) {
-                                    Task { await viewModel.openVideoInApp(video) }
+                                .layoutPriority(1)
+                            ViewThatFits(in: .horizontal) {
+                                HStack(spacing: 8) {
+                                    Text(CloudTuneFormatters.formatBytes(video.sizeBytes))
+                                        .font(.system(size: 12).monospacedDigit())
+                                        .foregroundStyle(palette.inkTertiary)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 6)
+                                    HStack(spacing: 8) {
+                                        SecondaryActionButton("应用内播放", systemImage: "play.fill", palette: palette) {
+                                            Task { await viewModel.openVideoInApp(video) }
+                                        }
+                                        SecondaryActionButton("其他应用", systemImage: "square.and.arrow.up", palette: palette) {
+                                            Task {
+                                                if let cachedURL = await viewModel.requestExternalVideoPlayback(video, prepareLoopbackStream: false) {
+                                                    viewModel.shareFileURL = cachedURL
+                                                    isShowingShareSheet = true
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .fixedSize(horizontal: true, vertical: false)
                                 }
-                                SecondaryActionButton("其他应用", systemImage: "square.and.arrow.up", palette: palette) {
-                                    Task {
-                                        if let cachedURL = await viewModel.requestExternalVideoPlayback(video, prepareLoopbackStream: false) {
-                                            viewModel.shareFileURL = cachedURL
-                                            isShowingShareSheet = true
+
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(CloudTuneFormatters.formatBytes(video.sizeBytes))
+                                        .font(.system(size: 12).monospacedDigit())
+                                        .foregroundStyle(palette.inkTertiary)
+                                        .lineLimit(1)
+                                    HStack(spacing: 8) {
+                                        SecondaryActionButton("应用内播放", systemImage: "play.fill", palette: palette) {
+                                            Task { await viewModel.openVideoInApp(video) }
+                                        }
+                                        SecondaryActionButton("其他应用", systemImage: "square.and.arrow.up", palette: palette) {
+                                            Task {
+                                                if let cachedURL = await viewModel.requestExternalVideoPlayback(video, prepareLoopbackStream: false) {
+                                                    viewModel.shareFileURL = cachedURL
+                                                    isShowingShareSheet = true
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1299,6 +898,10 @@ public struct IOSRootView: View {
                         .listRowBackground(palette.surfacePrimary)
                     }
                 }
+            } header: {
+                Text("当前目录视频 (\(videos.count))")
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(palette.inkTertiary)
             }
         }
         .listStyle(.plain)
@@ -1328,7 +931,7 @@ public struct IOSRootView: View {
             }
 
             if !folders.isEmpty {
-                Section("文件夹 (\(folders.count))") {
+                Section {
                     ForEach(folders) { folder in
                         Button {
                             let next = pane.breadcrumbs + [BreadcrumbItem(id: folder.id, name: folder.name)]
@@ -1341,6 +944,7 @@ public struct IOSRootView: View {
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundStyle(palette.inkPrimary)
                                     .lineLimit(1)
+                                    .truncationMode(.middle)
                                 Spacer()
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 12, weight: .semibold))
@@ -1349,22 +953,30 @@ public struct IOSRootView: View {
                             .padding(.vertical, 4)
                             .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8))
                         .listRowBackground(palette.surfacePrimary)
                     }
+                } header: {
+                    Text("文件夹 (\(folders.count))")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(palette.inkTertiary)
                 }
             }
 
             if !audios.isEmpty {
-                Section("目录音频 (\(audios.count))") {
+                Section {
                     ForEach(audios) { track in
                         iosTrackListRow(track: track, palette: palette)
                     }
+                } header: {
+                    Text("目录音频 (\(audios.count))")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(palette.inkTertiary)
                 }
             }
 
             if !others.isEmpty {
-                Section("视频与附件 (\(others.count))") {
+                Section {
                     ForEach(others) { item in
                         Button {
                             enqueueTrackWithPickerIfNeeded(item)
@@ -1377,6 +989,7 @@ public struct IOSRootView: View {
                                         .font(.system(size: 13.5, weight: .medium))
                                         .foregroundStyle(palette.inkPrimary)
                                         .lineLimit(1)
+                                        .truncationMode(.middle)
                                     Text(CloudTuneFormatters.formatBytes(item.sizeBytes))
                                         .font(.system(size: 11.5).monospacedDigit())
                                         .foregroundStyle(palette.inkTertiary)
@@ -1389,9 +1002,13 @@ public struct IOSRootView: View {
                             .padding(.vertical, 4)
                             .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8))
                         .listRowBackground(palette.surfacePrimary)
                     }
+                } header: {
+                    Text("视频与附件 (\(others.count))")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(palette.inkTertiary)
                 }
             }
         }
@@ -1437,7 +1054,7 @@ public struct IOSRootView: View {
                         .listRowBackground(palette.surfacePrimary)
                 }
             } else {
-                Section("队列明细 (\(viewModel.transferSnapshot.items.count))") {
+                Section {
                     ForEach(viewModel.transferSnapshot.items) { item in
                         TransferRowCardView(
                             item: item,
@@ -1459,131 +1076,15 @@ public struct IOSRootView: View {
                             }
                         }
                     }
+                } header: {
+                    Text("队列明细 (\(viewModel.transferSnapshot.items.count))")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(palette.inkTertiary)
                 }
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(palette.canvasBackground)
-    }
-
-    @ViewBuilder
-    private func iosSettingsContent(palette: CloudTunePalette) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let status = viewModel.settingsValidationError ?? viewModel.busyLabel ?? viewModel.statusMessage,
-                   !status.isEmpty {
-                    SubtleStatusBanner(
-                        message: status,
-                        isError: viewModel.settingsValidationError != nil
-                            || (viewModel.busyLabel == nil && viewModel.statusKind == .error),
-                        busyLabel: viewModel.busyLabel,
-                        palette: palette
-                    )
-                }
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("界面外观与播放策略")
-                        .font(.system(size: 14.5, weight: .bold))
-                        .foregroundStyle(palette.inkPrimary)
-
-                    HStack(spacing: 8) {
-                        ForEach(AppearanceMode.allCases) { pref in
-                            ToggleChipButton(pref.title, isActive: viewModel.appearancePreference == pref, palette: palette) {
-                                Task { await viewModel.setAppearanceMode(pref) }
-                            }
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        ToggleChipButton(
-                            "优先缓存",
-                            isActive: viewModel.committedSettings.playbackMode == .downloadFirst,
-                            palette: palette
-                        ) {
-                            Task { await viewModel.updatePlaybackMode(.downloadFirst) }
-                        }
-                        ToggleChipButton(
-                            "边播边缓存",
-                            isActive: viewModel.committedSettings.playbackMode == .streamCache,
-                            palette: palette
-                        ) {
-                            Task { await viewModel.updatePlaybackMode(.streamCache) }
-                        }
-                    }
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("缓存配额与分片线程")
-                        .font(.system(size: 14.5, weight: .bold))
-                        .foregroundStyle(palette.inkPrimary)
-                    Text("已用缓存：\(CloudTuneFormatters.formatBytes(viewModel.cacheUsageBytes)) / \(viewModel.committedSettings.cacheLimitMb) MB")
-                        .font(.system(size: 13).monospacedDigit())
-                        .foregroundStyle(palette.inkSecondary)
-
-                    HStack(spacing: 8) {
-                        TextField("缓存上限 MB", text: $viewModel.cacheLimitDraft)
-                            .keyboardType(.numberPad)
-                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
-                            .padding(10)
-                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
-                            .onChange(of: viewModel.cacheLimitDraft) { _, _ in viewModel.noteDraftEdited() }
-                        SecondaryActionButton("应用上限", palette: palette) {
-                            Task { await viewModel.commitCacheLimitDraft() }
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        TextField("下载线程", text: $viewModel.downloadThreadsDraft)
-                            .keyboardType(.numberPad)
-                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
-                            .padding(10)
-                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
-                            .onChange(of: viewModel.downloadThreadsDraft) { _, _ in viewModel.noteDraftEdited() }
-                        TextField("缓存线程", text: $viewModel.cacheThreadsDraft)
-                            .keyboardType(.numberPad)
-                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
-                            .padding(10)
-                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
-                            .onChange(of: viewModel.cacheThreadsDraft) { _, _ in viewModel.noteDraftEdited() }
-                        SecondaryActionButton("应用线程", palette: palette) {
-                            Task { await viewModel.commitTransferThreadsDraft() }
-                        }
-                    }
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("账号会话")
-                        .font(.system(size: 14.5, weight: .bold))
-                        .foregroundStyle(palette.inkPrimary)
-                    Text("当前账号：\(viewModel.accountName ?? "未登录")")
-                        .font(.system(size: 13))
-                        .foregroundStyle(palette.inkSecondary)
-                    Text("音乐库目录：\(viewModel.committedSettings.musicFolder?.name ?? "未设置") · 导出目录：\(viewModel.committedSettings.exportFolderDisplayName ?? "未设置")")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(palette.inkTertiary)
-
-                    SecondaryActionButton("退出登录", systemImage: "rectangle.portrait.and.arrow.right", palette: palette) {
-                        Task { await viewModel.logout() }
-                    }
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
-            }
-            .padding(16)
-            .frame(maxWidth: 680)
-            .frame(maxWidth: .infinity)
-        }
         .background(palette.canvasBackground)
     }
 
@@ -1614,32 +1115,55 @@ public struct IOSRootView: View {
                                 )
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 12))
                         .disabled(isLast)
                     }
                 }
             }
 
-            HStack(spacing: 8) {
-                if pane.breadcrumbs.count > 1 {
-                    SecondaryActionButton("上一级", systemImage: "chevron.left", palette: palette) {
-                        Task { await viewModel.navigateBackInBrowser(scope: scope) }
-                    }
-                }
-                SecondaryActionButton("根目录", palette: palette) {
-                    Task { await viewModel.browseTo(scope: scope, folderId: nil, nextBreadcrumbs: [.root]) }
-                }
-                if showMusicActions {
-                    SecondaryActionButton("下载目录", palette: palette, isDisabled: pane.payload == nil) {
-                        if viewModel.committedSettings.exportFolderDisplayName == nil {
-                            pendingExportPane = pane
-                            isShowingFolderPicker = true
-                        } else {
-                            Task { await viewModel.enqueueFolderDownload(from: pane) }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    if pane.breadcrumbs.count > 1 {
+                        SecondaryActionButton("上一级", systemImage: "chevron.left", palette: palette) {
+                            Task { await viewModel.navigateBackInBrowser(scope: scope) }
                         }
                     }
-                    PrimaryActionButton("设为音乐库", palette: palette, isDisabled: pane.payload == nil) {
-                        Task { await viewModel.setFolderAsMusicLibrary(from: pane) }
+                    SecondaryActionButton("根目录", palette: palette) {
+                        Task { await viewModel.browseTo(scope: scope, folderId: nil, nextBreadcrumbs: [.root]) }
+                    }
+                    if showMusicActions {
+                        SecondaryActionButton("下载目录", systemImage: "arrow.down.doc", palette: palette, isDisabled: pane.payload == nil) {
+                            triggerFolderDownload(from: pane)
+                        }
+                        PrimaryActionButton("设为音乐库", systemImage: "checkmark.circle", palette: palette, isDisabled: pane.payload == nil) {
+                            Task { await viewModel.setFolderAsMusicLibrary(from: pane) }
+                        }
+                    }
+                }
+                .fixedSize(horizontal: true, vertical: false)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        if pane.breadcrumbs.count > 1 {
+                            SecondaryActionButton("上一级", systemImage: "chevron.left", palette: palette) {
+                                Task { await viewModel.navigateBackInBrowser(scope: scope) }
+                            }
+                        }
+                        SecondaryActionButton("根目录", palette: palette) {
+                            Task { await viewModel.browseTo(scope: scope, folderId: nil, nextBreadcrumbs: [.root]) }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    if showMusicActions {
+                        HStack(spacing: 8) {
+                            SecondaryActionButton("下载目录", systemImage: "arrow.down.doc", palette: palette, isDisabled: pane.payload == nil) {
+                                triggerFolderDownload(from: pane)
+                            }
+                            PrimaryActionButton("设为音乐库", systemImage: "checkmark.circle", palette: palette, isDisabled: pane.payload == nil) {
+                                Task { await viewModel.setFolderAsMusicLibrary(from: pane) }
+                            }
+                            Spacer(minLength: 0)
+                        }
                     }
                 }
             }
@@ -1647,6 +1171,15 @@ public struct IOSRootView: View {
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
+    }
+
+    private func triggerFolderDownload(from pane: BrowserPaneState) {
+        if viewModel.committedSettings.exportFolderDisplayName == nil {
+            pendingExportPane = pane
+            isShowingFolderPicker = true
+        } else {
+            Task { await viewModel.enqueueFolderDownload(from: pane) }
+        }
     }
 
     private func enqueueTrackWithPickerIfNeeded(_ track: TrackSummary) {
@@ -1765,17 +1298,24 @@ struct IOSActivityShareSheet: UIViewControllerRepresentable {
 }
 
 @MainActor
-enum IOSTabBarAppearanceHelper {
-    private static func resolvedColor(_ color: Color, isDark: Bool) -> UIColor {
-        let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
-        return UIColor(color).resolvedColor(with: traits)
-    }
-
-    static func makeAppearance(palette: CloudTunePalette) -> UITabBarAppearance {
-        let surfaceColor = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
-        let separatorColor = resolvedColor(palette.separator, isDark: palette.isDark)
-        let normalColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
-        let selectedColor = resolvedColor(palette.accent, isDark: palette.isDark)
+package enum IOSTabBarAppearance {
+    package static func makeAppearance() -> UITabBarAppearance {
+        let surfaceColor = UIColor { traits in
+            let palette = CloudTunePalette(isDark: traits.userInterfaceStyle == .dark)
+            return UIColor(palette.surfacePrimary).resolvedColor(with: traits)
+        }
+        let separatorColor = UIColor { traits in
+            let palette = CloudTunePalette(isDark: traits.userInterfaceStyle == .dark)
+            return UIColor(palette.separator).resolvedColor(with: traits)
+        }
+        let normalColor = UIColor { traits in
+            let palette = CloudTunePalette(isDark: traits.userInterfaceStyle == .dark)
+            return UIColor(palette.inkSecondary).resolvedColor(with: traits)
+        }
+        let selectedColor = UIColor { traits in
+            let palette = CloudTunePalette(isDark: traits.userInterfaceStyle == .dark)
+            return UIColor(palette.accent).resolvedColor(with: traits)
+        }
 
         let appearance = UITabBarAppearance()
         appearance.configureWithOpaqueBackground()
@@ -1783,216 +1323,736 @@ enum IOSTabBarAppearanceHelper {
         appearance.backgroundColor = surfaceColor
         appearance.shadowColor = separatorColor
 
-        let normalTitleAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: normalColor
-        ]
-        let selectedTitleAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: selectedColor
-        ]
-
         for itemAppearance in [
             appearance.stackedLayoutAppearance,
             appearance.inlineLayoutAppearance,
             appearance.compactInlineLayoutAppearance
         ] {
             itemAppearance.normal.iconColor = normalColor
-            itemAppearance.normal.titleTextAttributes = normalTitleAttrs
+            itemAppearance.normal.titleTextAttributes = [.foregroundColor: normalColor]
             itemAppearance.selected.iconColor = selectedColor
-            itemAppearance.selected.titleTextAttributes = selectedTitleAttrs
+            itemAppearance.selected.titleTextAttributes = [.foregroundColor: selectedColor]
             itemAppearance.focused.iconColor = selectedColor
-            itemAppearance.focused.titleTextAttributes = selectedTitleAttrs
+            itemAppearance.focused.titleTextAttributes = [.foregroundColor: selectedColor]
         }
         return appearance
     }
 
-    static func needsApply(to tabBar: UITabBar, palette: CloudTunePalette) -> Bool {
-        let expectedSurface = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
-        let expectedNormal = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
-        let expectedSelected = resolvedColor(palette.accent, isDark: palette.isDark)
-        if !tabBar.isTranslucent
-            || tabBar.standardAppearance.backgroundEffect != nil
-            || tabBar.standardAppearance.backgroundColor != expectedSurface
-            || tabBar.standardAppearance.stackedLayoutAppearance.normal.iconColor != expectedNormal
-            || tabBar.standardAppearance.stackedLayoutAppearance.selected.iconColor != expectedSelected
-            || tabBar.scrollEdgeAppearance?.backgroundEffect != nil
-            || tabBar.scrollEdgeAppearance?.backgroundColor != expectedSurface
-            || tabBar.scrollEdgeAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal
-            || tabBar.scrollEdgeAppearance?.stackedLayoutAppearance.selected.iconColor != expectedSelected {
-            return true
-        }
-        for item in tabBar.items ?? [] {
-            if item.standardAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal
-                || item.scrollEdgeAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal {
-                return true
-            }
-        }
-        return false
-    }
-
-    static func applyGlobalDefaults(palette: CloudTunePalette) {
-        let appearance = makeAppearance(palette: palette)
+    package static func apply() {
+        let appearance = makeAppearance()
         let proxy = UITabBar.appearance()
         proxy.standardAppearance = appearance
         proxy.scrollEdgeAppearance = appearance
-        proxy.isTranslucent = true
-        proxy.tintColor = resolvedColor(palette.accent, isDark: palette.isDark)
-        proxy.unselectedItemTintColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
-    }
-
-    static func apply(
-        to tabBar: UITabBar,
-        viewControllers: [UIViewController]? = nil,
-        palette: CloudTunePalette
-    ) {
-        let appearance = makeAppearance(palette: palette)
-        let surfaceColor = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
-        let normalColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
-        let selectedColor = resolvedColor(palette.accent, isDark: palette.isDark)
-
-        tabBar.standardAppearance = appearance
-        tabBar.scrollEdgeAppearance = appearance
-        tabBar.isTranslucent = true
-        tabBar.barTintColor = surfaceColor
-        tabBar.backgroundColor = surfaceColor
-        tabBar.tintColor = selectedColor
-        tabBar.unselectedItemTintColor = normalColor
-        for item in tabBar.items ?? [] {
-            item.standardAppearance = appearance
-            item.scrollEdgeAppearance = appearance
-        }
-        for vc in viewControllers ?? [] {
-            vc.tabBarItem.standardAppearance = appearance
-            vc.tabBarItem.scrollEdgeAppearance = appearance
-        }
-        tabBar.setNeedsLayout()
-        tabBar.layoutIfNeeded()
-    }
-
-    static func applyRecursively(in viewController: UIViewController?, view: UIView?, palette: CloudTunePalette) {
-        if let tabController = viewController as? UITabBarController {
-            apply(to: tabController.tabBar, viewControllers: tabController.viewControllers, palette: palette)
-        }
-        for child in viewController?.children ?? [] {
-            applyRecursively(in: child, view: nil, palette: palette)
-        }
-        if let tabBar = view as? UITabBar {
-            apply(to: tabBar, palette: palette)
-        }
-        for subview in view?.subviews ?? [] {
-            applyRecursively(in: nil, view: subview, palette: palette)
-        }
+        proxy.isTranslucent = false
     }
 }
 
-private struct IOSTabBarConfigurator: UIViewControllerRepresentable {
+/// Standalone leaf view reading `PlaybackTimeline` ONLY when no artist string is present.
+private struct IOSMiniPlayerSubtitleView: View {
+    let artist: String?
+    let timeline: PlaybackTimeline
     let palette: CloudTunePalette
 
-    func makeUIViewController(context: Context) -> TabBarSyncViewController {
-        IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: palette)
-        return TabBarSyncViewController(palette: palette)
-    }
-
-    func updateUIViewController(_ uiViewController: TabBarSyncViewController, context: Context) {
-        uiViewController.updatePalette(palette)
-    }
-}
-
-private final class TabBarObserverView: UIView {
-    var onWindowAttached: (() -> Void)?
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window != nil {
-            onWindowAttached?()
-        }
+    var body: some View {
+        let text = artist ?? "\(CloudTuneFormatters.formatClock(timeline.currentTime)) / \(CloudTuneFormatters.formatClock(timeline.duration))"
+        Text(text)
+            .font(.system(size: 11.5).monospacedDigit())
+            .foregroundStyle(palette.inkTertiary)
+            .lineLimit(1)
     }
 }
 
-private final class TabBarSyncViewController: UIViewController {
-    private var palette: CloudTunePalette
-    private var lastAppliedIsDark: Bool?
+package struct IOSMiniPlayerBarView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let palette: CloudTunePalette
+    package let onHaptic: () -> Void
 
-    init(palette: CloudTunePalette) {
-        self.palette = palette
-        super.init(nibName: nil, bundle: nil)
-    }
+    package var body: some View {
+        let track = viewModel.currentTrack
+        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "点击选择或随机播放"
 
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func loadView() {
-        let observer = TabBarObserverView(frame: .zero)
-        observer.backgroundColor = .clear
-        observer.isUserInteractionEnabled = false
-        observer.onWindowAttached = { [weak self] in
-            self?.syncTabBar(force: true)
-        }
-        self.view = observer
-    }
-
-    override func didMove(toParent parent: UIViewController?) {
-        super.didMove(toParent: parent)
-        syncTabBar(force: true)
-    }
-
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        syncTabBar(force: true)
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        syncTabBar(force: false)
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        syncTabBar(force: false)
-    }
-
-    func updatePalette(_ nextPalette: CloudTunePalette) {
-        let changed = (lastAppliedIsDark != nextPalette.isDark)
-        palette = nextPalette
-        if changed {
-            IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: nextPalette)
-        }
-        syncTabBar(force: changed)
-    }
-
-    private func syncTabBar(force: Bool) {
-        if let tabController = tabBarController {
-            let tabBar = tabController.tabBar
-            if force || lastAppliedIsDark != palette.isDark || IOSTabBarAppearanceHelper.needsApply(to: tabBar, palette: palette) {
-                IOSTabBarAppearanceHelper.apply(
-                    to: tabBar,
-                    viewControllers: tabController.viewControllers,
-                    palette: palette
-                )
-                lastAppliedIsDark = palette.isDark
-            }
-        } else if let window = viewIfLoaded?.window, force || lastAppliedIsDark != palette.isDark {
-            IOSTabBarAppearanceHelper.applyRecursively(in: window.rootViewController, view: window, palette: palette)
-            lastAppliedIsDark = palette.isDark
-        }
-        if force {
-            let capturedPalette = palette
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let tabController = self.tabBarController {
-                    IOSTabBarAppearanceHelper.apply(
-                        to: tabController.tabBar,
-                        viewControllers: tabController.viewControllers,
-                        palette: capturedPalette
+        HStack(spacing: 10) {
+            Button {
+                onHaptic()
+                viewModel.isShowingNowPlaying = true
+            } label: {
+                HStack(spacing: 10) {
+                    ArtworkView(
+                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
+                        seedText: title,
+                        size: 38,
+                        cornerRadius: 8,
+                        palette: palette
                     )
-                    self.lastAppliedIsDark = capturedPalette.isDark
-                } else if let window = self.viewIfLoaded?.window {
-                    IOSTabBarAppearanceHelper.applyRecursively(in: window.rootViewController, view: window, palette: capturedPalette)
-                    self.lastAppliedIsDark = capturedPalette.isDark
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(title)
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(palette.inkPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let track {
+                                LosslessBadge(track: track, palette: palette)
+                            }
+                        }
+                        IOSMiniPlayerSubtitleView(
+                            artist: viewModel.nowPlayingMetadata?.artist?.trimmedNilIfEmpty,
+                            timeline: viewModel.timeline,
+                            palette: palette
+                        )
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 10, pressScale: 0.992))
+
+            Button {
+                onHaptic()
+                Task { await viewModel.togglePlayback() }
+            } label: {
+                Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(palette.primaryForeground)
+                    .frame(width: 36, height: 36)
+                    .background(Circle().fill(palette.accent))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 18))
+
+            Button {
+                onHaptic()
+                Task { await viewModel.playAdjacent(direction: 1) }
+            } label: {
+                Image(systemName: "forward.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(palette.inkPrimary)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 18))
+            .disabled(!viewModel.canSkipNext)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(palette.surfaceElevated)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .strokeBorder(palette.cardBorder, lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.06), radius: 8, x: 0, y: 3)
+        .gesture(
+            DragGesture(minimumDistance: 28)
+                .onEnded { gesture in
+                    let dx = gesture.translation.width
+                    guard abs(dx) > abs(gesture.translation.height), abs(dx) >= 36 else { return }
+                    onHaptic()
+                    Task {
+                        await viewModel.playAdjacent(direction: dx < 0 ? 1 : -1)
+                    }
+                }
+        )
+    }
+}
+
+package struct IOSSettingsFormView: View {
+    private enum NumericField: Hashable {
+        case cacheLimit
+        case downloadThreads
+        case cacheThreads
+    }
+
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let palette: CloudTunePalette
+    @FocusState private var focusedField: NumericField?
+
+    package var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let status = viewModel.settingsValidationError ?? viewModel.busyLabel ?? viewModel.statusMessage,
+                   !status.isEmpty {
+                    SubtleStatusBanner(
+                        message: status,
+                        isError: viewModel.settingsValidationError != nil
+                            || (viewModel.busyLabel == nil && viewModel.statusKind == .error),
+                        busyLabel: viewModel.busyLabel,
+                        palette: palette
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("界面外观与播放策略")
+                        .font(.system(size: 14.5, weight: .bold))
+                        .foregroundStyle(palette.inkPrimary)
+
+                    HStack(spacing: 8) {
+                        ForEach(AppearanceMode.allCases) { pref in
+                            ToggleChipButton(pref.title, isActive: viewModel.appearancePreference == pref, palette: palette) {
+                                Task { await viewModel.setAppearanceMode(pref) }
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        ToggleChipButton(
+                            "优先缓存",
+                            isActive: viewModel.committedSettings.playbackMode == .downloadFirst,
+                            palette: palette
+                        ) {
+                            Task { await viewModel.updatePlaybackMode(.downloadFirst) }
+                        }
+                        ToggleChipButton(
+                            "边播边缓存",
+                            isActive: viewModel.committedSettings.playbackMode == .streamCache,
+                            palette: palette
+                        ) {
+                            Task { await viewModel.updatePlaybackMode(.streamCache) }
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("缓存配额与分片线程")
+                        .font(.system(size: 14.5, weight: .bold))
+                        .foregroundStyle(palette.inkPrimary)
+                    Text("已用缓存：\(CloudTuneFormatters.formatBytes(viewModel.cacheUsageBytes)) / \(viewModel.committedSettings.cacheLimitMb) MB")
+                        .font(.system(size: 13).monospacedDigit())
+                        .foregroundStyle(palette.inkSecondary)
+
+                    HStack(spacing: 8) {
+                        TextField("缓存上限 MB", text: $viewModel.cacheLimitDraft)
+                            .keyboardType(.numberPad)
+                            .focused($focusedField, equals: .cacheLimit)
+                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
+                            .onChange(of: viewModel.cacheLimitDraft) { _, _ in viewModel.noteDraftEdited() }
+                        SecondaryActionButton("应用上限", palette: palette) {
+                            focusedField = nil
+                            Task { await viewModel.commitCacheLimitDraft() }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        TextField("下载线程", text: $viewModel.downloadThreadsDraft)
+                            .keyboardType(.numberPad)
+                            .focused($focusedField, equals: .downloadThreads)
+                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
+                            .onChange(of: viewModel.downloadThreadsDraft) { _, _ in viewModel.noteDraftEdited() }
+                        TextField("缓存线程", text: $viewModel.cacheThreadsDraft)
+                            .keyboardType(.numberPad)
+                            .focused($focusedField, equals: .cacheThreads)
+                            .font(.system(size: 13.5, weight: .medium).monospacedDigit())
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(palette.inputSurface))
+                            .onChange(of: viewModel.cacheThreadsDraft) { _, _ in viewModel.noteDraftEdited() }
+                        SecondaryActionButton("应用线程", palette: palette) {
+                            focusedField = nil
+                            Task { await viewModel.commitTransferThreadsDraft() }
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("账号会话")
+                        .font(.system(size: 14.5, weight: .bold))
+                        .foregroundStyle(palette.inkPrimary)
+                    Text("当前账号：\(viewModel.accountName ?? "未登录")")
+                        .font(.system(size: 13))
+                        .foregroundStyle(palette.inkSecondary)
+                    Text("音乐库目录：\(viewModel.committedSettings.musicFolder?.name ?? "未设置") · 导出目录：\(viewModel.committedSettings.exportFolderDisplayName ?? "未设置")")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(palette.inkTertiary)
+
+                    SecondaryActionButton("退出登录", systemImage: "rectangle.portrait.and.arrow.right", palette: palette) {
+                        focusedField = nil
+                        Task { await viewModel.logout() }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(palette.surfacePrimary))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.cardBorder, lineWidth: 1))
+            }
+            .padding(16)
+            .frame(maxWidth: 680)
+            .frame(maxWidth: .infinity)
+        }
+        .background(palette.canvasBackground)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("完成") {
+                    let completedField = focusedField
+                    focusedField = nil
+                    Task { @MainActor in
+                        switch completedField {
+                        case .cacheLimit:
+                            _ = await viewModel.commitCacheLimitDraft()
+                        case .downloadThreads, .cacheThreads:
+                            _ = await viewModel.commitTransferThreadsDraft()
+                        case nil:
+                            _ = await viewModel.commitPendingSettingsDraftsIfNeeded()
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+package struct IPadNowPlayingInspectorView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let palette: CloudTunePalette
+    package let onHaptic: () -> Void
+
+    package var body: some View {
+        let track = viewModel.currentTrack
+        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "未选择曲目"
+        let subtitle = [
+            viewModel.nowPlayingMetadata?.artist,
+            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
+        ]
+        .compactMap { $0?.isEmpty == false ? $0 : nil }
+        .joined(separator: " · ")
+
+        VStack(spacing: 14) {
+            HStack {
+                Text("正在播放")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(palette.inkPrimary)
+                Spacer()
+                AirPlayRoutePicker(tint: UIColor(palette.inkSecondary))
+                    .frame(width: 28, height: 28)
+            }
+
+            Button {
+                onHaptic()
+                viewModel.isShowingNowPlaying = true
+            } label: {
+                VStack(spacing: 14) {
+                    ArtworkView(
+                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
+                        seedText: title,
+                        size: 168,
+                        cornerRadius: 18,
+                        palette: palette
+                    )
+                    .scaleEffect(viewModel.isPlaying ? 1.0 : 0.94)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.78), value: viewModel.isPlaying)
+
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(title)
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(palette.inkPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let track {
+                                LosslessBadge(track: track, palette: palette)
+                            }
+                        }
+                        Text(subtitle.isEmpty ? "选择左侧曲目开始播放" : subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(palette.inkSecondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 16, pressScale: 0.992))
+            .accessibilityLabel("展开全屏正在播放视图")
+
+            NowPlayingScrubberView(
+                timeline: viewModel.timeline,
+                palette: palette,
+                layout: .iosStacked(fontSize: 11.5)
+            ) { sec in
+                await viewModel.seekPlayback(to: sec)
+            }
+
+            HStack(spacing: 16) {
+                Button {
+                    onHaptic()
+                    viewModel.toggleShuffle()
+                } label: {
+                    Image(systemName: "shuffle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(viewModel.shuffle ? palette.accent : palette.inkTertiary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 18))
+
+                Button {
+                    onHaptic()
+                    Task { await viewModel.playAdjacent(direction: -1) }
+                } label: {
+                    Image(systemName: "backward.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(palette.inkPrimary)
+                        .frame(width: 38, height: 38)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 19))
+                .disabled(!viewModel.canSkipPrevious)
+
+                Button {
+                    onHaptic()
+                    Task { await viewModel.togglePlayback() }
+                } label: {
+                    Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(palette.primaryForeground)
+                        .frame(width: 46, height: 46)
+                        .background(Circle().fill(palette.accent))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 23))
+
+                Button {
+                    onHaptic()
+                    Task { await viewModel.playAdjacent(direction: 1) }
+                } label: {
+                    Image(systemName: "forward.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(palette.inkPrimary)
+                        .frame(width: 38, height: 38)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 19))
+                .disabled(!viewModel.canSkipNext)
+
+                Button {
+                    onHaptic()
+                    viewModel.cycleLoopMode()
+                } label: {
+                    Image(systemName: viewModel.loopMode == .one ? "repeat.1" : "repeat")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(viewModel.loopMode != .off ? palette.accent : palette.inkTertiary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 18))
+            }
+
+            Divider().overlay(palette.separator)
+
+            HStack {
+                Text("待播队列 (\(viewModel.upcomingTracks.count))")
+                    .font(.system(size: 12.5, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(palette.inkSecondary)
+                Spacer()
+                if !viewModel.upNextQueue.isEmpty {
+                    Button {
+                        viewModel.clearUpNextQueue()
+                    } label: {
+                        Text("清空插播")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(palette.accent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 6))
+                }
+            }
+
+            ScrollView {
+                VStack(spacing: 6) {
+                    ForEach(viewModel.upcomingTracks) { item in
+                        let isManual = viewModel.isManualUpNext(trackId: item.id)
+                        Button {
+                            Task { await viewModel.playFromUpcomingQueue(item) }
+                        } label: {
+                            HStack(spacing: 8) {
+                                ArtworkView(
+                                    artworkData: nil,
+                                    seedText: item.name,
+                                    size: 30,
+                                    cornerRadius: 6,
+                                    palette: palette
+                                )
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                        .foregroundStyle(palette.inkPrimary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(isManual ? "插播 · \(item.folderPath)" : item.folderPath)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(isManual ? palette.accent : palette.inkTertiary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 4)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(palette.surfaceSecondary)
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8, pressScale: 0.992))
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxHeight: .infinity)
+        .background(palette.surfacePrimary)
+    }
+}
+
+package struct IOSFullPlayerView: View {
+    @Bindable package var viewModel: CloudTuneViewModel
+    package let palette: CloudTunePalette
+    package let onHaptic: () -> Void
+
+    package var body: some View {
+        let track = viewModel.currentTrack
+        let title = viewModel.nowPlayingMetadata?.title ?? track?.name ?? "未选择曲目"
+        let artistLine = [
+            viewModel.nowPlayingMetadata?.artist,
+            viewModel.nowPlayingMetadata?.album ?? track?.folderPath
+        ]
+        .compactMap { $0?.isEmpty == false ? $0 : nil }
+        .joined(separator: " · ")
+
+        ScrollView {
+            VStack(spacing: 20) {
+                HStack {
+                    Button {
+                        viewModel.isShowingNowPlaying = false
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(palette.inkSecondary)
+                            .frame(width: 40, height: 40)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 20))
+
+                    Spacer()
+                    Text("正在播放")
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(palette.inkSecondary)
+                    Spacer()
+
+                    AirPlayRoutePicker(tint: UIColor(palette.inkPrimary))
+                        .frame(width: 36, height: 36)
+                }
+
+                ArtworkView(
+                    artworkData: viewModel.nowPlayingMetadata?.artworkData,
+                    seedText: title,
+                    size: 236,
+                    cornerRadius: 24,
+                    palette: palette
+                )
+                .scaleEffect(viewModel.isPlaying ? 1.0 : 0.91)
+                .animation(.spring(response: 0.36, dampingFraction: 0.78), value: viewModel.isPlaying)
+
+                VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(title)
+                            .font(.system(size: 19, weight: .bold))
+                            .foregroundStyle(palette.inkPrimary)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                        if let track {
+                            LosslessBadge(track: track, palette: palette)
+                        }
+                    }
+                    Text(artistLine.isEmpty ? "CloudTune" : artistLine)
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(palette.inkSecondary)
+                        .lineLimit(1)
+                }
+
+                NowPlayingScrubberView(
+                    timeline: viewModel.timeline,
+                    palette: palette,
+                    layout: .iosStacked(fontSize: 12)
+                ) { sec in
+                    await viewModel.seekPlayback(to: sec)
+                }
+
+                HStack(spacing: 22) {
+                    Button {
+                        onHaptic()
+                        viewModel.toggleShuffle()
+                    } label: {
+                        Image(systemName: "shuffle")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(viewModel.shuffle ? palette.accent : palette.inkTertiary)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 22))
+
+                    Button {
+                        onHaptic()
+                        Task { await viewModel.playAdjacent(direction: -1) }
+                    } label: {
+                        Image(systemName: "backward.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(palette.inkPrimary)
+                            .frame(width: 48, height: 48)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 24))
+                    .disabled(!viewModel.canSkipPrevious)
+
+                    Button {
+                        onHaptic()
+                        Task { await viewModel.togglePlayback() }
+                    } label: {
+                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundStyle(palette.primaryForeground)
+                            .frame(width: 62, height: 62)
+                            .background(Circle().fill(palette.accent))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 31))
+
+                    Button {
+                        onHaptic()
+                        Task { await viewModel.playAdjacent(direction: 1) }
+                    } label: {
+                        Image(systemName: "forward.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(palette.inkPrimary)
+                            .frame(width: 48, height: 48)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 24))
+                    .disabled(!viewModel.canSkipNext)
+
+                    Button {
+                        onHaptic()
+                        viewModel.cycleLoopMode()
+                    } label: {
+                        Image(systemName: viewModel.loopMode == .one ? "repeat.1" : "repeat")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(viewModel.loopMode != .off ? palette.accent : palette.inkTertiary)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 22))
+                }
+
+                HStack(spacing: 10) {
+                    Image(systemName: "speaker.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.inkTertiary)
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.volume },
+                            set: { viewModel.setVolume($0) }
+                        ),
+                        in: 0.0...1.0
+                    )
+                    .tint(palette.accent)
+                    Image(systemName: "speaker.wave.3.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.inkTertiary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("待播队列 (\(viewModel.upcomingTracks.count))")
+                            .font(.system(size: 14, weight: .bold).monospacedDigit())
+                            .foregroundStyle(palette.inkPrimary)
+                        Spacer()
+                        if !viewModel.upNextQueue.isEmpty {
+                            Button {
+                                viewModel.clearUpNextQueue()
+                            } label: {
+                                Text("清空插播")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(palette.accent)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 4)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 6))
+                        }
+                    }
+
+                    ForEach(viewModel.upcomingTracks.prefix(8)) { item in
+                        let isManual = viewModel.isManualUpNext(trackId: item.id)
+                        HStack(spacing: 10) {
+                            Button {
+                                Task { await viewModel.playFromUpcomingQueue(item) }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    ArtworkView(
+                                        artworkData: nil,
+                                        seedText: item.name,
+                                        size: 34,
+                                        cornerRadius: 7,
+                                        palette: palette
+                                    )
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.name)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundStyle(palette.inkPrimary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Text(isManual ? "插播 · \(item.folderPath)" : item.folderPath)
+                                            .font(.system(size: 11.5))
+                                            .foregroundStyle(isManual ? palette.accent : palette.inkTertiary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 4)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 8, pressScale: 0.992))
+
+                            if isManual {
+                                Button {
+                                    viewModel.removeFromQueue(trackId: item.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(palette.inkTertiary)
+                                        .frame(width: 32, height: 32)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(InteractiveSurfaceButtonStyle(hoverOverlayColor: nil, cornerRadius: 16))
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(palette.surfaceSecondary)
+                        )
+                    }
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: 640)
+            .frame(maxWidth: .infinity)
+        }
+        .background(palette.surfacePrimary.ignoresSafeArea())
     }
 }
 #endif

@@ -7,16 +7,16 @@ import AppKit
 import UIKit
 #endif
 
-public struct TianyiWebLoginSheet: View {
-    @Bindable public var viewModel: CloudTuneViewModel
+package struct TianyiWebLoginSheet: View {
+    @Bindable package var viewModel: CloudTuneViewModel
     @Environment(\.colorScheme) private var colorScheme
     @State private var currentPageTitle: String = "正在加载天翼云盘官方登录页…"
 
-    public init(viewModel: CloudTuneViewModel) {
+    package init(viewModel: CloudTuneViewModel) {
         self.viewModel = viewModel
     }
 
-    public var body: some View {
+    package var body: some View {
         let palette = CloudTunePalette(isDark: colorScheme == .dark)
         VStack(spacing: 0) {
             HStack(spacing: 12) {

@@ -135,8 +135,15 @@ public enum SnapshotRenderer {
         isIPad: Bool
     ) throws -> Data {
         let size = isIPad ? CGSize(width: 1194, height: 834) : CGSize(width: 393, height: 852)
-        let palette = CloudTunePalette(isDark: isDark)
-        IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: palette)
+        let style: UIUserInterfaceStyle = isDark ? .dark : .light
+        let sizeClass: UIUserInterfaceSizeClass = isIPad ? .regular : .compact
+        IOSTabBarAppearance.apply()
+
+        let previousAnimationsEnabled = UIView.areAnimationsEnabled
+        UIView.setAnimationsEnabled(false)
+        defer {
+            UIView.setAnimationsEnabled(previousAnimationsEnabled)
+        }
 
         let vm = CloudTuneViewModel.fixture(scene: scene, fixture: fixture)
         vm.appearancePreference = isDark ? .dark : .light
@@ -145,20 +152,36 @@ public enum SnapshotRenderer {
             .environment(\.horizontalSizeClass, isIPad ? .regular : .compact)
 
         let controller = UIHostingController(rootView: rootView)
-        controller.overrideUserInterfaceStyle = isDark ? .dark : .light
-        controller.traitOverrides.horizontalSizeClass = isIPad ? .regular : .compact
+        controller.overrideUserInterfaceStyle = style
+        controller.traitOverrides.horizontalSizeClass = sizeClass
 
+        let activeScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first
+        let previousKeyWindow = activeScene?.windows.first(where: \.isKeyWindow)
         let window: UIWindow
-        if let activeScene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+        if let activeScene {
             window = UIWindow(windowScene: activeScene)
         } else {
             window = UIWindow(frame: CGRect(origin: .zero, size: size))
         }
         window.frame = CGRect(origin: .zero, size: size)
-        window.overrideUserInterfaceStyle = isDark ? .dark : .light
-        window.traitOverrides.horizontalSizeClass = isIPad ? .regular : .compact
+        window.bounds = CGRect(origin: .zero, size: size)
+        window.overrideUserInterfaceStyle = style
+        window.traitOverrides.horizontalSizeClass = sizeClass
         window.rootViewController = controller
-        window.isHidden = false
+        window.makeKeyAndVisible()
+
+        defer {
+            if controller.presentedViewController != nil {
+                controller.dismiss(animated: false)
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+
         controller.loadViewIfNeeded()
         controller.view.frame = CGRect(origin: .zero, size: size)
         controller.beginAppearanceTransition(true, animated: false)
@@ -167,21 +190,39 @@ public enum SnapshotRenderer {
         window.layoutIfNeeded()
         controller.view.setNeedsLayout()
         controller.view.layoutIfNeeded()
-        IOSTabBarAppearanceHelper.applyRecursively(in: controller, view: window, palette: palette)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+
+        let expectsPresentedSheet = (scene == .nowPlaying) || (isIPad && scene == .settings)
+        let pumpDeadline = Date().addingTimeInterval(expectsPresentedSheet ? 0.50 : 0.10)
+        while Date() < pumpDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            if expectsPresentedSheet, controller.presentedViewController != nil {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+                break
+            }
+        }
+
+        if let presented = controller.presentedViewController {
+            presented.overrideUserInterfaceStyle = style
+            presented.traitOverrides.horizontalSizeClass = sizeClass
+            presented.view.setNeedsLayout()
+            presented.view.layoutIfNeeded()
+        }
         window.setNeedsLayout()
         window.layoutIfNeeded()
-        IOSTabBarAppearanceHelper.applyRecursively(in: controller, view: window, palette: palette)
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 2.0
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
         let image = renderer.image { ctx in
-            window.layer.render(in: ctx.cgContext)
+            let drewWindow = window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            if !drewWindow {
+                window.layer.render(in: ctx.cgContext)
+                if let presentedView = controller.presentedViewController?.view, presentedView.window == nil {
+                    presentedView.layer.render(in: ctx.cgContext)
+                }
+            }
         }
-        window.isHidden = true
-        window.rootViewController = nil
         guard let png = image.pngData() else {
             throw CloudTuneError.storageError("无法编码 iOS PNG")
         }

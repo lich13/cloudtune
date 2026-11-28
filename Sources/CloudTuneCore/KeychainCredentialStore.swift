@@ -1,18 +1,18 @@
 import Foundation
 import Security
 
-public enum KeychainLoadResult: Equatable, Sendable {
+package enum KeychainLoadResult: Equatable, Sendable {
     case found(PersistedRefreshCredential)
     case notFound
     case deferredBySystem(Int32)
     case deniedOrFailed(Int32)
 
-    public static let cssmErrCSPInDarkWake: Int32 = -2_147_415_834
-    public static let errSecInteractionNotAllowedCode: Int32 = -25_308
-    public static let errSecInteractionRequiredCode: Int32 = -25_315
-    public static let errSecItemNotFoundCode: Int32 = -25_300
+    package static let cssmErrCSPInDarkWake: Int32 = -2_147_415_834
+    package static let errSecInteractionNotAllowedCode: Int32 = -25_308
+    package static let errSecInteractionRequiredCode: Int32 = -25_315
+    package static let errSecItemNotFoundCode: Int32 = -25_300
 
-    public static func classify(status: Int32, data: Data?) -> KeychainLoadResult {
+    package static func classify(status: Int32, data: Data?) -> KeychainLoadResult {
         if status == errSecSuccess {
             guard let data,
                   let cred = try? JSONDecoder().decode(PersistedRefreshCredential.self, from: data) else {
@@ -32,11 +32,11 @@ public enum KeychainLoadResult: Equatable, Sendable {
     }
 }
 
-public enum CredentialIssue: Equatable, Sendable {
+package enum CredentialIssue: Equatable, Sendable {
     case deferredBySystem(status: Int32)
     case deniedOrFailed(status: Int32)
 
-    public var userMessage: String {
+    package var userMessage: String {
         switch self {
         case let .deferredBySystem(code):
             return "系统正在唤醒或锁屏，钥匙串凭据读取已暂缓 (status=\(code))，未清除您的登录记录。"
@@ -46,7 +46,7 @@ public enum CredentialIssue: Equatable, Sendable {
     }
 }
 
-public protocol KeychainBackend: Sendable {
+package protocol KeychainBackend: Sendable {
     func readCredential() -> KeychainLoadResult
     func saveCredential(_ credential: PersistedRefreshCredential) throws
     func deleteCredential()
@@ -54,17 +54,17 @@ public protocol KeychainBackend: Sendable {
 
 /// Pure state machine governing Keychain access classification, DarkWake deferral protection,
 /// retry cooldowns, and ensuring transient ACL/DarkWake errors never trigger false logouts.
-public struct CredentialStateMachine: Sendable {
-    public static let retryCooldownSec: TimeInterval = 3.0
+package struct CredentialStateMachine: Sendable {
+    package static let retryCooldownSec: TimeInterval = 3.0
 
-    public private(set) var cachedCredential: PersistedRefreshCredential?
-    public private(set) var activeIssue: CredentialIssue?
-    public private(set) var isKnownMissing: Bool = false
+    package private(set) var cachedCredential: PersistedRefreshCredential?
+    package private(set) var activeIssue: CredentialIssue?
+    package private(set) var isKnownMissing: Bool = false
     private var lastAttemptAt: Date?
 
-    public init() {}
+    package init() {}
 
-    public mutating func load(
+    package mutating func load(
         isInteractiveGUI: Bool,
         userInitiatedRetry: Bool = false,
         now: Date = Date(),
@@ -119,14 +119,14 @@ public struct CredentialStateMachine: Sendable {
         }
     }
 
-    public mutating func save(_ credential: PersistedRefreshCredential, backend: KeychainBackend) throws {
+    package mutating func save(_ credential: PersistedRefreshCredential, backend: KeychainBackend) throws {
         try backend.saveCredential(credential)
         cachedCredential = credential
         activeIssue = nil
         isKnownMissing = false
     }
 
-    public mutating func clear(backend: KeychainBackend) {
+    package mutating func clear(backend: KeychainBackend) {
         backend.deleteCredential()
         cachedCredential = nil
         activeIssue = nil
@@ -134,16 +134,16 @@ public struct CredentialStateMachine: Sendable {
     }
 }
 
-public struct SystemKeychainBackend: KeychainBackend {
-    public let service: String
-    public let account: String
+package struct SystemKeychainBackend: KeychainBackend {
+    package let service: String
+    package let account: String
 
-    public init(service: String = "com.gosu.cloudtune.session", account: String = "primary") {
+    package init(service: String = "com.gosu.cloudtune.session", account: String = "primary") {
         self.service = service
         self.account = account
     }
 
-    public func readCredential() -> KeychainLoadResult {
+    package func readCredential() -> KeychainLoadResult {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -156,7 +156,7 @@ public struct SystemKeychainBackend: KeychainBackend {
         return KeychainLoadResult.classify(status: status, data: item as? Data)
     }
 
-    public func saveCredential(_ credential: PersistedRefreshCredential) throws {
+    package func saveCredential(_ credential: PersistedRefreshCredential) throws {
         let data = try JSONEncoder().encode(credential)
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -185,7 +185,7 @@ public struct SystemKeychainBackend: KeychainBackend {
         }
     }
 
-    public func deleteCredential() {
+    package func deleteCredential() {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -196,35 +196,35 @@ public struct SystemKeychainBackend: KeychainBackend {
 }
 
 #if DEBUG
-public final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
+package final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
     private let lock = NSLock()
     private var stored: PersistedRefreshCredential?
     private var nextReadOverride: KeychainLoadResult?
     private var simulatedSaveError: Error?
     private var _readCallCount: Int = 0
 
-    public init(_ initial: PersistedRefreshCredential? = nil, simulatedSaveError: Error? = nil) {
+    package init(_ initial: PersistedRefreshCredential? = nil, simulatedSaveError: Error? = nil) {
         self.stored = initial
         self.simulatedSaveError = simulatedSaveError
     }
 
-    public var current: PersistedRefreshCredential? {
+    package var current: PersistedRefreshCredential? {
         lock.withLock { stored }
     }
 
-    public var readCallCount: Int {
+    package var readCallCount: Int {
         lock.withLock { _readCallCount }
     }
 
-    public func setNextReadResult(_ result: KeychainLoadResult?) {
+    package func setNextReadResult(_ result: KeychainLoadResult?) {
         lock.withLock { nextReadOverride = result }
     }
 
-    public func setSaveError(_ error: Error?) {
+    package func setSaveError(_ error: Error?) {
         lock.withLock { simulatedSaveError = error }
     }
 
-    public func readCredential() -> KeychainLoadResult {
+    package func readCredential() -> KeychainLoadResult {
         lock.withLock {
             _readCallCount += 1
             if let nextReadOverride {
@@ -237,7 +237,7 @@ public final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable
         }
     }
 
-    public func saveCredential(_ credential: PersistedRefreshCredential) throws {
+    package func saveCredential(_ credential: PersistedRefreshCredential) throws {
         try lock.withLock {
             if let simulatedSaveError {
                 throw simulatedSaveError
@@ -247,7 +247,7 @@ public final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable
         }
     }
 
-    public func deleteCredential() {
+    package func deleteCredential() {
         lock.withLock {
             stored = nil
             nextReadOverride = nil

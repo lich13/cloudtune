@@ -2,22 +2,22 @@ import Foundation
 
 /// Global remote request concurrency limiter (`maxPermits = 8`) shared across stream proxy,
 /// background next-track prefetch, full-track playback cache, and user export downloads.
-public actor GlobalTransferSemaphore {
+package actor GlobalTransferSemaphore {
     private struct Waiter {
         let id: UUID
         let continuation: CheckedContinuation<Void, Error>
     }
 
-    public let maxPermits: Int
-    public private(set) var activePermits: Int = 0
-    public private(set) var peakObservedPermits: Int = 0
+    package let maxPermits: Int
+    package private(set) var activePermits: Int = 0
+    package private(set) var peakObservedPermits: Int = 0
     private var waiters: [Waiter] = []
 
-    public init(maxPermits: Int = 8) {
+    package init(maxPermits: Int = 8) {
         self.maxPermits = max(1, maxPermits)
     }
 
-    public func acquire() async throws {
+    package func acquire() async throws {
         try Task.checkCancellation()
         if activePermits < maxPermits {
             activePermits += 1
@@ -50,7 +50,7 @@ public actor GlobalTransferSemaphore {
         removed.continuation.resume(throwing: CancellationError())
     }
 
-    public func release() {
+    package func release() {
         guard activePermits > 0 else { return }
         while !waiters.isEmpty {
             let next = waiters.removeFirst()
@@ -61,26 +61,26 @@ public actor GlobalTransferSemaphore {
     }
 }
 
-public struct ParsedByteRange: Equatable, Sendable {
-    public let start: UInt64
-    public let end: UInt64?
-    public let suffixLength: UInt64?
+package struct ParsedByteRange: Equatable, Sendable {
+    package let start: UInt64
+    package let end: UInt64?
+    package let suffixLength: UInt64?
 
-    public init(start: UInt64, end: UInt64?, suffixLength: UInt64? = nil) {
+    package init(start: UInt64, end: UInt64?, suffixLength: UInt64? = nil) {
         self.start = start
         self.end = end
         self.suffixLength = suffixLength
     }
 
-    public static func suffix(_ length: UInt64) -> ParsedByteRange {
+    package static func suffix(_ length: UInt64) -> ParsedByteRange {
         ParsedByteRange(start: 0, end: nil, suffixLength: length)
     }
 
-    public var isSuffix: Bool {
+    package var isSuffix: Bool {
         suffixLength != nil
     }
 
-    public var headerValue: String {
+    package var headerValue: String {
         if let suffixLength {
             return "bytes=-\(suffixLength)"
         }
@@ -92,7 +92,7 @@ public struct ParsedByteRange: Equatable, Sendable {
 
     /// Resolves this range against a known `totalLength > 0` into inclusive `(start, end)`.
     /// Returns `nil` when unsatisfiable (`416 Range Not Satisfiable`).
-    public func resolve(totalLength: UInt64) -> (start: UInt64, end: UInt64)? {
+    package func resolve(totalLength: UInt64) -> (start: UInt64, end: UInt64)? {
         guard totalLength > 0 else { return nil }
         if let suffixLength {
             guard suffixLength > 0 else { return nil }
@@ -106,16 +106,16 @@ public struct ParsedByteRange: Equatable, Sendable {
     }
 }
 
-public struct ParsedContentRange: Equatable, Sendable {
-    public let start: UInt64
-    public let end: UInt64
-    public let totalLength: UInt64?
+package struct ParsedContentRange: Equatable, Sendable {
+    package let start: UInt64
+    package let end: UInt64
+    package let totalLength: UInt64?
 }
 
-public enum RangeHeaderValidator {
+package enum RangeHeaderValidator {
     /// Parse single-range `bytes=start-[end]` or RFC 9110 suffix range `bytes=-N` (`N > 0`).
     /// Returns `nil` when absent or invalid (including `bytes=-0`).
-    public static func parseRequestRange(_ rawHeader: String?) -> ParsedByteRange? {
+    package static func parseRequestRange(_ rawHeader: String?) -> ParsedByteRange? {
         guard let raw = rawHeader?.trimmingCharacters(in: .whitespacesAndNewlines),
               raw.lowercased().hasPrefix("bytes="),
               !raw.contains(",") else {
@@ -143,7 +143,7 @@ public enum RangeHeaderValidator {
 
     /// Write-through cache is ONLY permitted when `Range` is absent OR `Range: bytes=0-` (no upper bound).
     /// Probes like `bytes=0-1`, suffix ranges `bytes=-N`, or mid-stream seeks like `bytes=65536-` NEVER write through to cache.
-    public static func canWriteThroughToCache(rangeHeader: String?) -> Bool {
+    package static func canWriteThroughToCache(rangeHeader: String?) -> Bool {
         guard let raw = rangeHeader?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return true
         }
@@ -153,7 +153,7 @@ public enum RangeHeaderValidator {
         return !parsed.isSuffix && parsed.start == 0 && parsed.end == nil
     }
 
-    public static func parseContentRange(_ rawHeader: String?) -> ParsedContentRange? {
+    package static func parseContentRange(_ rawHeader: String?) -> ParsedContentRange? {
         guard let raw = rawHeader?.trimmingCharacters(in: .whitespacesAndNewlines) else {
             return nil
         }
@@ -175,7 +175,7 @@ public enum RangeHeaderValidator {
 
     /// Extracts authoritative full asset byte length ONLY from `Content-Range` `/total` on `206`
     /// or `Content-Length` on un-ranged `200 OK`.
-    public static func extractFullAssetLength(
+    package static func extractFullAssetLength(
         statusCode: Int,
         requestHadRange: Bool,
         contentRangeHeader: String?,
@@ -195,7 +195,7 @@ public enum RangeHeaderValidator {
 
     /// Validates an upstream non-zero or resume response at `expectedStartOffset`.
     /// When `expectedStartOffset > 0`, upstream MUST return `206 Partial Content` with matching `Content-Range` start!
-    public static func validateResumeResponse(
+    package static func validateResumeResponse(
         expectedStartOffset: UInt64,
         statusCode: Int,
         contentRangeHeader: String?
@@ -217,7 +217,7 @@ public enum RangeHeaderValidator {
     /// Validates an upstream response to a suffix range request `bytes=-N` (`N > 0`).
     /// Upstream MUST return `206` with `Content-Range: bytes S-E/T` where `E + 1 == T` and `S == (T > N ? T - N : 0)`.
     @discardableResult
-    public static func validateSuffixResponse(
+    package static func validateSuffixResponse(
         suffixLength: UInt64,
         statusCode: Int,
         contentRangeHeader: String?
@@ -242,7 +242,7 @@ public enum RangeHeaderValidator {
         return cr
     }
 
-    public static func splitByteRanges(totalSize: UInt64, partCount: Int) -> [(start: UInt64, end: UInt64)] {
+    package static func splitByteRanges(totalSize: UInt64, partCount: Int) -> [(start: UInt64, end: UInt64)] {
         guard totalSize > 0 else { return [] }
         let parts = max(1, partCount)
         let partSize = (totalSize + UInt64(parts) - 1) / UInt64(parts)
@@ -257,7 +257,7 @@ public enum RangeHeaderValidator {
     }
 }
 
-public enum PlaybackFailureAction: Equatable, Sendable {
+package enum PlaybackFailureAction: Equatable, Sendable {
     case fallbackToStreamProxyOnce
     case fallbackToFullDownloadOnce
     case stopImmediatelyUnsupportedCodec(String)
@@ -265,13 +265,13 @@ public enum PlaybackFailureAction: Equatable, Sendable {
     case stopAfterMaxRetries
 }
 
-public enum PlaybackDecisionPolicy {
-    public static let largeTrackThresholdBytes: UInt64 = 16 * 1024 * 1024
-    public static let maxRecoveryAttempts: Int = 6
+package enum PlaybackDecisionPolicy {
+    package static let largeTrackThresholdBytes: UInt64 = 16 * 1024 * 1024
+    package static let maxRecoveryAttempts: Int = 6
 
     /// Determines whether a track should be downloaded in full before playback starts.
     /// `forceStreamProxy = true` (triggered by `download-timeout-fallback`) bypasses the 16 MiB guard once.
-    public static func shouldDownloadBeforePlayback(
+    package static func shouldDownloadBeforePlayback(
         mode: PlaybackMode,
         sizeBytes: UInt64,
         forceStreamProxy: Bool
@@ -285,7 +285,7 @@ public enum PlaybackDecisionPolicy {
         return sizeBytes >= largeTrackThresholdBytes
     }
 
-    public static func classifyPlaybackFailure(
+    package static func classifyPlaybackFailure(
         fileName: String,
         wasLoopbackStream: Bool,
         wasDownloadPhaseTimeout: Bool,

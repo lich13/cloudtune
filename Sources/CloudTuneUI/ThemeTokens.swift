@@ -2,7 +2,7 @@ import CloudTuneCore
 import SwiftUI
 
 extension AppearanceMode {
-    public var preferredColorScheme: ColorScheme? {
+    package var preferredColorScheme: ColorScheme? {
         switch self {
         case .system: return nil
         case .light: return .light
@@ -13,36 +13,36 @@ extension AppearanceMode {
 
 /// Pure airy neutral palette paired with low-saturation pine-teal accent (`#2A6F5B` / `#58A88F`)
 /// and fixed high-contrast QR substrate (`#F6F1E8` / `#13271F`).
-public struct CloudTunePalette: Sendable {
-    public let isDark: Bool
-    public let canvasBackground: Color
-    public let sidebarBackground: Color
-    public let surfacePrimary: Color
-    public let surfaceSecondary: Color
-    public let surfaceElevated: Color
-    public let rowSurface: Color
-    public let rowHoverSurface: Color
-    public let rowActiveSurface: Color
-    public let rowActiveBorder: Color
-    public let inputSurface: Color
-    public let separator: Color
-    public let cardBorder: Color
-    public let accent: Color
-    public let accentSoft: Color
-    public let accentBorder: Color
-    public let inkPrimary: Color
-    public let inkSecondary: Color
-    public let inkTertiary: Color
-    public let primaryStart: Color
-    public let primaryEnd: Color
-    public let primaryForeground: Color
-    public let destructive: Color
-    public let noticeBackground: Color
+package struct CloudTunePalette: Sendable {
+    package let isDark: Bool
+    package let canvasBackground: Color
+    package let sidebarBackground: Color
+    package let surfacePrimary: Color
+    package let surfaceSecondary: Color
+    package let surfaceElevated: Color
+    package let rowSurface: Color
+    package let rowHoverSurface: Color
+    package let rowActiveSurface: Color
+    package let rowActiveBorder: Color
+    package let inputSurface: Color
+    package let separator: Color
+    package let cardBorder: Color
+    package let accent: Color
+    package let accentSoft: Color
+    package let accentBorder: Color
+    package let inkPrimary: Color
+    package let inkSecondary: Color
+    package let inkTertiary: Color
+    package let primaryStart: Color
+    package let primaryEnd: Color
+    package let primaryForeground: Color
+    package let destructive: Color
+    package let noticeBackground: Color
     // Fixed across light and dark modes so QR scanners always read dark-on-light reliably
-    public let qrSubstrate: Color
-    public let qrForeground: Color
+    package let qrSubstrate: Color
+    package let qrForeground: Color
 
-    public init(isDark: Bool) {
+    package init(isDark: Bool) {
         self.isDark = isDark
         self.qrSubstrate = Color(red: 0xF6 / 255.0, green: 0xF1 / 255.0, blue: 0xE8 / 255.0)
         self.qrForeground = Color(red: 0x13 / 255.0, green: 0x27 / 255.0, blue: 0x1F / 255.0)
@@ -111,7 +111,7 @@ public struct CloudTunePalette: Sendable {
         }
     }
 
-    public var primaryGradient: LinearGradient {
+    package var primaryGradient: LinearGradient {
         LinearGradient(colors: [primaryStart, primaryEnd], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }

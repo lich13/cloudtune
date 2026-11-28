@@ -21,6 +21,8 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -302,10 +304,28 @@ class CloudTuneSnapshotTest {
 
     @Test
     fun verifySafFirstExportAndDecoupledExternalVideoGeneration(): Unit = kotlinx.coroutines.runBlocking {
-        val tempRoot = Files.createTempDirectory("cloudtune-saf-ext").toFile()
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        val activity = controller.get()
+        val scopedFilesRoot = File(activity.applicationContext.filesDir, "saf-ext-test").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val mediaBytes = ByteArray(64) { 0x42 }
         try {
-            val activity = controller.get()
+            val store = com.gosu.cloudtune.data.AccountStore(scopedFilesRoot)
+            val preseedPaths = store.paths("saf@example.invalid")
+            val preseedCache = com.gosu.cloudtune.core.CacheManager(preseedPaths.cacheDir)
+            val preseededVideoFile = preseedCache.cacheFile("vid-dl-cached", "CachedShow.mp4").apply {
+                parentFile?.mkdirs()
+                writeBytes(mediaBytes)
+            }
+            preseedCache.recordCompletedFile(
+                trackId = "vid-dl-cached",
+                file = preseededVideoFile,
+                sizeBytes = mediaBytes.size.toLong(),
+                limitBytes = 16L * 1024L * 1024L
+            )
+
             var videoEntered = kotlinx.coroutines.CompletableDeferred<Unit>()
             var videoRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
             val transport = object : com.gosu.cloudtune.core.CloudHttpTransport {
@@ -329,9 +349,12 @@ class CloudTuneSnapshotTest {
                             com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
                         }
                         url.contains("getFileDownloadUrl.action") -> {
-                            if (url.contains("fileId=vid-gated")) {
+                            if (url.contains("fileId=vid-gated") || url.contains("fileId=vid-dl-gated")) {
                                 videoEntered.complete(Unit)
                                 videoRelease.await()
+                                if (url.contains("fileId=vid-dl-gated")) {
+                                    throw com.gosu.cloudtune.core.CloudTuneException("模拟视频缓存源波动")
+                                }
                             }
                             val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/media.mp4"}"""
                             com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
@@ -351,7 +374,7 @@ class CloudTuneSnapshotTest {
             val runtime = CloudTuneAppRuntime(
                 appContext = activity.applicationContext,
                 cloudClient = com.gosu.cloudtune.core.Cloud189Client(transport),
-                accountStore = com.gosu.cloudtune.data.AccountStore(tempRoot),
+                accountStore = store,
                 credentialStore = memCredStore,
                 limiter = com.gosu.cloudtune.core.GlobalTransferLimiter(8),
                 enableLiveLoops = false,
@@ -361,7 +384,7 @@ class CloudTuneSnapshotTest {
             runtime.bootstrap().await()
             assertTrue(runtime.isAuthenticated)
 
-            // 1) Issue 4: onSafTreeSelected persists exportTreeUri for active account BEFORE invoking onSaved
+            // 1) Issue 4: onSafTreeSelected persists exportTreeUri for active account BEFORE invoking onSaved, and ignores logged-out calls
             assertNull(runtime.committedSettings.exportTreeUri)
             val pickedUri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ACloudTuneExports")
             var callbackUri: String? = null
@@ -375,17 +398,56 @@ class CloudTuneSnapshotTest {
                 runtime.accountStore.loadSettingsOrNull(runtime.accountStorageKey!!)?.exportTreeUri
             )
 
-            // 2) Issue 10: Background audio playTrack (incrementing playbackGeneration) MUST NOT abort openVideoExternally
-            val gatedVideo = com.gosu.cloudtune.core.TrackSummary("vid-gated", "Stage4K.mp4", "Videos", 4096L)
+            runtime.logout()
+            runtime.cookieCleanupDeferred?.await()
+            var postLogoutCallbackInvoked = false
+            runtime.onSafTreeSelected(activity, pickedUri) { postLogoutCallbackInvoked = true }
+            assertFalse(postLogoutCallbackInvoked)
+            assertNull(runtime.committedSettings.exportTreeUri)
+
+            savedCred = com.gosu.cloudtune.core.PersistedRefreshCredential.createOrNull("rt_saf_2", "saf@example.invalid")
+            runtime.bootstrap().await()
+            assertTrue(runtime.isAuthenticated)
+
+            // 2) Issue 10a: Background audio playTrack (incrementing playbackGeneration) MUST NOT abort openVideoExternally
+            val gatedVideo = com.gosu.cloudtune.core.TrackSummary("vid-gated", "Stage4K.mp4", "Videos", mediaBytes.size.toLong())
             runtime.updatePlaybackMode(com.gosu.cloudtune.core.PlaybackMode.STREAM_CACHE)
             runtime.openVideoExternally(activity, gatedVideo)
             val extJob = runtime.lastExternalVideoJob
             kotlinx.coroutines.withTimeout(5000L) { videoEntered.await() }
-            runtime.playTrack(com.gosu.cloudtune.core.TrackSummary("audio-bg", "AutoAdvance.flac", "Music", 1024L))
+            runtime.playTrack(com.gosu.cloudtune.core.TrackSummary("audio-bg", "AutoAdvance.flac", "Music", mediaBytes.size.toLong()))
             assertEquals("audio-bg", runtime.currentTrackId)
             videoRelease.complete(Unit)
             extJob?.join()
             assertEquals("vid-gated", runtime.pendingExternalVideoAction?.video?.id)
+
+            // 2b) Issue 10b: downloadVideoAndOpenExternally MUST ALSO survive background audio playTrack (not aborted by playbackGeneration)
+            runtime.pendingExternalVideoAction = null
+            videoEntered = kotlinx.coroutines.CompletableDeferred()
+            videoRelease = kotlinx.coroutines.CompletableDeferred()
+            val dlGatedVideo = com.gosu.cloudtune.core.TrackSummary("vid-dl-gated", "GatedShow.mp4", "Videos", mediaBytes.size.toLong())
+            runtime.downloadVideoAndOpenExternally(activity, dlGatedVideo)
+            val dlExtJob = runtime.lastExternalVideoJob
+            kotlinx.coroutines.withTimeout(5000L) { videoEntered.await() }
+            runtime.playTrack(com.gosu.cloudtune.core.TrackSummary("audio-bg-2", "AutoAdvance2.flac", "Music", mediaBytes.size.toLong()))
+            assertEquals("audio-bg-2", runtime.currentTrackId)
+            videoRelease.complete(Unit)
+            dlExtJob?.join()
+            assertTrue(
+                "downloadVideoAndOpenExternally must retain its externalVideoGeneration across playTrack, got: ${runtime.statusMessage}",
+                runtime.statusMessage?.contains("模拟视频缓存源波动") == true
+            )
+
+            Shadows.shadowOf(activity as android.app.Activity).clearNextStartedActivities()
+            val dlCachedVideo = com.gosu.cloudtune.core.TrackSummary("vid-dl-cached", "CachedShow.mp4", "Videos", mediaBytes.size.toLong())
+            runtime.downloadVideoAndOpenExternally(activity, dlCachedVideo)
+            runtime.lastExternalVideoJob?.join()
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(runtime.cacheUsageBytes >= mediaBytes.size.toLong())
+            assertNotNull(
+                "downloadVideoAndOpenExternally must launch FileProvider chooser for cached video",
+                Shadows.shadowOf(activity as android.app.Activity).nextStartedActivity
+            )
 
             // Conversely, openVideoInApp MUST cancel/invalidate pending external video handoff
             runtime.pendingExternalVideoAction = null
@@ -394,7 +456,7 @@ class CloudTuneSnapshotTest {
             runtime.openVideoExternally(activity, gatedVideo)
             val extJob2 = runtime.lastExternalVideoJob
             kotlinx.coroutines.withTimeout(5000L) { videoEntered.await() }
-            runtime.openVideoInApp(com.gosu.cloudtune.core.TrackSummary("vid-inapp", "InApp.mp4", "Videos", 2048L))
+            runtime.openVideoInApp(com.gosu.cloudtune.core.TrackSummary("vid-inapp", "InApp.mp4", "Videos", mediaBytes.size.toLong()))
             videoRelease.complete(Unit)
             extJob2?.join()
             assertNull(runtime.pendingExternalVideoAction)
@@ -402,7 +464,7 @@ class CloudTuneSnapshotTest {
             Unit
         } finally {
             controller.pause().stop().destroy()
-            tempRoot.deleteRecursively()
+            scopedFilesRoot.deleteRecursively()
         }
     }
 }

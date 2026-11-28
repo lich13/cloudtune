@@ -564,6 +564,8 @@ struct CloudTuneUITests {
             try? FileManager.default.removeItem(at: root)
         }
 
+        let videoFixtureBytes = Data(repeating: 0x5A, count: 64)
+
         actor SequencedMockTransport: CloudHTTPTransport {
             private var slowFolderEntered: CheckedContinuation<Void, Never>?
             private var slowFolderRelease: CheckedContinuation<Void, Never>?
@@ -573,7 +575,29 @@ struct CloudTuneUITests {
             private var videoUrlRelease: CheckedContinuation<Void, Never>?
             private var hasEnteredVideoUrl = false
             private var isVideoUrlReleased = false
+            private var authEntered: CheckedContinuation<Void, Never>?
+            private var authRelease: CheckedContinuation<Void, Never>?
+            private var gateNextAuth = false
+            private var hasEnteredAuth = false
             private var downloadUrlCount = 0
+
+            func enableAuthGate() {
+                gateNextAuth = true
+                hasEnteredAuth = false
+                authEntered = nil
+                authRelease = nil
+            }
+
+            func waitUntilEnteredAuth() async {
+                if hasEnteredAuth { return }
+                await withCheckedContinuation { cont in authEntered = cont }
+            }
+
+            func releaseAuth() {
+                gateNextAuth = false
+                authRelease?.resume()
+                authRelease = nil
+            }
 
             func resetVideoGate() {
                 hasEnteredVideoUrl = false
@@ -619,6 +643,14 @@ struct CloudTuneUITests {
                 let path = url.path
                 let query = url.query ?? ""
                 if path.contains("getSessionForPC.action") {
+                    if gateNextAuth {
+                        hasEnteredAuth = true
+                        authEntered?.resume()
+                        authEntered = nil
+                        if gateNextAuth {
+                            await withCheckedContinuation { cont in authRelease = cont }
+                        }
+                    }
                     let b = #"{"res_code":0,"loginName":"r14@example.invalid","accessToken":"at","refreshToken":"rt_r14","sessionKey":"sk","sessionSecret":"ss"}"#
                     return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
                 }
@@ -642,12 +674,15 @@ struct CloudTuneUITests {
                 }
                 if path.contains("getFileDownloadUrl.action") {
                     downloadUrlCount += 1
-                    if query.contains("fileId=vid-gated") {
+                    if query.contains("fileId=vid-gated") || query.contains("fileId=vid-dl-gated") {
                         hasEnteredVideoUrl = true
                         videoUrlEntered?.resume()
                         videoUrlEntered = nil
                         if !isVideoUrlReleased {
                             await withCheckedContinuation { cont in videoUrlRelease = cont }
+                        }
+                        if query.contains("fileId=vid-dl-gated") {
+                            throw CloudTuneError.protocolError("模拟视频缓存源波动")
                         }
                     }
                     let b = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/stream.bin"}"#
@@ -662,6 +697,16 @@ struct CloudTuneUITests {
 
         let transport = SequencedMockTransport()
         let store = try AccountScopedStore(rootDirectory: root)
+        let preseedPaths = try await store.paths(for: "r14@example.invalid")
+        let preseedCache = try CacheStore(cacheDirectory: preseedPaths.cacheDir, indexURL: preseedPaths.cacheIndexURL)
+        let preseededVideoURL = await preseedCache.cacheFileURL(trackId: "vid-dl-cached", originalFileName: "CachedShow.mp4")
+        try videoFixtureBytes.write(to: preseededVideoURL, options: .atomic)
+        _ = try await preseedCache.recordCompletedFile(
+            trackId: "vid-dl-cached",
+            fileURL: preseededVideoURL,
+            sizeBytes: UInt64(videoFixtureBytes.count),
+            limitBytes: 64 * 1024 * 1024
+        )
         let keychain = InMemoryKeychainBackend(simulatedSaveError: CloudTuneError.storageError("模拟钥匙串拒绝写入"))
         let vm = CloudTuneViewModel(
             cloudClient: Cloud189Client(transport: transport),
@@ -770,6 +815,34 @@ struct CloudTuneUITests {
         _ = await extTask.value
         #expect(vm.pendingExternalVideoChoice?.video.id == "vid-gated")
 
+        // Issue 10b: downloadVideoAndPrepareLocalFile MUST ALSO stay active across background audio playTrack (incrementing playbackGeneration)
+        await transport.resetVideoGate()
+        let dlGatedVideo = TrackSummary(
+            id: "vid-dl-gated",
+            name: "GatedShow.mp4",
+            folderPath: "Videos",
+            sizeBytes: UInt64(videoFixtureBytes.count)
+        )
+        let dlVideoTask = Task { @MainActor in
+            await vm.downloadVideoAndPrepareLocalFile(dlGatedVideo)
+        }
+        await transport.waitUntilEnteredVideoUrl()
+        await vm.playTrack(TrackSummary(id: "bg-song-2", name: "AutoAdvance2.flac", folderPath: "Music", sizeBytes: 64))
+        #expect(vm.currentTrackId == "bg-song-2")
+        await transport.releaseVideoUrl()
+        _ = await dlVideoTask.value
+        #expect(vm.statusMessage?.contains("模拟视频缓存源波动") == true)
+
+        let dlCachedVideo = TrackSummary(
+            id: "vid-dl-cached",
+            name: "CachedShow.mp4",
+            folderPath: "Videos",
+            sizeBytes: UInt64(videoFixtureBytes.count)
+        )
+        let preparedLocalVideoURL = await vm.downloadVideoAndPrepareLocalFile(dlCachedVideo)
+        #expect(preparedLocalVideoURL == preseededVideoURL)
+        #expect(vm.shareFileURL == preseededVideoURL)
+
         // Conversely, openVideoInApp MUST invalidate in-flight external video preparation
         vm.pendingExternalVideoChoice = nil
         await transport.resetVideoGate()
@@ -778,7 +851,7 @@ struct CloudTuneUITests {
         }
         await transport.waitUntilEnteredVideoUrl()
         let inAppTask = Task { @MainActor in
-            await vm.openVideoInApp(TrackSummary(id: "vid-inapp", name: "InApp.mp4", folderPath: "Videos", sizeBytes: 2048))
+            await vm.openVideoInApp(TrackSummary(id: "vid-inapp", name: "InApp.mp4", folderPath: "Videos", sizeBytes: 64))
         }
         await transport.releaseVideoUrl()
         _ = await cancelledByInAppTask.value
@@ -786,26 +859,38 @@ struct CloudTuneUITests {
         #expect(vm.pendingExternalVideoChoice == nil)
         #expect(vm.activeVideoTrack?.id == "vid-inapp")
 
-        // Issue 5: Write-through callback completing after track change must not overwrite newer track's nowPlayingMetadata
-        let songA = TrackSummary(id: "wt-song-a", name: "SongA.flac", folderPath: "AlbumA", sizeBytes: 1024)
-        let songB = TrackSummary(id: "wt-song-b", name: "SongB.flac", folderPath: "AlbumB", sizeBytes: 1024)
-        await vm.playTrack(songB)
-        #expect(vm.currentTrackId == "wt-song-b")
-        let fakeCachedURL = root.appendingPathComponent("nonexistent-a.flac")
+        // Issue 5: Write-through callback updates cacheUsageBytes & metadata for active track,
+        // and rejects stale track/generation
+        let songA = TrackSummary(id: "wt-song-a", name: "SongA.flac", folderPath: "AlbumA", sizeBytes: 64)
+        let songB = TrackSummary(id: "wt-song-b", name: "SongB.flac", folderPath: "AlbumB", sizeBytes: 64)
+        await vm.playTrack(songA)
+        #expect(vm.currentTrackId == "wt-song-a")
+        vm.cacheUsageBytes = 0
+        let cachedFileForProbe = try #require(preparedLocalVideoURL)
         await vm.handleWriteThroughCompleted(
             accountHash: Cloud189Protocol.accountBucketHash(for: acctKey),
             trackId: songA.id,
-            localFileURL: fakeCachedURL
+            localFileURL: cachedFileForProbe
+        )
+        #expect(vm.cacheUsageBytes >= UInt64(videoFixtureBytes.count))
+        #expect(vm.nowPlayingMetadata?.title == "SongA.flac")
+
+        await vm.playTrack(songB)
+        #expect(vm.currentTrackId == "wt-song-b")
+        await vm.handleWriteThroughCompleted(
+            accountHash: Cloud189Protocol.accountBucketHash(for: acctKey),
+            trackId: songA.id,
+            localFileURL: cachedFileForProbe
         )
         #expect(vm.nowPlayingMetadata?.title == "SongB.flac")
 
         // Issue 12 & 13: togglePlayback() when currentTrack == nil consumes upNextQueue first; playFromUpcomingQueue removes manual item
         vm.activeTrack = nil
         vm.currentTrackId = nil
-        let lib1 = TrackSummary(id: "lib-1", name: "Lib1.flac", folderPath: "Music", sizeBytes: 512)
-        let lib2 = TrackSummary(id: "lib-2", name: "Lib2.flac", folderPath: "Music", sizeBytes: 512)
-        let queuedCloud = TrackSummary(id: "queued-cloud", name: "QueuedCloud.flac", folderPath: "Cloud", sizeBytes: 512)
-        let manualSecond = TrackSummary(id: "manual-2", name: "Manual2.flac", folderPath: "Cloud", sizeBytes: 512)
+        let lib1 = TrackSummary(id: "lib-1", name: "Lib1.flac", folderPath: "Music", sizeBytes: 64)
+        let lib2 = TrackSummary(id: "lib-2", name: "Lib2.flac", folderPath: "Music", sizeBytes: 64)
+        let queuedCloud = TrackSummary(id: "queued-cloud", name: "QueuedCloud.flac", folderPath: "Cloud", sizeBytes: 64)
+        let manualSecond = TrackSummary(id: "manual-2", name: "Manual2.flac", folderPath: "Cloud", sizeBytes: 64)
         vm.tracks = [lib1, lib2]
         vm.shuffle = false
         vm.loopMode = .off
@@ -822,6 +907,22 @@ struct CloudTuneUITests {
         #expect(vm.upNextQueue.isEmpty)
         await vm.playAdjacent(direction: 1)
         #expect(vm.currentTrack?.id == "lib-1")
+
+        // Auth generation guard: completeEmbeddedWebLogin suspended across logout() MUST NOT resurrect session
+        await vm.logout()
+        await transport.enableAuthGate()
+        let racingLoginTask = Task { @MainActor in
+            await vm.completeEmbeddedWebLogin(
+                callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=aborted")!,
+                cookies: []
+            )
+        }
+        await transport.waitUntilEnteredAuth()
+        await vm.logout()
+        await transport.releaseAuth()
+        await racingLoginTask.value
+        #expect(vm.isAuthenticated == false)
+        #expect(vm.accountStorageKey == nil)
     }
 
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")

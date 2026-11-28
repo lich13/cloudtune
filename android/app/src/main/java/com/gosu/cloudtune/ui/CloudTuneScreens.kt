@@ -112,6 +112,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
 import com.gosu.cloudtune.core.AppearanceMode
 import com.gosu.cloudtune.core.BreadcrumbItem
+import com.gosu.cloudtune.core.BrowserPaneState
 import com.gosu.cloudtune.core.BrowserScope
 import com.gosu.cloudtune.core.Cloud189Constants
 import com.gosu.cloudtune.core.Cloud189Protocol
@@ -1521,7 +1522,7 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
     val payload = pane.payload
     var backProgress by remember { mutableFloatStateOf(0f) }
     var pendingFile by remember { mutableStateOf<TrackSummary?>(null) }
-    var pendingFolder by remember { mutableStateOf(false) }
+    var pendingFolderPane by remember { mutableStateOf<BrowserPaneState?>(null) }
 
     PredictiveBackHandler(
         enabled = pane.breadcrumbs.size > 1 && runtime.activeVideoUrl == null && !runtime.isShowingNowPlayingSheet
@@ -1539,16 +1540,15 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
 
     val safLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         val fileTarget = pendingFile
-        val folderTarget = pendingFolder
-        val capturedPane = pane
+        val folderPaneTarget = pendingFolderPane
         pendingFile = null
-        pendingFolder = false
+        pendingFolderPane = null
         if (uri != null) {
             runtime.onSafTreeSelected(context, uri) { savedTreeUri ->
                 if (fileTarget != null) {
                     runtime.enqueueDownload(context, fileTarget, treeUriString = savedTreeUri)
-                } else if (folderTarget) {
-                    runtime.enqueueCurrentFolderDownload(context, capturedPane, treeUriString = savedTreeUri)
+                } else if (folderPaneTarget != null) {
+                    runtime.enqueueCurrentFolderDownload(context, folderPaneTarget, treeUriString = savedTreeUri)
                 }
             }
         }
@@ -1582,7 +1582,8 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
                 secondaryActionLabel = "下载此目录",
                 onSecondaryAction = {
                     if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
-                        pendingFolder = true
+                        pendingFile = null
+                        pendingFolderPane = pane
                         safLauncher.launch(null)
                     } else {
                         runtime.enqueueCurrentFolderDownload(context, pane)
@@ -1629,6 +1630,7 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
                     playNextActionTitle = "下一首",
                     onDownload = {
                         if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
+                            pendingFolderPane = null
                             pendingFile = track
                             safLauncher.launch(null)
                         } else {
@@ -1658,6 +1660,7 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
                     trailingLabel = "导出",
                     onPlay = {
                         if (runtime.committedSettings.exportTreeUri.isNullOrBlank()) {
+                            pendingFolderPane = null
                             pendingFile = file
                             safLauncher.launch(null)
                         } else {

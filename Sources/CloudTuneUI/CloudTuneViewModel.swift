@@ -253,6 +253,7 @@ public final class CloudTuneViewModel {
     private var transferRefreshTask: Task<Void, Never>?
     private var prefetchedTrackId: String?
     private var prefetchingTrackId: String?
+    private var authGeneration: Int = 0
     private var playbackGeneration: Int = 0
     private var externalVideoGeneration: Int = 0
     private var cloudBrowserGeneration: Int = 0
@@ -260,6 +261,7 @@ public final class CloudTuneViewModel {
     private var cloudBrowserIdleGeneration: Int = 0
     private var videoBrowserIdleGeneration: Int = 0
     private var browserBusyToken: Int = 0
+    private var operationBusyToken: Int = 0
     private let settingsSequence = SettingsMutationSequence()
     private var lastAppliedSettingsSeq: UInt64 = 0
     private var recoveryAttempts: Int = 0
@@ -796,14 +798,24 @@ public final class CloudTuneViewModel {
     // MARK: - Bootstrap & Auth
 
     public func bootstrap(userInitiatedKeychainRetry: Bool = false) async {
+        guard !isAuthenticated else { return }
+        let expectedAuthGen = authGeneration
         isBootstrapping = true
-        busyLabel = "同步本地配置..."
+        let assignedBusy = "同步本地配置..."
+        busyLabel = assignedBusy
+        operationBusyToken += 1
+        let myBusyToken = operationBusyToken
         defer {
-            busyLabel = nil
-            isBootstrapping = false
+            if operationBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+            if authGeneration == expectedAuthGen {
+                isBootstrapping = false
+            }
         }
 
         let migrated = await accountStore.migrateLegacyTauriDataIfPresent()
+        guard authGeneration == expectedAuthGen, !isAuthenticated else { return }
 
         var (storedCred, issue) = credentialMachine.load(
             isInteractiveGUI: true,
@@ -826,6 +838,10 @@ public final class CloudTuneViewModel {
 
         do {
             let sessionPayload = try await cloudClient.restoreFromRefreshCredential(storedCred)
+            guard authGeneration == expectedAuthGen, !isAuthenticated else {
+                await cloudClient.clearSession()
+                return
+            }
             let identity = Cloud189Protocol.resolveAccountIdentity(
                 activeSession: sessionPayload.activeSession,
                 persistedCredential: sessionPayload.persistedCredential ?? storedCred,
@@ -838,10 +854,12 @@ public final class CloudTuneViewModel {
                 storageKey: identity.storageKey,
                 displayName: identity.displayName
             )
+            guard isAuthenticated, activeAccountKey == identity.storageKey else { return }
             await browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
         } catch is CancellationError {
             return
         } catch {
+            guard authGeneration == expectedAuthGen else { return }
             isAuthenticated = false
             statusMessage = error.localizedDescription
         }
@@ -849,10 +867,19 @@ public final class CloudTuneViewModel {
 
     public func beginQrLogin() async {
         qrPollTask?.cancel()
-        busyLabel = "生成二维码..."
-        defer { busyLabel = nil }
+        let expectedAuthGen = authGeneration
+        let assignedBusy = "生成二维码..."
+        busyLabel = assignedBusy
+        operationBusyToken += 1
+        let myBusyToken = operationBusyToken
+        defer {
+            if operationBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         do {
             let start = try await cloudClient.startQrLogin()
+            guard authGeneration == expectedAuthGen, !isAuthenticated else { return }
             qrContent = start.qrContent
             qrHint = start.message
             statusMessage = start.message
@@ -861,12 +888,14 @@ public final class CloudTuneViewModel {
         } catch is CancellationError {
             return
         } catch {
+            guard authGeneration == expectedAuthGen else { return }
             statusMessage = error.localizedDescription
         }
     }
 
     private func startQrPolling() {
         qrPollTask?.cancel()
+        let expectedAuthGen = authGeneration
         qrPollTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -874,15 +903,20 @@ public final class CloudTuneViewModel {
                 } catch {
                     break
                 }
-                guard !Task.isCancelled, let self else { break }
+                guard !Task.isCancelled, let self, self.authGeneration == expectedAuthGen else { break }
                 do {
                     let poll = try await self.cloudClient.pollQrLogin()
+                    guard !Task.isCancelled, self.authGeneration == expectedAuthGen else { return }
                     self.qrHint = poll.message
                     self.statusMessage = poll.message
                     switch poll.state {
                     case .authenticated:
                         let activeSession = await self.cloudClient.activeSession
                         let persisted = await self.cloudClient.persistedCredential
+                        guard !Task.isCancelled, self.authGeneration == expectedAuthGen else {
+                            await self.cloudClient.clearSession()
+                            return
+                        }
                         let identity: (storageKey: String, displayName: String)
                         if let activeSession {
                             identity = Cloud189Protocol.resolveAccountIdentity(
@@ -909,6 +943,7 @@ public final class CloudTuneViewModel {
                             storageKey: identity.storageKey,
                             displayName: identity.displayName
                         )
+                        guard self.isAuthenticated, self.activeAccountKey == identity.storageKey else { return }
                         await self.browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
                         return
                     case .expired:
@@ -921,7 +956,9 @@ public final class CloudTuneViewModel {
                 } catch is CancellationError {
                     return
                 } catch {
-                    self.statusMessage = error.localizedDescription
+                    if self.authGeneration == expectedAuthGen {
+                        self.statusMessage = error.localizedDescription
+                    }
                     return
                 }
             }
@@ -929,11 +966,26 @@ public final class CloudTuneViewModel {
     }
 
     public func completeEmbeddedWebLogin(callbackURL: URL, cookies: [HTTPCookie]) async {
-        busyLabel = "正在验证天翼登录会话..."
-        defer { busyLabel = nil }
+        authGeneration += 1
+        let loginAuthGen = authGeneration
+        isBootstrapping = false
+        let assignedBusy = "正在验证天翼登录会话..."
+        busyLabel = assignedBusy
+        operationBusyToken += 1
+        let myBusyToken = operationBusyToken
+        defer {
+            if operationBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         do {
             await cloudClient.importWebCookies(cookies)
+            guard authGeneration == loginAuthGen else { return }
             let parsed = try await cloudClient.exchangeRedirectForSession(redirectURL: callbackURL.absoluteString)
+            guard authGeneration == loginAuthGen else {
+                await cloudClient.clearSession()
+                return
+            }
             let identity = Cloud189Protocol.resolveAccountIdentity(
                 activeSession: parsed.activeSession,
                 persistedCredential: parsed.persistedCredential
@@ -950,6 +1002,7 @@ public final class CloudTuneViewModel {
                 storageKey: identity.storageKey,
                 displayName: identity.displayName
             )
+            guard isAuthenticated, activeAccountKey == identity.storageKey else { return }
             await browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
             guard isAuthenticated, activeAccountKey == identity.storageKey else { return }
             if let credentialWarning {
@@ -960,6 +1013,7 @@ public final class CloudTuneViewModel {
         } catch is CancellationError {
             return
         } catch {
+            guard authGeneration == loginAuthGen else { return }
             isShowingWebLoginSheet = false
             statusMessage = "网页登录回调兑换失败（\(error.localizedDescription)），已切换至二维码扫码登录，可保存二维码到相册后用天翼云盘 App 识别。"
             await beginQrLogin()
@@ -970,11 +1024,15 @@ public final class CloudTuneViewModel {
         if enableLiveObservers {
             setupPlayerAndRemoteCommands()
         }
+        self.authGeneration += 1
+        let expectedAuthGen = self.authGeneration
         self.isAuthenticated = true
         self.accountStorageKey = storageKey
         self.accountName = displayName
         self.credentialIssue = nil
         self.lastAppliedSettingsSeq = 0
+        self.playbackGeneration += 1
+        self.externalVideoGeneration += 1
         self.cloudBrowserGeneration += 1
         self.videoBrowserGeneration += 1
         self.cloudBrowserIdleGeneration = self.cloudBrowserGeneration
@@ -982,10 +1040,14 @@ public final class CloudTuneViewModel {
 
         do {
             let paths = try await accountStore.paths(for: storageKey)
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             let store = try CacheStore(cacheDirectory: paths.cacheDir, indexURL: paths.cacheIndexURL)
             self.cacheStore = store
-            self.cacheUsageBytes = await store.usageBytes()
+            let bytes = await store.usageBytes()
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey, cacheStore === store else { return }
+            self.cacheUsageBytes = bytes
         } catch {
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.cacheStore = nil
             self.cacheUsageBytes = 0
             self.statusMessage = "初始化本地缓存目录失败：\(error.localizedDescription)"
@@ -993,30 +1055,44 @@ public final class CloudTuneViewModel {
 
         do {
             if let savedSettings = try await accountStore.loadSettingsIfPresent(for: storageKey) {
-                self.committedSettings = savedSettings
-                self.appearancePreference = savedSettings.appearanceMode
+                guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
+                if lastAppliedSettingsSeq == 0 {
+                    self.committedSettings = savedSettings
+                    self.appearancePreference = savedSettings.appearanceMode
+                    syncDraftsFromCommitted()
+                }
             } else {
-                self.committedSettings = AccountSettings(appearanceMode: appearancePreference)
+                guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
+                if lastAppliedSettingsSeq == 0 {
+                    self.committedSettings = AccountSettings(appearanceMode: appearancePreference)
+                    syncDraftsFromCommitted()
+                }
             }
-            syncDraftsFromCommitted()
         } catch {
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.statusMessage = "读取账户设置失败：\(error.localizedDescription)"
         }
 
         do {
             let savedTracks = try await accountStore.loadLibrary(for: storageKey)
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.tracks = savedTracks
         } catch {
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
             self.tracks = []
             self.statusMessage = "读取本地曲库索引失败：\(error.localizedDescription)"
         }
 
         await transferEngine.restorePersistedDownloads(for: storageKey, accountStore: accountStore)
+        guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
         let snap = await transferEngine.snapshot()
+        guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == storageKey else { return }
         await handleTransferActivityChange(snapshot: snap, hasActive: snap.hasActiveItems)
     }
 
     public func logout() async {
+        authGeneration += 1
+        isBootstrapping = false
         qrPollTask?.cancel()
         qrPollTask = nil
         transferRefreshTask?.cancel()
@@ -1037,7 +1113,13 @@ public final class CloudTuneViewModel {
         _player?.replaceCurrentItem(with: nil)
         nowPlayingCoordinator.updateNowPlaying(metadata: nil, isPlaying: false, elapsedSeconds: 0, durationSeconds: 0)
 
-        if let accountId = activeAccountKey {
+        let previousAccountId = activeAccountKey
+        isAuthenticated = false
+        busyLabel = nil
+        accountName = nil
+        accountStorageKey = nil
+
+        if let accountId = previousAccountId {
             let hash = Cloud189Protocol.accountBucketHash(for: accountId)
             await streamServer?.revokeAllSources(forAccountHash: hash)
             await transferEngine.cancelAll(forAccountId: accountId)
@@ -1045,10 +1127,6 @@ public final class CloudTuneViewModel {
         await cloudClient.clearSession()
         credentialMachine.clear(backend: keychainBackend)
 
-        isAuthenticated = false
-        busyLabel = nil
-        accountName = nil
-        accountStorageKey = nil
         cacheStore = nil
         cacheUsageBytes = 0
         cloudBrowser = BrowserPaneState()
@@ -1206,24 +1284,44 @@ public final class CloudTuneViewModel {
     }
 
     public func scanMusicLibrary(showBusy: Bool = true) async {
-        guard let folder = committedSettings.musicFolder, let accountId = activeAccountKey else {
+        guard isAuthenticated, let folder = committedSettings.musicFolder, let accountId = activeAccountKey else {
             statusMessage = "请先在云盘目录中设为音乐库。"
             return
         }
-        if showBusy { busyLabel = "扫描 \(folder.name) 中的音乐..." }
-        defer { if showBusy { busyLabel = nil } }
+        let expectedAuthGen = authGeneration
+        let assignedBusy: String?
+        let myBusyToken: Int
+        if showBusy {
+            let label = "扫描 \(folder.name) 中的音乐..."
+            busyLabel = label
+            operationBusyToken += 1
+            assignedBusy = label
+            myBusyToken = operationBusyToken
+        } else {
+            assignedBusy = nil
+            myBusyToken = 0
+        }
+        defer {
+            if let assignedBusy, operationBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         do {
             let scanned = try await cloudClient.scanMusicLibrary(folderId: folder.id, folderName: folder.name)
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
             tracks = scanned
             do {
                 try await accountStore.saveLibrary(scanned, for: accountId)
+                guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
                 statusMessage = "已载入 \(scanned.count) 首音乐"
             } catch {
+                guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
                 statusMessage = "已载入 \(scanned.count) 首音乐（索引落盘失败：\(error.localizedDescription)）"
             }
         } catch is CancellationError {
             return
         } catch {
+            guard authGeneration == expectedAuthGen, isAuthenticated, activeAccountKey == accountId else { return }
             statusMessage = error.localizedDescription
         }
     }

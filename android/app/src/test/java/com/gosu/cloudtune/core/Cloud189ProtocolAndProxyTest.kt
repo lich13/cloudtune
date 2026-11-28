@@ -947,6 +947,8 @@ class Cloud189ProtocolAndProxyTest {
             val prevLimit = runtime.committedSettings.cacheLimitMb
             runtime.cacheLimitDraft = "4096"
             runtime.commitCacheLimitDraft()
+            assertTrue(runtime.statusMessage?.contains("保存设置失败") == true)
+            runtime.statusMessage = null
             assertFalse("Async write failure must return false", runtime.commitCacheLimitDraftAsync())
             assertEquals(prevLimit, runtime.committedSettings.cacheLimitMb)
             assertEquals("4096", runtime.cacheLimitDraft)
@@ -1065,7 +1067,7 @@ class Cloud189ProtocolAndProxyTest {
                 ioDispatcher = Dispatchers.IO
             )
 
-            // Issue 2: logout() followed immediately by bootstrap() awaits cookieCleanupDeferred and NEVER restores logged-out session
+            // Issue 2a: logout() followed immediately by bootstrap() awaits cookieCleanupDeferred and NEVER restores logged-out session
             ioRuntime.bootstrap().await()
             assertTrue(ioRuntime.isAuthenticated)
             delayClearMs.set(80)
@@ -1075,6 +1077,25 @@ class Cloud189ProtocolAndProxyTest {
             ioRuntime.cookieCleanupDeferred?.await()
             assertFalse("Immediate bootstrap() after logout() must not resurrect session", ioRuntime.isAuthenticated)
             assertNull(savedCred)
+
+            // Issue 2b: logout() with slow cookieCleanupDeferred followed immediately by completeEmbeddedWebLogin()
+            // MUST NOT let stale cookieCleanupDeferred wipe the newly saved login credential or let bootstrap() race
+            savedCred = PersistedRefreshCredential.createOrNull("rt_r14_seed2", "r14@example.invalid")
+            delayClearMs.set(0)
+            ioRuntime.bootstrap().await()
+            assertTrue(ioRuntime.isAuthenticated)
+            delayClearMs.set(80)
+            ioRuntime.logout()
+            val supersededBoot = ioRuntime.bootstrap()
+            ioRuntime.completeEmbeddedWebLogin(
+                "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=relogin",
+                emptyMap()
+            )
+            repeat(60) { if (ioRuntime.isAuthenticated) return@repeat; delay(20L) }
+            runCatching { supersededBoot.await() }
+            ioRuntime.cookieCleanupDeferred?.await()
+            assertTrue("Rapid re-login after logout must stay authenticated", ioRuntime.isAuthenticated)
+            assertNotNull("Prior logout cleanup must NOT delete newly saved login credential", savedCred)
             delayClearMs.set(0)
 
             // Issue 8: Credential save warning preserved in completeEmbeddedWebLogin statusMessage
@@ -1126,15 +1147,28 @@ class Cloud189ProtocolAndProxyTest {
             repeat(40) { if (rt.isAuthenticated) return@repeat; delay(15L) }
             val acctKey = rt.accountStorageKey!!
 
-            // Issue 5: handleWriteThroughCompleted after track change must not overwrite newer track title
-            val songB = TrackSummary("wt-b", "CurrentSongB.flac", "Album", 1024L)
+            // Issue 5: handleWriteThroughCompleted refreshes cacheUsageBytes & metadata for active track, and rejects stale track/generation
+            val songA = TrackSummary("wt-a", "SongA.flac", "AlbumA", 128L)
+            val songB = TrackSummary("wt-b", "CurrentSongB.flac", "AlbumB", 1024L)
             rt.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
+            rt.playTrack(songA)
+            repeat(40) { if (rt.currentTrackId == "wt-a") return@repeat; delay(15L) }
+            rt.cacheUsageBytes = 999_999L
+            val missingOrRawFile = File(tempRoot, "wt-a.flac")
+            rt.handleWriteThroughCompleted(
+                accountHash = Cloud189Protocol.accountBucketHash(acctKey),
+                trackId = "wt-a",
+                localFile = missingOrRawFile
+            )
+            assertEquals(0L, rt.cacheUsageBytes)
+            assertEquals("SongA.flac", rt.nowPlayingTitle)
+
             rt.playTrack(songB)
             repeat(40) { if (rt.currentTrackId == "wt-b") return@repeat; delay(15L) }
             rt.handleWriteThroughCompleted(
                 accountHash = Cloud189Protocol.accountBucketHash(acctKey),
-                trackId = "wt-a-stale",
-                localFile = File(tempRoot, "missing.flac")
+                trackId = "wt-a",
+                localFile = missingOrRawFile
             )
             assertEquals("CurrentSongB.flac", rt.nowPlayingTitle)
 

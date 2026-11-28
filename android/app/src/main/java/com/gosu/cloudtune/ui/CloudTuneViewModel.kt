@@ -228,7 +228,7 @@ class CloudTuneAppRuntime(
     internal var lastExternalVideoJob: Job? = null
     private var prefetchedTrackId: String? = null
     private var prefetchingTrackId: String? = null
-    @Volatile private var logoutGeneration: Int = 0
+    @Volatile private var authEpoch: Int = 0
     @Volatile private var playbackGeneration: Int = 0
     @Volatile private var externalVideoGeneration: Int = 0
     @Volatile private var cloudBrowserGeneration: Int = 0
@@ -236,6 +236,7 @@ class CloudTuneAppRuntime(
     @Volatile private var cloudBrowserIdleGeneration: Int = 0
     @Volatile private var videoBrowserIdleGeneration: Int = 0
     @Volatile private var browserBusyToken: Int = 0
+    @Volatile private var operationBusyToken: Int = 0
     private var recoveryAttempts = 0
     private var currentPlaybackIsLoopback = false
     private var attachedUiCount = 0
@@ -571,20 +572,31 @@ class CloudTuneAppRuntime(
         if (isAuthenticated) return CompletableDeferred(Unit)
         val existing = bootstrapDeferred
         if (existing != null && existing.isActive) return existing
-        val expectedLogoutGen = logoutGeneration
+        val expectedAuthEpoch = authEpoch
         val pendingCleanup = cookieCleanupDeferred
+        operationBusyToken += 1
+        val myBusyToken = operationBusyToken
         val assignedBusy = "恢复天翼登录会话..."
         var selfDeferred: Deferred<Unit>? = null
         val created = scope.async {
             try {
-                pendingCleanup?.join()
-                if (logoutGeneration != expectedLogoutGen || isAuthenticated) return@async
-                val stored = withContext(ioDispatcher) { credentialStore?.loadCredential() } ?: return@async
-                if (logoutGeneration != expectedLogoutGen || isAuthenticated) return@async
+                if (pendingCleanup != null) {
+                    try {
+                        pendingCleanup.await()
+                    } catch (ce: CancellationException) {
+                        if (!isActive) throw ce
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (!isActive || authEpoch != expectedAuthEpoch || isAuthenticated) return@async
+                val stored = withContext(ioDispatcher) {
+                    if (authEpoch == expectedAuthEpoch) credentialStore?.loadCredential() else null
+                } ?: return@async
+                if (!isActive || authEpoch != expectedAuthEpoch || isAuthenticated) return@async
                 isBootstrapping = true
                 busyLabel = assignedBusy
                 val restored = cloudClient.restoreFromRefreshCredential(stored)
-                if (logoutGeneration != expectedLogoutGen) {
+                if (authEpoch != expectedAuthEpoch) {
                     cloudClient.clearSessionImmediate()
                     return@async
                 }
@@ -593,46 +605,46 @@ class CloudTuneAppRuntime(
                     persistedCredential = restored.persistedCredential ?: stored,
                     priorAccountKey = stored.accountKey
                 )
-                if (logoutGeneration != expectedLogoutGen) {
+                if (authEpoch != expectedAuthEpoch) {
                     cloudClient.clearSessionImmediate()
                     return@async
                 }
                 restored.persistedCredential?.let { cred ->
                     runCatching {
                         withContext(ioDispatcher) {
-                            if (logoutGeneration == expectedLogoutGen) {
+                            if (authEpoch == expectedAuthEpoch) {
                                 credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
                             }
                         }
                     }.onFailure { err ->
-                        if (logoutGeneration == expectedLogoutGen) {
+                        if (authEpoch == expectedAuthEpoch) {
                             statusMessage = "登录凭据持久化警告：${err.message}"
                         }
                     }
                 }
-                if (logoutGeneration != expectedLogoutGen) {
+                if (authEpoch != expectedAuthEpoch) {
                     cloudClient.clearSessionImmediate()
                     return@async
                 }
                 activateAccount(
                     storageKey = identity.storageKey,
                     displayName = identity.displayName,
-                    expectedLogoutGen = expectedLogoutGen
+                    expectedAuthEpoch = expectedAuthEpoch
                 )
-                if (logoutGeneration != expectedLogoutGen || !isAuthenticated) return@async
+                if (authEpoch != expectedAuthEpoch || !isAuthenticated) return@async
                 browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                if (logoutGeneration == expectedLogoutGen) {
+                if (authEpoch == expectedAuthEpoch) {
                     isAuthenticated = false
                     statusMessage = e.message
                 }
             } finally {
-                if (busyLabel == assignedBusy) {
+                if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
                     busyLabel = null
                 }
-                if (logoutGeneration == expectedLogoutGen) {
+                if (authEpoch == expectedAuthEpoch) {
                     isBootstrapping = false
                 }
                 synchronized(bootstrapLock) {
@@ -651,38 +663,81 @@ class CloudTuneAppRuntime(
 
     fun beginQrLogin() {
         qrPollJob?.cancel()
+        val startEpoch: Int
+        val myBusyToken: Int
+        synchronized(bootstrapLock) {
+            startEpoch = authEpoch
+            operationBusyToken += 1
+            myBusyToken = operationBusyToken
+        }
         scope.launch {
-            busyLabel = "生成二维码..."
+            val assignedBusy = "生成二维码..."
+            busyLabel = assignedBusy
             try {
                 val start = cloudClient.startQrLogin()
+                if (authEpoch != startEpoch || isAuthenticated) return@launch
                 qrContent = start.qrContent
                 qrHint = start.message
                 statusMessage = start.message
-                qrBitmap = withContext(ioDispatcher) {
+                val bmp = withContext(ioDispatcher) {
                     QrCodeHelper.generateQrBitmap(start.qrContent, 480)
                 }
-                startQrPolling()
+                if (authEpoch != startEpoch || isAuthenticated) return@launch
+                qrBitmap = bmp
+                startQrPolling(startEpoch)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = e.message
+                if (authEpoch == startEpoch) {
+                    statusMessage = e.message
+                }
             } finally {
-                busyLabel = null
+                if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
+                    busyLabel = null
+                }
             }
         }
     }
 
-    private fun startQrPolling() {
+    private fun startQrPolling(startEpoch: Int = authEpoch) {
         qrPollJob?.cancel()
         qrPollJob = scope.launch {
-            while (isActive) {
+            while (isActive && authEpoch == startEpoch) {
                 delay(2500L)
+                if (!isActive || authEpoch != startEpoch) return@launch
                 try {
                     val poll = cloudClient.pollQrLogin()
+                    if (!isActive || authEpoch != startEpoch) return@launch
                     qrHint = poll.message
                     statusMessage = poll.message
                     when (poll.state) {
                         QrLoginState.AUTHENTICATED -> {
+                            val qrAuthEpoch: Int
+                            val pendingCleanup: Deferred<Unit>?
+                            synchronized(bootstrapLock) {
+                                if (authEpoch != startEpoch) {
+                                    cloudClient.clearSessionImmediate()
+                                    return@launch
+                                }
+                                authEpoch += 1
+                                qrAuthEpoch = authEpoch
+                                pendingCleanup = cookieCleanupDeferred
+                                isBootstrapping = false
+                                bootstrapDeferred?.cancel()
+                                bootstrapDeferred = null
+                            }
+                            if (pendingCleanup != null) {
+                                try {
+                                    pendingCleanup.await()
+                                } catch (ce: CancellationException) {
+                                    if (!isActive) throw ce
+                                } catch (_: Throwable) {
+                                }
+                            }
+                            if (!isActive || authEpoch != qrAuthEpoch) {
+                                cloudClient.clearSessionImmediate()
+                                return@launch
+                            }
                             val active = cloudClient.activeSession
                             val persisted = cloudClient.persistedCredential
                             val identity = if (active != null) {
@@ -703,15 +758,28 @@ class CloudTuneAppRuntime(
                             persisted?.let { cred ->
                                 runCatching {
                                     withContext(ioDispatcher) {
-                                        credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                                        if (authEpoch == qrAuthEpoch) {
+                                            credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
+                                        }
                                     }
                                 }.onFailure { err ->
-                                    statusMessage = "登录凭据保存异常：${err.message}"
+                                    if (authEpoch == qrAuthEpoch) {
+                                        statusMessage = "登录凭据保存异常：${err.message}"
+                                    }
                                 }
+                            }
+                            if (authEpoch != qrAuthEpoch) {
+                                cloudClient.clearSessionImmediate()
+                                return@launch
                             }
                             qrContent = null
                             qrBitmap = null
-                            activateAccount(storageKey = identity.storageKey, displayName = identity.displayName)
+                            activateAccount(
+                                storageKey = identity.storageKey,
+                                displayName = identity.displayName,
+                                expectedAuthEpoch = qrAuthEpoch
+                            )
+                            if (authEpoch != qrAuthEpoch || !isAuthenticated) return@launch
                             browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                             return@launch
                         }
@@ -725,7 +793,9 @@ class CloudTuneAppRuntime(
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (e: Exception) {
-                    statusMessage = e.message
+                    if (authEpoch == startEpoch) {
+                        statusMessage = e.message
+                    }
                     return@launch
                 }
             }
@@ -745,16 +815,37 @@ class CloudTuneAppRuntime(
     }
 
     fun completeEmbeddedWebLogin(callbackUrl: String, cookiesByOrigin: Map<String, String?>) {
-        val loginLogoutGen = logoutGeneration
+        val loginEpoch: Int
+        val pendingCleanup: Deferred<Unit>?
+        val myBusyToken: Int
+        synchronized(bootstrapLock) {
+            authEpoch += 1
+            loginEpoch = authEpoch
+            pendingCleanup = cookieCleanupDeferred
+            isBootstrapping = false
+            bootstrapDeferred?.cancel()
+            bootstrapDeferred = null
+            operationBusyToken += 1
+            myBusyToken = operationBusyToken
+        }
         scope.launch {
             val assignedBusy = "正在验证天翼登录会话..."
             busyLabel = assignedBusy
             try {
+                if (pendingCleanup != null) {
+                    try {
+                        pendingCleanup.await()
+                    } catch (ce: CancellationException) {
+                        if (!isActive) throw ce
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (!isActive || authEpoch != loginEpoch) return@launch
                 for ((origin, header) in cookiesByOrigin) {
                     cloudClient.importWebCookies(origin, header)
                 }
                 val parsed = cloudClient.exchangeRedirectForSession(callbackUrl)
-                if (logoutGeneration != loginLogoutGen) {
+                if (authEpoch != loginEpoch) {
                     cloudClient.clearSessionImmediate()
                     return@launch
                 }
@@ -766,19 +857,19 @@ class CloudTuneAppRuntime(
                 parsed.persistedCredential?.let { cred ->
                     runCatching {
                         withContext(ioDispatcher) {
-                            if (logoutGeneration == loginLogoutGen) {
+                            if (authEpoch == loginEpoch) {
                                 credentialStore?.saveCredential(cred.withAccountKey(identity.storageKey))
                             }
                         }
                     }.onFailure { err ->
                         val warning = "登录凭据保存异常：${err.message ?: "未知错误"}"
                         credentialWarning = warning
-                        if (logoutGeneration == loginLogoutGen) {
+                        if (authEpoch == loginEpoch) {
                             statusMessage = warning
                         }
                     }
                 }
-                if (logoutGeneration != loginLogoutGen) {
+                if (authEpoch != loginEpoch) {
                     cloudClient.clearSessionImmediate()
                     return@launch
                 }
@@ -789,11 +880,11 @@ class CloudTuneAppRuntime(
                 activateAccount(
                     storageKey = identity.storageKey,
                     displayName = identity.displayName,
-                    expectedLogoutGen = loginLogoutGen
+                    expectedAuthEpoch = loginEpoch
                 )
-                if (logoutGeneration != loginLogoutGen || !isAuthenticated) return@launch
+                if (authEpoch != loginEpoch || !isAuthenticated) return@launch
                 browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
-                if (logoutGeneration == loginLogoutGen && isAuthenticated && activeAccountKey == identity.storageKey) {
+                if (authEpoch == loginEpoch && isAuthenticated && activeAccountKey == identity.storageKey) {
                     statusMessage = if (credentialWarning != null) {
                         "天翼官方网页一键登录成功（$credentialWarning）"
                     } else {
@@ -803,13 +894,13 @@ class CloudTuneAppRuntime(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                if (logoutGeneration == loginLogoutGen) {
+                if (authEpoch == loginEpoch) {
                     isShowingWebLoginDialog = false
                     statusMessage = "网页回调兑换失败（${e.message}），已自动切换二维码登录，可保存二维码到相册识别。"
                     beginQrLogin()
                 }
             } finally {
-                if (busyLabel == assignedBusy) {
+                if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
                     busyLabel = null
                 }
             }
@@ -819,7 +910,7 @@ class CloudTuneAppRuntime(
     internal suspend fun activateAccount(
         storageKey: String,
         displayName: String,
-        expectedLogoutGen: Int = logoutGeneration
+        expectedAuthEpoch: Int = authEpoch
     ) {
         val loaded = withContext(ioDispatcher) {
             val paths = accountStore.paths(storageKey)
@@ -832,10 +923,12 @@ class CloudTuneAppRuntime(
             val snap = transferEngine.snapshot()
             LoadedAccountState(cm, usage, savedSettings, savedTracks, snap)
         }
-        if (logoutGeneration != expectedLogoutGen) return
+        if (authEpoch != expectedAuthEpoch) return
         isAuthenticated = true
         accountStorageKey = storageKey
         accountName = displayName
+        playbackGeneration += 1
+        externalVideoGeneration += 1
         cloudBrowserGeneration += 1
         videoBrowserGeneration += 1
         cloudBrowserIdleGeneration = cloudBrowserGeneration
@@ -865,18 +958,31 @@ class CloudTuneAppRuntime(
     fun logout() {
         val previousAccountKey = activeAccountKey
         synchronized(bootstrapLock) {
-            logoutGeneration += 1
+            authEpoch += 1
+            val cleanupEpoch = authEpoch
             isAuthenticated = false
             isBootstrapping = false
             bootstrapDeferred?.cancel()
             bootstrapDeferred = null
             val previousCleanup = cookieCleanupDeferred
             cookieCleanupDeferred = scope.async {
-                previousCleanup?.join()
-                runCatching {
-                    withContext(ioDispatcher) { credentialStore?.clearCredential() }
+                if (previousCleanup != null) {
+                    try {
+                        previousCleanup.await()
+                    } catch (ce: CancellationException) {
+                        if (!isActive) throw ce
+                    } catch (_: Throwable) {
+                    }
                 }
-                if (hasAndroidContext) {
+                if (authEpoch != cleanupEpoch || isAuthenticated) return@async
+                runCatching {
+                    withContext(ioDispatcher) {
+                        if (authEpoch == cleanupEpoch && !isAuthenticated) {
+                            credentialStore?.clearCredential()
+                        }
+                    }
+                }
+                if (hasAndroidContext && authEpoch == cleanupEpoch && !isAuthenticated) {
                     clearWebViewCookiesAndFlush()
                 }
             }
@@ -1096,15 +1202,28 @@ class CloudTuneAppRuntime(
     }
 
     fun scanMusicLibrary() {
+        if (!isAuthenticated) {
+            statusMessage = "请先在云盘目录中设为音乐库"
+            return
+        }
         val folder = committedSettings.musicFolder ?: run {
             statusMessage = "请先在云盘目录中设为音乐库"
             return
         }
         val acct = activeAccountKey ?: return
+        val expectedEpoch: Int
+        val myBusyToken: Int
+        synchronized(bootstrapLock) {
+            expectedEpoch = authEpoch
+            operationBusyToken += 1
+            myBusyToken = operationBusyToken
+        }
         scope.launch {
-            busyLabel = "扫描 ${folder.name} 中的音乐..."
+            val assignedBusy = "扫描 ${folder.name} 中的音乐..."
+            busyLabel = assignedBusy
             try {
                 val scanned = cloudClient.scanMusicLibrary(folder.id, folder.name)
+                if (!isAuthenticated || authEpoch != expectedEpoch || activeAccountKey != acct) return@launch
                 tracks = scanned
                 if (shuffle) {
                     shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(scanned, currentTrackId)
@@ -1115,17 +1234,23 @@ class CloudTuneAppRuntime(
                         accountStore.saveLibrary(acct, scanned)
                     }
                 }.isSuccess
-                statusMessage = if (persistedOk) {
-                    "已载入 ${scanned.size} 首音乐"
-                } else {
-                    "已载入 ${scanned.size} 首音乐（本地索引保存失败）"
+                if (isAuthenticated && authEpoch == expectedEpoch && activeAccountKey == acct) {
+                    statusMessage = if (persistedOk) {
+                        "已载入 ${scanned.size} 首音乐"
+                    } else {
+                        "已载入 ${scanned.size} 首音乐（本地索引保存失败）"
+                    }
                 }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = e.message
+                if (isAuthenticated && authEpoch == expectedEpoch && activeAccountKey == acct) {
+                    statusMessage = e.message
+                }
             } finally {
-                busyLabel = null
+                if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
+                    busyLabel = null
+                }
             }
         }
     }
@@ -1873,13 +1998,16 @@ class CloudTuneAppRuntime(
     fun enqueueDownload(
         context: Context,
         track: TrackSummary,
-        treeUriString: String? = committedSettings.exportTreeUri
+        treeUriString: String? = null
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val capturedTreeUri = treeUriString
+        val explicitTreeUri = treeUriString
+        val fallbackTreeUri = committedSettings.exportTreeUri
         enqueueDownloadWithExporter(track = track, expectedAccount = acct) { staged, rel, _ ->
-            val effectiveTreeUri = capturedTreeUri ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
+            val effectiveTreeUri = explicitTreeUri
+                ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
+                ?: fallbackTreeUri
             SafExporter.exportToSafTree(
                 context = appContextRef,
                 treeUriString = effectiveTreeUri,
@@ -1922,13 +2050,16 @@ class CloudTuneAppRuntime(
     fun enqueueCurrentFolderDownload(
         context: Context,
         pane: BrowserPaneState = cloudBrowser,
-        treeUriString: String? = committedSettings.exportTreeUri
+        treeUriString: String? = null
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val capturedTreeUri = treeUriString
+        val explicitTreeUri = treeUriString
+        val fallbackTreeUri = committedSettings.exportTreeUri
         enqueueCurrentFolderDownloadWithExporter(pane = pane, expectedAccount = acct) { staged, subpath, _ ->
-            val effectiveTreeUri = capturedTreeUri ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
+            val effectiveTreeUri = explicitTreeUri
+                ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
+                ?: fallbackTreeUri
             SafExporter.exportToSafTree(
                 context = appContextRef,
                 treeUriString = effectiveTreeUri,
@@ -2013,19 +2144,22 @@ class CloudTuneAppRuntime(
     fun resumeTransfer(
         context: Context,
         id: String,
-        treeUriString: String? = committedSettings.exportTreeUri
+        treeUriString: String? = null
     ) {
         val appContextRef = context.applicationContext ?: context
         val acct = activeAccountKey ?: return
-        val capturedTreeUri = treeUriString
+        val explicitTreeUri = treeUriString
+        val fallbackTreeUri = committedSettings.exportTreeUri
         scope.launch {
             val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
-                val resolvedTreeUri = capturedTreeUri ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
                 transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _ ->
+                    val effectiveTreeUri = explicitTreeUri
+                        ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
+                        ?: fallbackTreeUri
                     SafExporter.exportToSafTree(
                         context = appContextRef,
-                        treeUriString = resolvedTreeUri,
+                        treeUriString = effectiveTreeUri,
                         stagedFile = staged,
                         relativeSubpath = rel,
                         mimeType = PlaybackDecisionPolicy.guessMimeType(rel)

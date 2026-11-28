@@ -36,6 +36,7 @@ fun CloudTuneAppRuntime.Companion.fixture(
             rt.accountName = null
             rt.accountStorageKey = null
             rt.cacheUsageBytes = 0L
+            rt.statusKind = StatusKind.INFO
         }
         SnapshotScene.AUTH_QR -> {
             rt.isAuthenticated = false
@@ -45,6 +46,7 @@ fun CloudTuneAppRuntime.Companion.fixture(
             rt.qrContent = fixture.qrContent
             rt.qrHint = fixture.qrMessage
             rt.statusMessage = fixture.qrMessage
+            rt.statusKind = StatusKind.INFO
             rt.qrBitmap = QrCodeHelper.generateQrBitmap(fixture.qrContent, 420)
         }
         SnapshotScene.MUSIC,
@@ -76,10 +78,12 @@ fun CloudTuneAppRuntime.Companion.fixture(
             rt.loopMode = fixture.loopMode
             rt.upNextQueue = fixture.libraryTracks.filterNot { it.id == fixture.nowPlayingTrackId }.take(2)
             rt.transferSnapshot = fixture.transferSnapshot
-            rt.statusMessage = if (scene == SnapshotScene.ERROR_BANNER) {
-                fixture.errorBannerMessage
+            if (scene == SnapshotScene.ERROR_BANNER) {
+                rt.statusMessage = fixture.errorBannerMessage
+                rt.statusKind = StatusKind.ERROR
             } else {
-                fixture.statusMessage
+                rt.statusMessage = fixture.statusMessage
+                rt.statusKind = StatusKind.INFO
             }
             when (scene) {
                 SnapshotScene.VIDEO -> rt.activeModule = ModuleTab.VIDEO

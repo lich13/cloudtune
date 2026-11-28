@@ -1,15 +1,22 @@
 package com.gosu.cloudtune.ui
 
+import android.Manifest
+import android.content.pm.ProviderInfo
 import android.content.res.Configuration
+import android.database.Cursor
+import android.database.MatrixCursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
+import android.os.CancellationSignal
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
+import android.provider.DocumentsProvider
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.Lifecycle
 import com.gosu.cloudtune.MainActivity
 import com.gosu.cloudtune.core.AppearanceMode
@@ -20,7 +27,10 @@ import com.gosu.cloudtune.data.SafExporter
 import com.gosu.cloudtune.media.AudioMetadataHelper
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.nio.file.Files
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -145,61 +155,271 @@ class CloudTuneSnapshotTest {
         renderAndAssertAllScenes(formFactor = "tablet", widthPx = 1024, heightPx = 768)
     }
 
+    class MockSafDocumentsProvider : DocumentsProvider() {
+        override fun onCreate(): Boolean = true
+
+        override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+            return documentId == parentDocumentId || documentId.startsWith("$parentDocumentId/")
+        }
+
+        override fun queryRoots(projection: Array<out String>?): Cursor {
+            val cols = projection?.map { it }?.toTypedArray() ?: arrayOf(
+                DocumentsContract.Root.COLUMN_ROOT_ID,
+                DocumentsContract.Root.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Root.COLUMN_TITLE,
+                DocumentsContract.Root.COLUMN_FLAGS
+            )
+            return MatrixCursor(cols)
+        }
+
+        override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
+            val file = resolveFile(documentId)
+            if (!file.exists()) throw FileNotFoundException("Missing document: $documentId")
+            val cursor = MatrixCursor(resolveColumns(projection))
+            appendRow(cursor, documentId, file)
+            return cursor
+        }
+
+        override fun queryChildDocuments(
+            parentDocumentId: String,
+            projection: Array<out String>?,
+            sortOrder: String?
+        ): Cursor {
+            val dir = resolveFile(parentDocumentId)
+            if (!dir.isDirectory) throw FileNotFoundException("Not a directory: $parentDocumentId")
+            val cursor = MatrixCursor(resolveColumns(projection))
+            val children = dir.listFiles()?.sortedBy { it.name }.orEmpty()
+            for (child in children) {
+                appendRow(cursor, docIdForFile(child), child)
+            }
+            return cursor
+        }
+
+        override fun createDocument(
+            parentDocumentId: String,
+            mimeType: String,
+            displayName: String
+        ): String {
+            val parent = resolveFile(parentDocumentId)
+            if (!parent.isDirectory) throw FileNotFoundException("Parent not a directory: $parentDocumentId")
+            val target = File(parent, displayName)
+            if (target.exists()) throw IllegalStateException("Already exists: $displayName")
+            if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                if (!target.mkdirs() && !target.isDirectory) {
+                    throw FileNotFoundException("Unable to create directory $displayName")
+                }
+            } else if (!target.createNewFile()) {
+                throw FileNotFoundException("Unable to create file $displayName")
+            }
+            return docIdForFile(target)
+        }
+
+        override fun renameDocument(documentId: String, displayName: String): String {
+            val source = resolveFile(documentId)
+            if (!source.exists()) throw FileNotFoundException("Missing document: $documentId")
+            val dest = File(source.parentFile, displayName)
+            if (dest.exists()) throw IllegalStateException("Target exists: $displayName")
+            if (!source.renameTo(dest)) {
+                throw FileNotFoundException("Rename failed for $documentId -> $displayName")
+            }
+            return docIdForFile(dest)
+        }
+
+        override fun deleteDocument(documentId: String) {
+            val target = resolveFile(documentId)
+            if (!target.exists()) throw FileNotFoundException("Missing document: $documentId")
+            if (!target.deleteRecursively()) {
+                throw FileNotFoundException("Delete failed: $documentId")
+            }
+        }
+
+        override fun openDocument(
+            documentId: String,
+            mode: String,
+            signal: CancellationSignal?
+        ): ParcelFileDescriptor {
+            val file = resolveFile(documentId)
+            if (!file.exists()) throw FileNotFoundException("Missing document: $documentId")
+            return ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode))
+        }
+
+        private fun resolveColumns(projection: Array<out String>?): Array<String> =
+            projection?.map { it }?.toTypedArray() ?: DEFAULT_COLUMNS
+
+        private fun appendRow(cursor: MatrixCursor, docId: String, file: File) {
+            val mime = if (file.isDirectory) {
+                DocumentsContract.Document.MIME_TYPE_DIR
+            } else {
+                "application/octet-stream"
+            }
+            val flags = if (file.isDirectory) {
+                DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE or
+                    DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
+                    DocumentsContract.Document.FLAG_SUPPORTS_RENAME
+            } else {
+                DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
+                    DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
+                    DocumentsContract.Document.FLAG_SUPPORTS_RENAME
+            }
+            val values = cursor.columnNames.map { col ->
+                when (col) {
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME -> file.name
+                    DocumentsContract.Document.COLUMN_MIME_TYPE -> mime
+                    DocumentsContract.Document.COLUMN_SIZE -> if (file.isFile) file.length() else 0L
+                    DocumentsContract.Document.COLUMN_FLAGS -> flags
+                    else -> null
+                }
+            }.toTypedArray()
+            cursor.addRow(values)
+        }
+
+        companion object {
+            const val AUTHORITY = "com.gosu.cloudtune.test.saf"
+            private val DEFAULT_COLUMNS = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_FLAGS
+            )
+            @Volatile var backingRoot: File? = null
+
+            fun resolveFile(documentId: String): File {
+                val root = backingRoot ?: throw FileNotFoundException("backingRoot unset")
+                if (documentId == "root") return root
+                if (!documentId.startsWith("root/")) throw FileNotFoundException("Invalid docId: $documentId")
+                val rel = documentId.removePrefix("root/")
+                return File(root, rel)
+            }
+
+            fun docIdForFile(file: File): String {
+                val root = backingRoot!!.canonicalFile
+                val target = file.canonicalFile
+                if (target == root) return "root"
+                val rel = root.toPath().relativize(target.toPath()).toString().replace(File.separatorChar, '/')
+                return "root/$rel"
+            }
+        }
+    }
+
     @Test
     fun verifySafExporterTargetSafety() {
         val tempRoot = Files.createTempDirectory("cloudtune-saf-export").toFile()
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
         try {
+            val activity = controller.get()
             val exportRoot = File(tempRoot, "exports").apply { mkdirs() }
-            val staged = File(tempRoot, "staged.flac")
-            val newBytes = "new-staged-flac-payload".toByteArray(Charsets.UTF_8)
-            staged.writeBytes(newBytes)
+            MockSafDocumentsProvider.backingRoot = exportRoot
+            val providerInfo = ProviderInfo().apply {
+                authority = MockSafDocumentsProvider.AUTHORITY
+                packageName = activity.packageName
+                exported = true
+                grantUriPermissions = true
+                readPermission = Manifest.permission.MANAGE_DOCUMENTS
+                writePermission = Manifest.permission.MANAGE_DOCUMENTS
+            }
+            Robolectric.buildContentProvider(MockSafDocumentsProvider::class.java).create(providerInfo)
 
-            val docRoot = DocumentFile.fromFile(exportRoot)
+            val treeUri = DocumentsContract.buildTreeDocumentUri(MockSafDocumentsProvider.AUTHORITY, "root")
+            val treeUriStr = treeUri.toString()
+            assertEquals("exports", SafExporter.persistTreePermission(activity, treeUri))
+
+            val part0 = File(tempRoot, "0000.part")
+            val part1 = File(tempRoot, "0001.part")
+            val newBytes = ByteArray(100_000) { ((it * 19 + 3) and 0xFF).toByte() }
+            part0.writeBytes(newBytes.copyOfRange(0, 50_000))
+            part1.writeBytes(newBytes.copyOfRange(50_000, 100_000))
 
             // 1) Directory collision MUST throw and keep directory + children intact
             val collidingDir = File(exportRoot, "Collision.flac").apply { mkdirs() }
             val childInside = File(collidingDir, "keep.txt").apply { writeText("precious") }
             assertThrows(CloudTuneException::class.java) {
-                SafExporter.exportToDocumentDirectory(
-                    dir = docRoot,
-                    targetName = "Collision.flac",
-                    stagedFile = staged,
-                    mimeType = "audio/flac",
-                    openOutputStream = { d -> FileOutputStream(File(d.uri.path!!)) }
+                SafExporter.exportPartsToSafTree(
+                    context = activity,
+                    treeUriString = treeUriStr,
+                    partFiles = listOf(part0, part1),
+                    expectedTotalBytes = newBytes.size.toLong(),
+                    relativeSubpath = "Collision.flac",
+                    mimeType = "audio/flac"
                 )
             }
             assertTrue(childInside.isFile)
 
-            // 2) Copy/open stream failure MUST preserve existing target file intact
-            val existingFile = File(exportRoot, "Existing.flac")
-            val oldBytes = "original-precious-audio".toByteArray(Charsets.UTF_8)
+            // 2) Mid-stream write failure during SAF overwrite MUST preserve existing target file intact & clean up temp sibling
+            val albumDir = File(exportRoot, "CD 1").apply { mkdirs() }
+            val existingFile = File(albumDir, "Existing.flac")
+            val oldBytes = "original-precious-audio-intact".toByteArray(Charsets.UTF_8)
             existingFile.writeBytes(oldBytes)
+
             assertThrows(CloudTuneException::class.java) {
-                SafExporter.exportToDocumentDirectory(
-                    dir = docRoot,
-                    targetName = "Existing.flac",
-                    stagedFile = staged,
+                SafExporter.exportPartsToSafTree(
+                    context = activity,
+                    treeUriString = treeUriStr,
+                    partFiles = listOf(part0, part1),
+                    expectedTotalBytes = newBytes.size.toLong(),
+                    relativeSubpath = "CD 1/Existing.flac",
                     mimeType = "audio/flac",
-                    openOutputStream = { null }
+                    openOutputStreamOverride = { docUri ->
+                        val backing = MockSafDocumentsProvider.resolveFile(DocumentsContract.getDocumentId(docUri))
+                        val rawOut = FileOutputStream(backing)
+                        object : OutputStream() {
+                            private var written = 0
+                            override fun write(b: Int) {
+                                if (written >= 40_000) throw IOException("simulated mid-stream SAF drop")
+                                rawOut.write(b)
+                                written += 1
+                            }
+                            override fun write(b: ByteArray, off: Int, len: Int) {
+                                if (written + len > 40_000) {
+                                    val partial = (40_000 - written).coerceAtLeast(0)
+                                    if (partial > 0) {
+                                        rawOut.write(b, off, partial)
+                                        written += partial
+                                    }
+                                    throw IOException("simulated mid-stream SAF drop")
+                                }
+                                rawOut.write(b, off, len)
+                                written += len
+                            }
+                            override fun close() {
+                                rawOut.close()
+                            }
+                        }
+                    }
                 )
             }
-            assertArrayEquals(oldBytes, existingFile.readBytes())
+            assertArrayEquals("Pre-existing SAF file must remain 100% intact on mid-stream failure", oldBytes, existingFile.readBytes())
+            assertEquals("Sibling temp document must be deleted on failure", listOf("Existing.flac"), albumDir.list().orEmpty().sorted())
 
-            // 3) Valid replacement writes via sibling temp document and replaces cleanly
-            SafExporter.exportToDocumentDirectory(
-                dir = docRoot,
-                targetName = "Existing.flac",
-                stagedFile = staged,
-                mimeType = "audio/flac",
-                openOutputStream = { d -> FileOutputStream(File(d.uri.path!!)) }
+            // 3) Valid multi-part replacement writes via sibling temp document, verifies byte count, and replaces cleanly
+            SafExporter.exportPartsToSafTree(
+                context = activity,
+                treeUriString = treeUriStr,
+                partFiles = listOf(part0, part1),
+                expectedTotalBytes = newBytes.size.toLong(),
+                relativeSubpath = "CD 1/Existing.flac",
+                mimeType = "audio/flac"
             )
             assertArrayEquals(newBytes, existingFile.readBytes())
-            assertTrue(exportRoot.list().orEmpty().none { it.contains(".tmp") })
+            assertEquals(listOf("Existing.flac"), albumDir.list().orEmpty().sorted())
 
-            // 4) sanitizeFileName blocks "." and ".." traversal names
+            // 4) Nested subpath creation via DocumentsContract single-projection child queries
+            SafExporter.exportToSafTree(
+                context = activity,
+                treeUriString = treeUriStr,
+                stagedFile = part0,
+                relativeSubpath = "Jazz/2026 Live/Part0.flac",
+                mimeType = "audio/flac"
+            )
+            assertArrayEquals(newBytes.copyOfRange(0, 50_000), File(exportRoot, "Jazz/2026 Live/Part0.flac").readBytes())
+
+            // 5) sanitizeFileName blocks "." and ".." traversal names
             assertTrue(com.gosu.cloudtune.core.Cloud189Protocol.sanitizeFileName("..") == "_")
             assertTrue(com.gosu.cloudtune.core.Cloud189Protocol.sanitizeFileName(".") == "_")
         } finally {
+            MockSafDocumentsProvider.backingRoot = null
+            controller.pause().stop().destroy()
             tempRoot.deleteRecursively()
         }
     }

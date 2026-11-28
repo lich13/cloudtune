@@ -101,7 +101,7 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
     private var session: URLSession
     private var cookieStorage: HTTPCookieStorage
 
-    public init() {
+    private static func makeSessionAndCookieStorage() -> (session: URLSession, cookieStorage: HTTPCookieStorage) {
         let config = URLSessionConfiguration.ephemeral
         let storage = config.httpCookieStorage ?? HTTPCookieStorage()
         storage.cookieAcceptPolicy = .always
@@ -109,11 +109,14 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
         config.httpCookieStorage = storage
         config.timeoutIntervalForRequest = 25
         config.timeoutIntervalForResource = 120
-        config.httpAdditionalHeaders = [
-            "User-Agent": Cloud189Constants.userAgent
-        ]
-        self.cookieStorage = storage
-        self.session = URLSession(configuration: config)
+        config.httpAdditionalHeaders = ["User-Agent": Cloud189Constants.userAgent]
+        return (URLSession(configuration: config), storage)
+    }
+
+    public init() {
+        let created = Self.makeSessionAndCookieStorage()
+        self.session = created.session
+        self.cookieStorage = created.cookieStorage
     }
 
     public func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
@@ -164,16 +167,9 @@ public final class URLSessionCloudHTTPTransport: CloudHTTPTransport, @unchecked 
     public func clearCookies() async {
         let oldSession = lock.withLock { () -> URLSession in
             let previous = session
-            let config = URLSessionConfiguration.ephemeral
-            let storage = config.httpCookieStorage ?? HTTPCookieStorage()
-            storage.cookieAcceptPolicy = .always
-            config.httpShouldSetCookies = true
-            config.httpCookieStorage = storage
-            config.timeoutIntervalForRequest = 25
-            config.timeoutIntervalForResource = 120
-            config.httpAdditionalHeaders = ["User-Agent": Cloud189Constants.userAgent]
-            cookieStorage = storage
-            session = URLSession(configuration: config)
+            let created = Self.makeSessionAndCookieStorage()
+            cookieStorage = created.cookieStorage
+            session = created.session
             return previous
         }
         oldSession.invalidateAndCancel()
@@ -449,11 +445,9 @@ public actor Cloud189Client {
             resolvedFolderName = Cloud189Constants.rootFolderName
             resolvedFolderPath = Cloud189Constants.rootFolderName
         } else {
-            let trimmedName = folderName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-            let trimmedPath = folderPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-            let leafFromPath = trimmedPath?.split(separator: "/").last.map(String.init)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty
+            let trimmedName = folderName?.trimmedNilIfEmpty
+            let trimmedPath = folderPath?.trimmedNilIfEmpty
+            let leafFromPath = trimmedPath?.split(separator: "/").last.map(String.init)?.trimmedNilIfEmpty
             resolvedFolderName = trimmedName ?? leafFromPath ?? targetId
             resolvedFolderPath = trimmedPath ?? resolvedFolderName
         }

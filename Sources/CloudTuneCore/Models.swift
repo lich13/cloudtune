@@ -100,8 +100,7 @@ public struct ActiveCloudSession: Equatable, Sendable {
         self.accessToken = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         self.sessionKey = trimmedKey
         self.sessionSecret = trimmedSecret
-        self.loginName = loginName?.trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
+        self.loginName = loginName?.trimmedNilIfEmpty
     }
 }
 
@@ -115,9 +114,9 @@ public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
         let trimmed = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         self.refreshToken = trimmed
-        let normalizedName = accountName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let normalizedName = accountName?.trimmedNilIfEmpty
         self.accountName = normalizedName
-        let normalizedKey = accountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let normalizedKey = accountKey?.trimmedNilIfEmpty
         self.accountKey = normalizedKey ?? normalizedName
     }
 
@@ -129,13 +128,9 @@ public struct PersistedRefreshCredential: Codable, Equatable, Sendable {
             throw DecodingError.dataCorruptedError(forKey: .refreshToken, in: c, debugDescription: "Empty refreshToken")
         }
         self.refreshToken = rawToken
-        let decodedName = (try c.decodeIfPresent(String.self, forKey: .accountName))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
+        let decodedName = (try c.decodeIfPresent(String.self, forKey: .accountName))?.trimmedNilIfEmpty
         self.accountName = decodedName
-        self.accountKey = (try c.decodeIfPresent(String.self, forKey: .accountKey))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty ?? decodedName
+        self.accountKey = (try c.decodeIfPresent(String.self, forKey: .accountKey))?.trimmedNilIfEmpty ?? decodedName
     }
 
     public func withAccountKey(_ key: String) -> PersistedRefreshCredential {
@@ -154,8 +149,8 @@ public struct FolderSelection: Codable, Equatable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? "-11"
-        self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? "我的云盘"
+        self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? Cloud189Constants.rootFolderId
+        self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? Cloud189Constants.rootFolderName
     }
 }
 
@@ -187,7 +182,7 @@ public struct BreadcrumbItem: Codable, Equatable, Hashable, Sendable {
         self.name = name
     }
 
-    public static let root = BreadcrumbItem(id: nil, name: "我的云盘")
+    public static let root = BreadcrumbItem(id: nil, name: Cloud189Constants.rootFolderName)
 }
 
 public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable {
@@ -226,12 +221,7 @@ public struct TrackSummary: Codable, Equatable, Identifiable, Hashable, Sendable
     }
 
     public var isLosslessAudio: Bool {
-        switch fileExtensionUpper {
-        case "FLAC", "WAV", "ALAC", "APE", "AIFF", "AIF", "DSF", "DFF":
-            return true
-        default:
-            return false
-        }
+        Cloud189Protocol.isLosslessAudioFile(name)
     }
 }
 
@@ -267,8 +257,8 @@ public struct FolderBrowsePayload: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.currentFolderId = try c.decodeIfPresent(String.self, forKey: .currentFolderId) ?? "-11"
-        self.currentFolderName = try c.decodeIfPresent(String.self, forKey: .currentFolderName) ?? "我的云盘"
+        self.currentFolderId = try c.decodeIfPresent(String.self, forKey: .currentFolderId) ?? Cloud189Constants.rootFolderId
+        self.currentFolderName = try c.decodeIfPresent(String.self, forKey: .currentFolderName) ?? Cloud189Constants.rootFolderName
         self.parentFolderId = try c.decodeIfPresent(String.self, forKey: .parentFolderId)
         self.isRoot = try c.decodeIfPresent(Bool.self, forKey: .isRoot) ?? false
         self.folders = try c.decodeIfPresent([RemoteFolder].self, forKey: .folders) ?? []
@@ -724,14 +714,18 @@ public struct NowPlayingMetadata: Equatable, Sendable {
     }
 }
 
-extension String {
+public extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
 
+    var trimmedNilIfEmpty: String? {
+        trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
     var nilIfNotDefaultDisplayName: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != Cloud189Constants.defaultAccountDisplayName else {
+        guard let trimmed = trimmedNilIfEmpty,
+              trimmed != Cloud189Constants.defaultAccountDisplayName else {
             return nil
         }
         return trimmed

@@ -319,7 +319,7 @@ public struct MacWorkspaceView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                    if viewModel.isShowingNowPlayingSheet || viewModel.isShowingQueuePopover {
+                    if viewModel.isShowingNowPlaying {
                         Divider().overlay(palette.separator)
                         nowPlayingInspectorPane(palette: palette)
                             .frame(width: 316)
@@ -473,9 +473,9 @@ public struct MacWorkspaceView: View {
                 case .music, .settings:
                     "\(viewModel.committedSettings.musicFolder?.name ?? "尚未设置音乐目录") · 共 \(viewModel.visibleTracks.count) 首 · 缓存 \(CloudTuneFormatters.formatBytes(viewModel.cacheUsageBytes))"
                 case .video:
-                    "\(viewModel.videoBrowser.payload?.currentFolderName ?? "我的云盘") · \(viewModel.videoBrowser.payload?.videoFiles.count ?? 0) 个视频"
+                    "\(viewModel.videoBrowser.payload?.currentFolderName ?? Cloud189Constants.rootFolderName) · \(viewModel.videoBrowser.payload?.videoFiles.count ?? 0) 个视频"
                 case .cloud:
-                    "\(viewModel.cloudBrowser.payload?.currentFolderName ?? "我的云盘") · \(viewModel.cloudBrowser.payload?.folders.count ?? 0) 个文件夹 · \(viewModel.downloadableBrowserFiles.count) 个文件"
+                    "\(viewModel.cloudBrowser.payload?.currentFolderName ?? Cloud189Constants.rootFolderName) · \(viewModel.cloudBrowser.payload?.folders.count ?? 0) 个文件夹 · \(viewModel.downloadableBrowserFiles.count) 个文件"
                 case .transfers:
                     "实时速率 \(CloudTuneFormatters.formatBytes(viewModel.transferSnapshot.totalSpeedBytesPerSecond))/s · 导出目录 \(viewModel.committedSettings.exportFolderDisplayName ?? "未指定")"
                 }
@@ -1042,8 +1042,7 @@ public struct MacWorkspaceView: View {
                     .foregroundStyle(palette.inkPrimary)
                 Spacer()
                 Button {
-                    viewModel.isShowingNowPlayingSheet = false
-                    viewModel.isShowingQueuePopover = false
+                    viewModel.isShowingNowPlaying = false
                 } label: {
                     Image(systemName: "sidebar.right")
                         .font(.system(size: 13, weight: .medium))
@@ -1073,7 +1072,7 @@ public struct MacWorkspaceView: View {
                             LosslessBadge(track: track, palette: palette)
                         }
                     }
-                    if let subtitle = [artist, album].compactMap({ $0?.isEmpty == false ? $0 : nil }).joined(separator: " · ").nilIfBlank {
+                    if let subtitle = [artist, album].compactMap({ $0?.isEmpty == false ? $0 : nil }).joined(separator: " · ").trimmedNilIfEmpty {
                         Text(subtitle)
                             .font(.system(size: 12))
                             .foregroundStyle(palette.inkSecondary)
@@ -1180,10 +1179,7 @@ public struct MacWorkspaceView: View {
         HStack(spacing: 18) {
             // Left: Artwork + Track metadata
             Button {
-                viewModel.isShowingQueuePopover.toggle()
-                if !viewModel.isShowingQueuePopover {
-                    viewModel.isShowingNowPlayingSheet = false
-                }
+                viewModel.isShowingNowPlaying.toggle()
             } label: {
                 HStack(spacing: 11) {
                     ArtworkView(
@@ -1307,14 +1303,10 @@ public struct MacWorkspaceView: View {
 
                 barIconButton(
                     systemImage: "list.bullet",
-                    isActive: viewModel.isShowingNowPlayingSheet || viewModel.isShowingQueuePopover,
+                    isActive: viewModel.isShowingNowPlaying,
                     palette: palette
                 ) {
-                    let nextVisible = !(viewModel.isShowingNowPlayingSheet || viewModel.isShowingQueuePopover)
-                    viewModel.isShowingQueuePopover = nextVisible
-                    if !nextVisible {
-                        viewModel.isShowingNowPlayingSheet = false
-                    }
+                    viewModel.isShowingNowPlaying.toggle()
                 }
             }
             .frame(width: 210, alignment: .trailing)
@@ -1732,13 +1724,6 @@ struct MacExternalVideoChoiceSheet: View {
         .padding(22)
         .frame(width: 500)
         .background(palette.surfacePrimary)
-    }
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }
 #endif

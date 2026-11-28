@@ -6,7 +6,6 @@ public struct AccountPaths: Equatable, Sendable {
     public let accountDir: URL
     public let cacheDir: URL
     public let stagingDir: URL
-    public let artworkDir: URL
     public let settingsURL: URL
     public let libraryURL: URL
     public let cacheIndexURL: URL
@@ -21,7 +20,6 @@ public struct AccountPaths: Equatable, Sendable {
         self.accountDir = dir
         self.cacheDir = dir.appendingPathComponent("cache", isDirectory: true)
         self.stagingDir = dir.appendingPathComponent("staging", isDirectory: true)
-        self.artworkDir = dir.appendingPathComponent("artwork", isDirectory: true)
         self.settingsURL = dir.appendingPathComponent("settings.json")
         self.libraryURL = dir.appendingPathComponent("library.json")
         self.cacheIndexURL = self.cacheDir.appendingPathComponent("index.json")
@@ -33,6 +31,7 @@ public struct AccountPaths: Equatable, Sendable {
 public actor AccountScopedStore {
     public let rootDirectory: URL
     private let fm = FileManager.default
+    private var settingsMutationSequence: UInt64 = 0
 
     public init(rootDirectory: URL? = nil) throws {
         if let rootDirectory {
@@ -76,7 +75,7 @@ public actor AccountScopedStore {
 
     public func paths(for accountId: String) throws -> AccountPaths {
         let resolved = AccountPaths(baseRoot: rootDirectory, accountId: accountId)
-        for dir in [resolved.accountDir, resolved.cacheDir, resolved.stagingDir, resolved.artworkDir] {
+        for dir in [resolved.accountDir, resolved.cacheDir, resolved.stagingDir] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         return resolved
@@ -91,10 +90,6 @@ public actor AccountScopedStore {
         return try? JSONDecoder().decode(AccountSettings.self, from: data)
     }
 
-    public func loadSettings(for accountId: String) throws -> AccountSettings {
-        try loadSettingsIfPresent(for: accountId) ?? AccountSettings()
-    }
-
     public func saveSettings(_ settings: AccountSettings, for accountId: String) throws {
         let p = try paths(for: accountId)
         let data = try JSONEncoder().encode(settings)
@@ -106,11 +101,12 @@ public actor AccountScopedStore {
         for accountId: String,
         base: AccountSettings = AccountSettings(),
         _ transform: @Sendable (inout AccountSettings) -> Void
-    ) throws -> AccountSettings {
+    ) throws -> (settings: AccountSettings, sequence: UInt64) {
         var settings = (try loadSettingsIfPresent(for: accountId)) ?? base
         transform(&settings)
         try saveSettings(settings, for: accountId)
-        return settings
+        settingsMutationSequence &+= 1
+        return (settings, settingsMutationSequence)
     }
 
     public func loadLibrary(for accountId: String) throws -> [TrackSummary] {
@@ -127,24 +123,12 @@ public actor AccountScopedStore {
         try data.write(to: p.libraryURL, options: .atomic)
     }
 
-    public func saveExportDirectoryBookmark(
-        _ folderURL: URL,
-        baseSettings: AccountSettings? = nil,
-        for accountId: String
-    ) throws -> String {
-        try saveExportDirectoryBookmarkAndSettings(
-            folderURL,
-            baseSettings: baseSettings,
-            for: accountId
-        ).displayName
-    }
-
+    @discardableResult
     public func saveExportDirectoryBookmarkAndSettings(
         _ folderURL: URL,
         baseSettings: AccountSettings? = nil,
-        for accountId: String,
-        afterMutate: (@Sendable () -> Void)? = nil
-    ) throws -> (displayName: String, settings: AccountSettings) {
+        for accountId: String
+    ) throws -> (displayName: String, settings: AccountSettings, sequence: UInt64) {
         let p = try paths(for: accountId)
         let didStart = folderURL.startAccessingSecurityScopedResource()
         defer {
@@ -164,11 +148,10 @@ public actor AccountScopedStore {
         )
         try bookmarkData.write(to: p.exportBookmarkURL, options: .atomic)
         let displayName = folderURL.lastPathComponent
-        let updated = try mutateSettings(for: accountId, base: baseSettings ?? AccountSettings()) { settings in
+        let mutated = try mutateSettings(for: accountId, base: baseSettings ?? AccountSettings()) { settings in
             settings.exportFolderDisplayName = displayName
-            afterMutate?()
         }
-        return (displayName, updated)
+        return (displayName, mutated.settings, mutated.sequence)
     }
 
     public func captureExportBookmarkData(

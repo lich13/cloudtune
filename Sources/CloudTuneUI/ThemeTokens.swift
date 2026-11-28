@@ -116,6 +116,7 @@ public struct CloudTunePalette: Sendable {
     }
 }
 
+#if DEBUG
 public enum SnapshotScene: String, CaseIterable, Sendable {
     case authIdle = "01-auth-idle"
     case authQr = "02-auth-qr"
@@ -127,3 +128,4 @@ public enum SnapshotScene: String, CaseIterable, Sendable {
     case settings = "08-settings"
     case nowPlaying = "09-now-playing"
 }
+#endif

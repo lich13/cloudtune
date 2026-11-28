@@ -44,10 +44,6 @@ public actor CacheStore {
         activeWriters.remove(trackId)
     }
 
-    public func isWriteThroughActive(trackId: String) -> Bool {
-        activeWriters.contains(trackId)
-    }
-
     public func setProtectedTrackIDs(_ ids: Set<String>) {
         protectedTrackIDs = ids
     }

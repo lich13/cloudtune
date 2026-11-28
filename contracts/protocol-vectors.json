@@ -107,7 +107,16 @@
     "expectedTotalFromContentRange": 48234496,
     "resumeOffset": 4096,
     "validResumeContentRange": "bytes 4096-9999/10000",
-    "mismatchedResumeContentRange": "bytes 0-9999/10000"
+    "mismatchedResumeContentRange": "bytes 0-9999/10000",
+    "initialNonZeroOffset": 65536,
+    "validInitialNonZeroContentRange": "bytes 65536-131071/48234496",
+    "mismatchedInitialNonZeroContentRange": "bytes 0-131071/48234496",
+    "suffixRangeHeader": "bytes=-512",
+    "suffixTotalLength": 10000,
+    "expectedSuffixStart": 9488,
+    "expectedSuffixEnd": 9999,
+    "validSuffixContentRange": "bytes 9488-9999/10000",
+    "mismatchedSuffixContentRange": "bytes 0-511/10000"
   },
   "playbackFallbackPolicy": {
     "largeTrackThresholdBytes": 16777216,

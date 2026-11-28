@@ -193,55 +193,42 @@ public enum Cloud189Protocol {
             throw CloudTuneError.protocolError("会话接口返回空响应，HTTP \(statusCode)")
         }
 
+        let accessToken: String
+        let refreshToken: String
+        let loginName: String?
+        let userId: String?
+        let sessionKey: String
+        let sessionSecret: String
+        let emptySessionKeyError: String
+
         if cleaned.hasPrefix("<") {
-            let loginName = extractXMLTag("loginName", in: cleaned)
+            accessToken = fallbackAccessToken
+            refreshToken = fallbackRefreshToken
+            loginName = extractXMLTag("loginName", in: cleaned)
                 ?? extractXMLTag("userAccount", in: cleaned)
                 ?? fallbackAccountName
-            let userId = extractXMLTag("userId", in: cleaned)
-            let sessionKey = extractXMLTag("sessionKey", in: cleaned) ?? ""
-            let sessionSecret = extractXMLTag("sessionSecret", in: cleaned) ?? ""
-            guard let active = ActiveCloudSession(
-                accessToken: fallbackAccessToken,
-                sessionKey: sessionKey,
-                sessionSecret: sessionSecret,
-                loginName: loginName
-            ) else {
-                throw CloudTuneError.protocolError("189CloudPC XML 会话初始化失败，sessionKey 为空")
+            userId = extractXMLTag("userId", in: cleaned)
+            sessionKey = extractXMLTag("sessionKey", in: cleaned) ?? ""
+            sessionSecret = extractXMLTag("sessionSecret", in: cleaned) ?? ""
+            emptySessionKeyError = "189CloudPC XML 会话初始化失败，sessionKey 为空"
+        } else {
+            if let err = extractAPIErrorMessage(cleaned) {
+                throw CloudTuneError.protocolError(err)
             }
-            let explicitLogin = active.loginName?.nilIfNotDefaultDisplayName
-            let storageKey = explicitLogin
-                ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty?.nilIfNotDefaultDisplayName
-                ?? deriveFallbackAccountKey(
-                    userId: userId,
-                    refreshToken: fallbackRefreshToken,
-                    accessToken: active.accessToken,
-                    sessionKey: active.sessionKey
-                )
-            let persisted = PersistedRefreshCredential(
-                refreshToken: fallbackRefreshToken,
-                accountName: active.loginName,
-                accountKey: storageKey
-            )
-            return ParsedSessionPayload(activeSession: active, persistedCredential: persisted)
+            guard let data = cleaned.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CloudTuneError.protocolError("会话接口返回非预期响应，HTTP \(statusCode)")
+            }
+            accessToken = stringValue(json["accessToken"]) ?? fallbackAccessToken
+            refreshToken = stringValue(json["refreshToken"]) ?? fallbackRefreshToken
+            loginName = stringValue(json["loginName"])
+                ?? stringValue(json["userAccount"])
+                ?? fallbackAccountName
+            userId = stringValue(json["userId"])
+            sessionKey = stringValue(json["sessionKey"]) ?? ""
+            sessionSecret = stringValue(json["sessionSecret"]) ?? ""
+            emptySessionKeyError = "189CloudPC 会话初始化失败，sessionKey 为空"
         }
-
-        if let err = extractAPIErrorMessage(cleaned) {
-            throw CloudTuneError.protocolError(err)
-        }
-
-        guard let data = cleaned.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw CloudTuneError.protocolError("会话接口返回非预期响应，HTTP \(statusCode)")
-        }
-
-        let accessToken = stringValue(json["accessToken"]) ?? fallbackAccessToken
-        let refreshToken = stringValue(json["refreshToken"]) ?? fallbackRefreshToken
-        let loginName = stringValue(json["loginName"])
-            ?? stringValue(json["userAccount"])
-            ?? fallbackAccountName
-        let userId = stringValue(json["userId"])
-        let sessionKey = stringValue(json["sessionKey"]) ?? ""
-        let sessionSecret = stringValue(json["sessionSecret"]) ?? ""
 
         guard let active = ActiveCloudSession(
             accessToken: accessToken,
@@ -249,11 +236,11 @@ public enum Cloud189Protocol {
             sessionSecret: sessionSecret,
             loginName: loginName
         ) else {
-            throw CloudTuneError.protocolError("189CloudPC 会话初始化失败，sessionKey 为空")
+            throw CloudTuneError.protocolError(emptySessionKeyError)
         }
         let explicitLogin = active.loginName?.nilIfNotDefaultDisplayName
         let storageKey = explicitLogin
-            ?? fallbackAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty?.nilIfNotDefaultDisplayName
+            ?? fallbackAccountKey?.nilIfNotDefaultDisplayName
             ?? deriveFallbackAccountKey(
                 userId: userId,
                 refreshToken: refreshToken,
@@ -337,17 +324,14 @@ public enum Cloud189Protocol {
         persistedCredential: PersistedRefreshCredential? = nil,
         priorAccountKey: String? = nil
     ) -> (storageKey: String, displayName: String) {
-        let explicitLogin = activeSession.loginName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-            ?? persistedCredential?.accountName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        if let explicitLogin, explicitLogin != Cloud189Constants.defaultAccountDisplayName {
+        if let explicitLogin = activeSession.loginName?.nilIfNotDefaultDisplayName
+            ?? persistedCredential?.accountName?.nilIfNotDefaultDisplayName {
             return (explicitLogin, explicitLogin)
         }
-        if let prior = priorAccountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
-           prior != Cloud189Constants.defaultAccountDisplayName {
+        if let prior = priorAccountKey?.nilIfNotDefaultDisplayName {
             return (prior, Cloud189Constants.defaultAccountDisplayName)
         }
-        if let savedKey = persistedCredential?.accountKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
-           savedKey != Cloud189Constants.defaultAccountDisplayName {
+        if let savedKey = persistedCredential?.accountKey?.nilIfNotDefaultDisplayName {
             return (savedKey, Cloud189Constants.defaultAccountDisplayName)
         }
         let derived = deriveFallbackAccountKey(
@@ -402,16 +386,75 @@ public enum Cloud189Protocol {
         return mapped
     }
 
+    private struct MediaExtensionDescriptor: Sendable {
+        enum Kind: Equatable, Sendable {
+            case audio(isLossless: Bool)
+            case video
+        }
+
+        let kind: Kind
+        let mimeType: String
+    }
+
+    private static let mediaDescriptorsByExtension: [String: MediaExtensionDescriptor] = [
+        // Audio formats
+        "mp3": .init(kind: .audio(isLossless: false), mimeType: "audio/mpeg"),
+        "flac": .init(kind: .audio(isLossless: true), mimeType: "audio/flac"),
+        "wav": .init(kind: .audio(isLossless: true), mimeType: "audio/wav"),
+        "m4a": .init(kind: .audio(isLossless: false), mimeType: "audio/mp4"),
+        "alac": .init(kind: .audio(isLossless: true), mimeType: "audio/mp4"),
+        "aac": .init(kind: .audio(isLossless: false), mimeType: "audio/aac"),
+        "ogg": .init(kind: .audio(isLossless: false), mimeType: "audio/ogg"),
+        "opus": .init(kind: .audio(isLossless: false), mimeType: "audio/opus"),
+        "ape": .init(kind: .audio(isLossless: true), mimeType: "audio/x-ape"),
+        "wma": .init(kind: .audio(isLossless: false), mimeType: "audio/x-ms-wma"),
+        "aiff": .init(kind: .audio(isLossless: true), mimeType: "audio/aiff"),
+        "aif": .init(kind: .audio(isLossless: true), mimeType: "audio/aiff"),
+        "dsf": .init(kind: .audio(isLossless: true), mimeType: "audio/dsf"),
+        "dff": .init(kind: .audio(isLossless: true), mimeType: "audio/dff"),
+        // Video formats
+        "mp4": .init(kind: .video, mimeType: "video/mp4"),
+        "m4v": .init(kind: .video, mimeType: "video/mp4"),
+        "mov": .init(kind: .video, mimeType: "video/quicktime"),
+        "mkv": .init(kind: .video, mimeType: "video/x-matroska"),
+        "webm": .init(kind: .video, mimeType: "video/webm"),
+        "avi": .init(kind: .video, mimeType: "video/x-msvideo"),
+        "wmv": .init(kind: .video, mimeType: "video/x-ms-wmv"),
+        "flv": .init(kind: .video, mimeType: "video/x-flv"),
+        "mpeg": .init(kind: .video, mimeType: "video/mpeg"),
+        "mpg": .init(kind: .video, mimeType: "video/mpeg")
+    ]
+
+    private static func mediaDescriptor(for fileName: String) -> MediaExtensionDescriptor? {
+        let trimmed = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let dotIndex = trimmed.lastIndex(of: "."),
+              dotIndex < trimmed.index(before: trimmed.endIndex) else {
+            return nil
+        }
+        let ext = trimmed[trimmed.index(after: dotIndex)...]
+        guard !ext.contains("/"), !ext.contains("\\") else {
+            return nil
+        }
+        return mediaDescriptorsByExtension[ext.lowercased()]
+    }
+
     public static func isAudioFile(_ name: String) -> Bool {
-        let lower = name.lowercased()
-        return [".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".ape", ".wma", ".alac"]
-            .contains { lower.hasSuffix($0) }
+        if case .audio = mediaDescriptor(for: name)?.kind {
+            return true
+        }
+        return false
+    }
+
+    public static func isLosslessAudioFile(_ name: String) -> Bool {
+        mediaDescriptor(for: name)?.kind == .audio(isLossless: true)
     }
 
     public static func isVideoFile(_ name: String) -> Bool {
-        let lower = name.lowercased()
-        return [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg"]
-            .contains { lower.hasSuffix($0) }
+        mediaDescriptor(for: name)?.kind == .video
+    }
+
+    public static func guessMimeType(for fileName: String) -> String {
+        mediaDescriptor(for: fileName)?.mimeType ?? "application/octet-stream"
     }
 
     private static func normalizeBody(_ raw: String) -> String {

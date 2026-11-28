@@ -119,6 +119,7 @@ jobs:
             xcodebuild test \
             -project ios/CloudTuneIOS.xcodeproj \
             -scheme CloudTuneIOS \
+            -configuration Debug \
             -destination "platform=iOS Simulator,id=${SIM_UDID}" \
             CODE_SIGNING_ALLOWED=NO
 

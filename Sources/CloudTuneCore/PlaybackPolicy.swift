@@ -59,12 +59,6 @@ public actor GlobalTransferSemaphore {
         }
         activePermits -= 1
     }
-
-    public func withPermit<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
-        try await acquire()
-        defer { release() }
-        return try await operation()
-    }
 }
 
 public struct ParsedByteRange: Equatable, Sendable {
@@ -250,21 +244,5 @@ public enum PlaybackDecisionPolicy {
             return .stopAfterMaxRetries
         }
         return .retryTransientAfterDelay(attempt: priorAttemptCount + 1)
-    }
-
-    public static func guessMimeType(for fileName: String) -> String {
-        let lower = fileName.lowercased()
-        if lower.hasSuffix(".flac") { return "audio/flac" }
-        if lower.hasSuffix(".mp3") { return "audio/mpeg" }
-        if lower.hasSuffix(".m4a") || lower.hasSuffix(".alac") { return "audio/mp4" }
-        if lower.hasSuffix(".aac") { return "audio/aac" }
-        if lower.hasSuffix(".wav") { return "audio/wav" }
-        if lower.hasSuffix(".ogg") { return "audio/ogg" }
-        if lower.hasSuffix(".opus") { return "audio/opus" }
-        if lower.hasSuffix(".mp4") || lower.hasSuffix(".m4v") { return "video/mp4" }
-        if lower.hasSuffix(".mov") { return "video/quicktime" }
-        if lower.hasSuffix(".mkv") { return "video/x-matroska" }
-        if lower.hasSuffix(".webm") { return "video/webm" }
-        return "application/octet-stream"
     }
 }

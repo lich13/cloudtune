@@ -82,12 +82,17 @@ public actor AccountScopedStore {
         return resolved
     }
 
-    public func loadSettings(for accountId: String) throws -> AccountSettings {
+    public func loadSettingsIfPresent(for accountId: String) throws -> AccountSettings? {
         let p = try paths(for: accountId)
-        guard let data = try? Data(contentsOf: p.settingsURL) else {
-            return AccountSettings()
+        guard fm.fileExists(atPath: p.settingsURL.path),
+              let data = try? Data(contentsOf: p.settingsURL) else {
+            return nil
         }
-        return (try? JSONDecoder().decode(AccountSettings.self, from: data)) ?? AccountSettings()
+        return try? JSONDecoder().decode(AccountSettings.self, from: data)
+    }
+
+    public func loadSettings(for accountId: String) throws -> AccountSettings {
+        try loadSettingsIfPresent(for: accountId) ?? AccountSettings()
     }
 
     public func saveSettings(_ settings: AccountSettings, for accountId: String) throws {

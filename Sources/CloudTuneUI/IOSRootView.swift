@@ -18,6 +18,7 @@ public struct IOSRootView: View {
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var hapticCounter: Int = 0
     @State private var scrubPreviewSeconds: Double?
+    @State private var isSearchPresented: Bool = false
 
     public init(viewModel: CloudTuneViewModel) {
         self.viewModel = viewModel
@@ -342,16 +343,25 @@ public struct IOSRootView: View {
                 Task { await viewModel.togglePlayback() }
             }
             .keyboardShortcut(.space, modifiers: [])
+            .disabled(isSearchPresented || viewModel.activeModule == .settings)
 
             Button("") {
                 Task { await viewModel.playAdjacent(direction: -1) }
             }
             .keyboardShortcut(.leftArrow, modifiers: [.command])
+            .disabled(!viewModel.canSkipPrevious)
 
             Button("") {
                 Task { await viewModel.playAdjacent(direction: 1) }
             }
             .keyboardShortcut(.rightArrow, modifiers: [.command])
+            .disabled(!viewModel.canSkipNext)
+
+            Button("") {
+                viewModel.activeModule = .music
+                isSearchPresented = true
+            }
+            .keyboardShortcut("f", modifiers: [.command])
 
             Button("") { viewModel.activeModule = .music }
                 .keyboardShortcut("1", modifiers: [.command])
@@ -420,12 +430,16 @@ public struct IOSRootView: View {
                 InteractiveScrubSlider(
                     value: viewModel.currentTime,
                     total: viewModel.duration,
-                    palette: palette
-                ) { sec in
-                    Task { await viewModel.seekPlayback(to: sec) }
-                }
+                    palette: palette,
+                    onPreviewChange: { preview in
+                        scrubPreviewSeconds = preview
+                    },
+                    onSeek: { sec in
+                        Task { await viewModel.seekPlayback(to: sec) }
+                    }
+                )
                 HStack {
-                    Text(CloudTuneFormatters.formatClock(viewModel.currentTime))
+                    Text(CloudTuneFormatters.formatClock(scrubPreviewSeconds ?? viewModel.currentTime))
                     Spacer()
                     Text(CloudTuneFormatters.formatClock(viewModel.duration))
                 }
@@ -990,7 +1004,7 @@ public struct IOSRootView: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(palette.canvasBackground)
-        .searchable(text: $viewModel.searchQuery, prompt: "搜索曲目或目录")
+        .searchable(text: $viewModel.searchQuery, isPresented: $isSearchPresented, prompt: "搜索曲目或目录")
         .refreshable {
             await viewModel.scanMusicLibrary(showBusy: false)
         }

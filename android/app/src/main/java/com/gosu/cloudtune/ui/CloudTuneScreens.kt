@@ -45,6 +45,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -222,6 +223,7 @@ fun CloudTuneRootApp(
                         ) {
                             NowPlayingFullSheetContent(
                                 runtime = runtime,
+                                applySystemInsets = false,
                                 onCollapse = { runtime.isShowingNowPlayingSheet = false }
                             )
                         }
@@ -232,6 +234,7 @@ fun CloudTuneRootApp(
                         ) {
                             NowPlayingFullSheetContent(
                                 runtime = runtime,
+                                applySystemInsets = true,
                                 onCollapse = { runtime.isShowingNowPlayingSheet = false }
                             )
                         }
@@ -266,10 +269,12 @@ fun CloudTuneRootApp(
                         },
                         dismissButton = {
                             Row {
-                                TextButton(onClick = {
-                                    runtime.launchLoopbackStreamInVideoApp(context, pending)
-                                }) {
-                                    Text("直接串流打开")
+                                if (pending.streamUrl != null) {
+                                    TextButton(onClick = {
+                                        runtime.launchLoopbackStreamInVideoApp(context, pending)
+                                    }) {
+                                        Text("直接串流打开")
+                                    }
                                 }
                                 TextButton(onClick = { runtime.pendingExternalVideoAction = null }) {
                                     Text("取消")
@@ -526,7 +531,7 @@ private fun LoginStageScreen(runtime: CloudTuneAppRuntime) {
     ) {
         LazyColumn(
             modifier = Modifier
-                .width(520.dp)
+                .widthIn(max = 520.dp)
                 .fillMaxWidth(),
             contentPadding = PaddingValues(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -640,9 +645,21 @@ private fun LoginStageScreen(runtime: CloudTuneAppRuntime) {
 @Composable
 private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
-    if (runtime.activeModule == ModuleTab.SETTINGS) {
-        BackHandler {
+    var settingsBackProgress by remember { mutableFloatStateOf(0f) }
+
+    PredictiveBackHandler(
+        enabled = runtime.activeModule == ModuleTab.SETTINGS &&
+            runtime.activeVideoUrl == null &&
+            !runtime.isShowingNowPlayingSheet
+    ) { progress ->
+        try {
+            progress.collect { event ->
+                settingsBackProgress = event.progress
+            }
+            settingsBackProgress = 0f
             runtime.activeModule = ModuleTab.MUSIC
+        } catch (_: CancellationException) {
+            settingsBackProgress = 0f
         }
     }
 
@@ -716,7 +733,11 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(colors.surface)
-                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .windowInsetsPadding(
+                        WindowInsets.navigationBars.union(
+                            WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)
+                        )
+                    )
             ) {
                 MiniPlayerBar(
                     runtime = runtime,
@@ -725,7 +746,8 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                 HorizontalDivider(color = colors.separator)
                 NavigationBar(
                     containerColor = colors.surface,
-                    tonalElevation = 0.dp
+                    tonalElevation = 0.dp,
+                    windowInsets = WindowInsets(0, 0, 0, 0)
                 ) {
                     PhonePrimaryTabs.forEach { tab ->
                         val icon = when (tab) {
@@ -758,6 +780,12 @@ private fun PhoneWorkspaceScaffold(runtime: CloudTuneAppRuntime) {
                 .padding(innerPadding)
                 .fillMaxSize()
                 .imePadding()
+                .graphicsLayer {
+                    if (runtime.activeModule == ModuleTab.SETTINGS) {
+                        translationX = settingsBackProgress * 28.dp.toPx()
+                        alpha = 1f - settingsBackProgress * 0.08f
+                    }
+                }
         ) {
             ActiveModuleContent(runtime)
         }
@@ -981,6 +1009,7 @@ private fun MiniPlayerBar(runtime: CloudTuneAppRuntime, modifier: Modifier = Mod
 @Composable
 private fun NowPlayingFullSheetContent(
     runtime: CloudTuneAppRuntime,
+    applySystemInsets: Boolean = true,
     onCollapse: () -> Unit
 ) {
     val colors = LocalCloudTuneColors.current
@@ -992,11 +1021,14 @@ private fun NowPlayingFullSheetContent(
         (runtime.nowPlayingAlbum ?: track?.folderPath)?.takeIf { it.isNotBlank() }
     ).joinToString(" · ").ifBlank { "CloudTune" }
     val safeInsets = WindowInsets.systemBars.union(WindowInsets.displayCutout)
+    val listModifier = if (applySystemInsets) {
+        Modifier.fillMaxSize().windowInsetsPadding(safeInsets)
+    } else {
+        Modifier.fillMaxSize()
+    }
 
     LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .windowInsetsPadding(safeInsets),
+        modifier = listModifier,
         contentPadding = PaddingValues(horizontal = 22.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -1875,9 +1907,10 @@ private fun TransfersWorkspaceContent(runtime: CloudTuneAppRuntime) {
                                 "playback" -> "播放缓存"
                                 else -> "导出下载"
                             }
+                            val pathSuffix = item.path?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+                            val baseMeta = "$kindTag · ${item.localizedStateLabel}$pathSuffix"
                             Text(
-                                text = pct?.let { "$kindTag · ${item.state} · ${String.format(Locale.US, "%.1f%%", it)}" }
-                                    ?: "$kindTag · ${item.state}",
+                                text = pct?.let { "$baseMeta · ${String.format(Locale.US, "%.1f%%", it)}" } ?: baseMeta,
                                 style = TabularNumStyle,
                                 color = colors.inkTertiary,
                                 fontSize = 12.sp,
@@ -2309,6 +2342,12 @@ private fun TianyiOfficialWebLoginDialog(runtime: CloudTuneAppRuntime) {
                                     Cloud189Protocol.webLoginEntryUrl(),
                                     mapOf("Referer" to Cloud189Constants.REFERER)
                                 )
+                            }
+                        },
+                        onRelease = { webView ->
+                            runCatching {
+                                webView.stopLoading()
+                                webView.destroy()
                             }
                         }
                     )

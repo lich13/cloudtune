@@ -139,6 +139,7 @@ public enum SnapshotRenderer {
 
         let controller = UIHostingController(rootView: rootView)
         controller.overrideUserInterfaceStyle = isDark ? .dark : .light
+        controller.traitOverrides.horizontalSizeClass = isIPad ? .regular : .compact
 
         let window: UIWindow
         if let activeScene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
@@ -148,6 +149,7 @@ public enum SnapshotRenderer {
         }
         window.frame = CGRect(origin: .zero, size: size)
         window.overrideUserInterfaceStyle = isDark ? .dark : .light
+        window.traitOverrides.horizontalSizeClass = isIPad ? .regular : .compact
         window.rootViewController = controller
         window.isHidden = false
         controller.loadViewIfNeeded()

@@ -1,5 +1,6 @@
 package com.gosu.cloudtune.ui
 
+import android.content.ClipData
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -84,7 +85,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 data class PendingExternalVideoAction(
     val video: TrackSummary,
-    val streamUrl: String
+    val streamUrl: String?
 )
 
 /**
@@ -281,6 +282,9 @@ class CloudTuneAppRuntime(
     fun setUiForegroundVisible(visible: Boolean) {
         if (isUiForegroundVisible == visible) return
         isUiForegroundVisible = visible
+        if (!visible) {
+            videoPlayer?.pause()
+        }
         updateUiProgressClock()
         if (visible && isAuthenticated) {
             transferSnapshot = transferEngine.snapshot()
@@ -438,7 +442,7 @@ class CloudTuneAppRuntime(
         }
     }
 
-    fun commitCacheLimitDraft(): Boolean {
+    suspend fun commitCacheLimitDraftAsync(): Boolean {
         val parsed = cacheLimitDraft.trim().toLongOrNull()
         if (parsed == null || parsed < AccountSettings.MIN_CACHE_LIMIT_MB) {
             val msg = "缓存上限至少设为 256 MB。"
@@ -447,23 +451,55 @@ class CloudTuneAppRuntime(
             return false
         }
         val cm = cacheManager
-        var immediateOutcome = true
-        scope.launch {
-            val ok = mutateAccountSettings(
-                successMessage = "缓存限制已更新",
-                resyncDrafts = true
-            ) { prev -> prev.copy(cacheLimitMb = parsed) }
-            immediateOutcome = ok
-            if (ok && cm != null) {
-                val prunedUsage = runCatching {
-                    withContext(ioDispatcher) { cm.pruneToLimit(parsed * 1024L * 1024L) }
-                }.getOrNull()
-                if (prunedUsage != null && cm === cacheManager) {
-                    cacheUsageBytes = prunedUsage
-                }
+        val ok = mutateAccountSettings(
+            successMessage = "缓存限制已更新",
+            resyncDrafts = true
+        ) { prev -> prev.copy(cacheLimitMb = parsed) }
+        if (ok && cm != null) {
+            val prunedUsage = runCatching {
+                withContext(ioDispatcher) { cm.pruneToLimit(parsed * 1024L * 1024L) }
+            }.getOrNull()
+            if (prunedUsage != null && cm === cacheManager) {
+                cacheUsageBytes = prunedUsage
             }
         }
-        return immediateOutcome
+        return ok
+    }
+
+    fun commitCacheLimitDraft(): Boolean {
+        val parsed = cacheLimitDraft.trim().toLongOrNull()
+        if (parsed == null || parsed < AccountSettings.MIN_CACHE_LIMIT_MB) {
+            val msg = "缓存上限至少设为 256 MB。"
+            settingsValidationError = msg
+            statusMessage = msg
+            return false
+        }
+        var completedOutcome: Boolean? = null
+        scope.launch {
+            completedOutcome = commitCacheLimitDraftAsync()
+        }
+        return completedOutcome ?: true
+    }
+
+    suspend fun commitTransferThreadsDraftAsync(): Boolean {
+        val dl = downloadThreadsDraft.trim().toIntOrNull()
+        if (dl == null || dl !in 1..AccountSettings.MAX_DOWNLOAD_THREADS) {
+            val msg = "下载线程范围是 1-${AccountSettings.MAX_DOWNLOAD_THREADS}"
+            settingsValidationError = msg
+            statusMessage = msg
+            return false
+        }
+        val ct = cacheThreadsDraft.trim().toIntOrNull()
+        if (ct == null || ct !in 1..AccountSettings.MAX_CACHE_THREADS) {
+            val msg = "缓存线程范围是 1-${AccountSettings.MAX_CACHE_THREADS}"
+            settingsValidationError = msg
+            statusMessage = msg
+            return false
+        }
+        return mutateAccountSettings(
+            successMessage = "传输参数已更新",
+            resyncDrafts = true
+        ) { prev -> prev.copy(downloadThreads = dl, cacheThreads = ct) }
     }
 
     fun commitTransferThreadsDraft(): Boolean {
@@ -481,14 +517,11 @@ class CloudTuneAppRuntime(
             statusMessage = msg
             return false
         }
-        var immediateOutcome = true
+        var completedOutcome: Boolean? = null
         scope.launch {
-            immediateOutcome = mutateAccountSettings(
-                successMessage = "传输参数已更新",
-                resyncDrafts = true
-            ) { prev -> prev.copy(downloadThreads = dl, cacheThreads = ct) }
+            completedOutcome = commitTransferThreadsDraftAsync()
         }
-        return immediateOutcome
+        return completedOutcome ?: true
     }
 
     fun updatePlaybackMode(mode: PlaybackMode) {
@@ -790,6 +823,8 @@ class CloudTuneAppRuntime(
         currentTime = 0.0
         duration = 0.0
         isShowingNowPlayingSheet = false
+        isShowingWebLoginDialog = false
+        activeModule = ModuleTab.MUSIC
         pendingExternalVideoAction = null
         transferSnapshot = TransferSnapshotPayload()
         committedSettings = AccountSettings(
@@ -1071,6 +1106,7 @@ class CloudTuneAppRuntime(
                     val remoteUrl = cloudClient.resolveDownloadUrl(track.id)
                     if (gen != playbackGeneration || !isAuthenticated) return@launch
                     val dest = withContext(ioDispatcher) { cm.cacheFile(track.id, track.name) }
+                    if (gen != playbackGeneration || !isAuthenticated) return@launch
                     val playUrl = streamServer?.registerSource(
                         StreamSourceRegistration(
                             accountHash = accountHash,
@@ -1356,6 +1392,7 @@ class CloudTuneAppRuntime(
 
     fun openVideoInApp(video: TrackSummary) {
         playbackGeneration += 1
+        val gen = playbackGeneration
         recoveryAttempts = 0
         scheduledPrefetchJob?.cancel()
         mediaController?.pause()
@@ -1368,12 +1405,15 @@ class CloudTuneAppRuntime(
                 val cm = cacheManager
                 val acct = activeAccountKey
                 val cached = withContext(ioDispatcher) { cm?.existingCachedFile(video.id) }
+                if (gen != playbackGeneration || !isAuthenticated) return@launch
                 val resolvedPlayUrl = if (cached != null) {
                     Uri.fromFile(cached)?.toString() ?: cached.toURI().toString()
                 } else {
                     val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
+                    if (gen != playbackGeneration || !isAuthenticated) return@launch
                     if (streamServer != null && cm != null && acct != null) {
                         val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
+                        if (gen != playbackGeneration || !isAuthenticated) return@launch
                         streamServer.registerSource(
                             StreamSourceRegistration(
                                 accountHash = Cloud189Protocol.accountBucketHash(acct),
@@ -1390,6 +1430,7 @@ class CloudTuneAppRuntime(
                         remoteUrl
                     }
                 }
+                if (gen != playbackGeneration || !isAuthenticated) return@launch
                 activeVideoTrack = video
                 activeVideoTitle = video.name
                 activeVideoUrl = resolvedPlayUrl
@@ -1397,9 +1438,13 @@ class CloudTuneAppRuntime(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = e.message
+                if (gen == playbackGeneration && isAuthenticated) {
+                    statusMessage = e.message
+                }
             } finally {
-                busyLabel = null
+                if (gen == playbackGeneration) {
+                    busyLabel = null
+                }
             }
         }
     }
@@ -1466,7 +1511,7 @@ class CloudTuneAppRuntime(
                 val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
                 val cm = cacheManager
                 val acct = activeAccountKey
-                val loopbackUrl = if (streamServer != null && cm != null && acct != null) {
+                val loopbackUrl: String? = if (streamServer != null && cm != null && acct != null) {
                     val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
                     streamServer.registerSource(
                         StreamSourceRegistration(
@@ -1480,7 +1525,7 @@ class CloudTuneAppRuntime(
                         ),
                         cacheManager = cm
                     )
-                } else remoteUrl
+                } else null
                 pendingExternalVideoAction = PendingExternalVideoAction(video, loopbackUrl)
             } catch (ce: CancellationException) {
                 throw ce
@@ -1520,13 +1565,19 @@ class CloudTuneAppRuntime(
 
     fun launchLoopbackStreamInVideoApp(context: Context, action: PendingExternalVideoAction) {
         pendingExternalVideoAction = null
+        val streamUrl = action.streamUrl ?: return
+        val uri = Uri.parse(streamUrl)
+        if (uri?.host != "127.0.0.1") return
         val mime = PlaybackDecisionPolicy.guessMimeType(action.video.name)
         val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(Uri.parse(action.streamUrl), mime)
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val chooser = Intent.createChooser(intent, "选择本地视频播放器").apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching {
-            context.startActivity(Intent.createChooser(intent, "选择本地视频播放器"))
+            context.startActivity(chooser)
         }.onFailure { err ->
             statusMessage = "未能唤起外部视频播放器：${err.message}"
         }
@@ -1536,9 +1587,13 @@ class CloudTuneAppRuntime(
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", localFile)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, PlaybackDecisionPolicy.guessMimeType(fileName))
+            clipData = ClipData.newRawUri("", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "选择本地视频播放器"))
+        val chooser = Intent.createChooser(intent, "选择本地视频播放器").apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(chooser)
     }
 
     fun onSafTreeSelected(context: Context, treeUri: Uri) {
@@ -1994,6 +2049,7 @@ class CloudTuneViewModel(
     fun bootstrap(): Deferred<Unit> = runtime.bootstrap()
     fun noteDraftEdited() = runtime.noteDraftEdited()
     fun commitCacheLimitDraft(): Boolean = runtime.commitCacheLimitDraft()
+    suspend fun commitCacheLimitDraftAsync(): Boolean = runtime.commitCacheLimitDraftAsync()
     fun updatePlaybackMode(mode: PlaybackMode) = runtime.updatePlaybackMode(mode)
     fun completeEmbeddedWebLogin(callbackUrl: String, cookiesByOrigin: Map<String, String?>) =
         runtime.completeEmbeddedWebLogin(callbackUrl, cookiesByOrigin)

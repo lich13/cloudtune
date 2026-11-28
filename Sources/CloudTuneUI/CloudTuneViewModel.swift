@@ -21,9 +21,9 @@ public struct BrowserPaneState: Equatable, Sendable {
 public struct PendingExternalVideoChoice: Equatable, Identifiable, Sendable {
     public var id: String { video.id }
     public let video: TrackSummary
-    public let streamURL: URL
+    public let streamURL: URL?
 
-    public init(video: TrackSummary, streamURL: URL) {
+    public init(video: TrackSummary, streamURL: URL?) {
         self.video = video
         self.streamURL = streamURL
     }
@@ -454,6 +454,12 @@ public final class CloudTuneViewModel {
         settingsValidationError = nil
     }
 
+    public var hasUnsavedSettingsDrafts: Bool {
+        cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb)
+            || downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
+            || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads)
+    }
+
     public func noteDraftEdited() {
         if let previousError = settingsValidationError, statusMessage == previousError {
             statusMessage = nil
@@ -760,9 +766,12 @@ public final class CloudTuneViewModel {
         }
 
         do {
-            let savedSettings = try await accountStore.loadSettings(for: storageKey)
-            self.committedSettings = savedSettings
-            self.appearancePreference = savedSettings.appearanceMode
+            if let savedSettings = try await accountStore.loadSettingsIfPresent(for: storageKey) {
+                self.committedSettings = savedSettings
+                self.appearancePreference = savedSettings.appearanceMode
+            } else {
+                self.committedSettings = AccountSettings(appearanceMode: appearancePreference)
+            }
             syncDraftsFromCommitted()
         } catch {
             self.statusMessage = "读取账户设置失败：\(error.localizedDescription)"
@@ -825,7 +834,10 @@ public final class CloudTuneViewModel {
         activeVideoTrack = nil
         pendingExternalVideoChoice = nil
         isShowingNowPlayingSheet = false
+        isShowingSettingsSheet = false
+        isShowingWebLoginSheet = false
         isShowingQueuePopover = false
+        activeModule = .music
         transferSnapshot = TransferSnapshotPayload()
         committedSettings = AccountSettings(appearanceMode: appearancePreference)
         syncDraftsFromCommitted()
@@ -1000,7 +1012,9 @@ public final class CloudTuneViewModel {
         do {
             await cacheStore.setProtectedTrackIDs([track.id])
             if let cachedURL = await cacheStore.existingCachedFile(trackId: track.id) {
-                cacheUsageBytes = await cacheStore.usageBytes()
+                let usage = await cacheStore.usageBytes()
+                guard gen == playbackGeneration, isAuthenticated else { return }
+                cacheUsageBytes = usage
                 try await startAVPlayer(
                     track: track,
                     url: cachedURL,
@@ -1134,6 +1148,7 @@ public final class CloudTuneViewModel {
         player.replaceCurrentItem(with: item)
         if resumeTime > 0 {
             await player.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 600))
+            guard generation == playbackGeneration, isAuthenticated else { return }
         }
         player.play()
         isPlaying = true
@@ -1387,18 +1402,21 @@ public final class CloudTuneViewModel {
 
     public func openVideoInApp(_ video: TrackSummary) async {
         playbackGeneration += 1
+        let gen = playbackGeneration
         recoveryAttempts = 0
         pauseIfPlaying()
         busyLabel = "准备视频流 \(video.name)..."
-        defer { busyLabel = nil }
+        defer { if gen == playbackGeneration { busyLabel = nil } }
         do {
             if let cacheStore, let cached = await cacheStore.existingCachedFile(trackId: video.id) {
+                guard gen == playbackGeneration, isAuthenticated else { return }
                 activeVideoTrack = video
                 activeVideoURL = cached
                 statusMessage = "正在播放已缓存视频：\(video.name)"
                 return
             }
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
+            guard gen == playbackGeneration, isAuthenticated else { return }
             let playbackURL: URL
             if let streamServer, let cacheStore, let accountId = activeAccountKey {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
@@ -1418,12 +1436,14 @@ public final class CloudTuneViewModel {
             } else {
                 playbackURL = remoteURL
             }
+            guard gen == playbackGeneration, isAuthenticated else { return }
             activeVideoTrack = video
             activeVideoURL = playbackURL
             statusMessage = "正在应用内播放视频：\(video.name)"
         } catch is CancellationError {
             return
         } catch {
+            guard gen == playbackGeneration, isAuthenticated else { return }
             statusMessage = error.localizedDescription
         }
     }
@@ -1439,11 +1459,11 @@ public final class CloudTuneViewModel {
         }
         do {
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
-            let streamURL: URL
+            let loopbackStreamURL: URL?
             if let streamServer, let cacheStore, let accountId = activeAccountKey {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
                 let destURL = await cacheStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
-                streamURL = await streamServer.registerSource(
+                loopbackStreamURL = await streamServer.registerSource(
                     StreamSourceRegistration(
                         accountHash: accountHash,
                         trackId: video.id,
@@ -1456,9 +1476,9 @@ public final class CloudTuneViewModel {
                     cacheStore: cacheStore
                 )
             } else {
-                streamURL = remoteURL
+                loopbackStreamURL = nil
             }
-            pendingExternalVideoChoice = PendingExternalVideoChoice(video: video, streamURL: streamURL)
+            pendingExternalVideoChoice = PendingExternalVideoChoice(video: video, streamURL: loopbackStreamURL)
             return nil
         } catch is CancellationError {
             return nil

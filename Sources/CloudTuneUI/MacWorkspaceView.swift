@@ -10,6 +10,26 @@ extension Notification.Name {
     public static let cloudTuneFocusSearch = Notification.Name("com.gosu.cloudtune.focusSearch")
 }
 
+public enum MacShortcutFocusGuard {
+    @MainActor
+    public static func shouldAllowSingleKeyPlaybackShortcut(in window: NSWindow?) -> Bool {
+        guard let responder = window?.firstResponder else {
+            return true
+        }
+        if responder is NSText {
+            return false
+        }
+        var currentView = responder as? NSView
+        while let view = currentView {
+            if NSStringFromClass(type(of: view)).contains("WKWebView") {
+                return false
+            }
+            currentView = view.superview
+        }
+        return true
+    }
+}
+
 private extension TrackSummary {
     var modifiedSortKey: String {
         modifiedAt ?? ""
@@ -24,6 +44,7 @@ public struct MacWorkspaceView: View {
     @State private var sortOrder: [KeyPathComparator<TrackSummary>] = [
         .init(\.name, order: .forward)
     ]
+    @State private var scrubPreviewSeconds: Double?
     @FocusState private var isSearchFocused: Bool
 
     public init(viewModel: CloudTuneViewModel) {
@@ -63,6 +84,7 @@ public struct MacWorkspaceView: View {
                     Color.black.opacity(isDark ? 0.48 : 0.22)
                         .ignoresSafeArea()
                         .onTapGesture {
+                            guard !viewModel.hasUnsavedSettingsDrafts else { return }
                             viewModel.isShowingSettingsSheet = false
                         }
                     MacPreferencesView(
@@ -85,8 +107,14 @@ public struct MacWorkspaceView: View {
         .preferredColorScheme(viewModel.appearancePreference.preferredColorScheme)
         .onReceive(NotificationCenter.default.publisher(for: .cloudTuneFocusSearch)) { _ in
             if viewModel.isAuthenticated {
+                let needsModuleSwitch = viewModel.activeModule != .music
                 viewModel.activeModule = .music
                 isSearchFocused = true
+                if needsModuleSwitch {
+                    Task { @MainActor in
+                        isSearchFocused = true
+                    }
+                }
             }
         }
         .sheet(isPresented: $viewModel.isShowingWebLoginSheet) {
@@ -133,8 +161,10 @@ public struct MacWorkspaceView: View {
                 },
                 onOpenStreamInInstalledPlayer: { appURL in
                     viewModel.pendingExternalVideoChoice = nil
-                    let config = NSWorkspace.OpenConfiguration()
-                    NSWorkspace.shared.open([choice.streamURL], withApplicationAt: appURL, configuration: config)
+                    if let streamURL = choice.streamURL, streamURL.host == "127.0.0.1" {
+                        let config = NSWorkspace.OpenConfiguration()
+                        NSWorkspace.shared.open([streamURL], withApplicationAt: appURL, configuration: config)
+                    }
                 },
                 onCancel: {
                     viewModel.pendingExternalVideoChoice = nil
@@ -272,7 +302,6 @@ public struct MacWorkspaceView: View {
                 }
                 .background(palette.canvasBackground)
             }
-            .searchable(text: $viewModel.searchQuery, placement: .toolbar, prompt: "搜索曲目或目录")
 
             Divider().overlay(palette.separator)
 
@@ -1206,7 +1235,7 @@ public struct MacWorkspaceView: View {
                 }
 
                 HStack(spacing: 8) {
-                    Text(CloudTuneFormatters.formatClock(viewModel.currentTime))
+                    Text(CloudTuneFormatters.formatClock(scrubPreviewSeconds ?? viewModel.currentTime))
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
                         .foregroundStyle(palette.inkTertiary)
                         .frame(width: 40, alignment: .trailing)
@@ -1214,10 +1243,14 @@ public struct MacWorkspaceView: View {
                     InteractiveScrubSlider(
                         value: viewModel.currentTime,
                         total: viewModel.duration,
-                        palette: palette
-                    ) { targetSeconds in
-                        Task { await viewModel.seekPlayback(to: targetSeconds) }
-                    }
+                        palette: palette,
+                        onPreviewChange: { preview in
+                            scrubPreviewSeconds = preview
+                        },
+                        onSeek: { targetSeconds in
+                            Task { await viewModel.seekPlayback(to: targetSeconds) }
+                        }
+                    )
 
                     Text(CloudTuneFormatters.formatClock(viewModel.duration))
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
@@ -1502,7 +1535,10 @@ public struct MacPreferencesView: View {
                 Spacer()
                 if viewModel.isAuthenticated {
                     SecondaryActionButton("退出登录", systemImage: "rectangle.portrait.and.arrow.right", palette: palette) {
-                        Task { await viewModel.logout() }
+                        Task {
+                            await viewModel.logout()
+                            onClose?()
+                        }
                     }
                 }
             }
@@ -1624,7 +1660,7 @@ struct MacExternalVideoChoiceSheet: View {
 
             PrimaryActionButton("先缓存到本地再打开（推荐）", systemImage: "arrow.down.circle.fill", palette: palette, action: onDownloadThenOpen)
 
-            if !installedVideoPlayers.isEmpty {
+            if choice.streamURL?.host == "127.0.0.1" && !installedVideoPlayers.isEmpty {
                 Divider().overlay(palette.separator)
                 Text("直接用已安装播放器串流：")
                     .font(.system(size: 12, weight: .semibold))

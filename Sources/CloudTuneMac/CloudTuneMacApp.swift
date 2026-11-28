@@ -15,7 +15,7 @@ struct CloudTuneMacMain {
 }
 
 @MainActor
-final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     private let viewModel = CloudTuneViewModel()
     private var mainWindow: NSWindow?
     private var preferencesWindow: NSWindow?
@@ -125,6 +125,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let window = NSWindow(contentViewController: hosting)
         window.identifier = NSUserInterfaceItemIdentifier("cloudtune.main")
         window.title = "CloudTune"
+        window.titleVisibility = .hidden
         window.toolbarStyle = .unified
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window.setContentSize(NSSize(width: 1460, height: 930))
@@ -263,6 +264,30 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         NSApp.mainMenu = mainMenu
     }
 
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(handleDockTogglePlay):
+            guard viewModel.isAuthenticated else { return false }
+            if menuItem.keyEquivalent == " " {
+                return MacShortcutFocusGuard.shouldAllowSingleKeyPlaybackShortcut(in: NSApp.keyWindow)
+            }
+            return true
+        case #selector(handleDockPrev):
+            return viewModel.isAuthenticated && viewModel.canSkipPrevious
+        case #selector(handleDockNext):
+            return viewModel.isAuthenticated && viewModel.canSkipNext
+        case #selector(handleVolumeUp),
+             #selector(handleVolumeDown),
+             #selector(handleDockToggleShuffle),
+             #selector(handleMenuFocusSearch),
+             #selector(handleSwitchModule(_:)),
+             #selector(handleToggleQueueInspector):
+            return viewModel.isAuthenticated
+        default:
+            return true
+        }
+    }
+
     @objc private func handleMenuShowWindow() {
         showOrCreateMainWindow()
     }
@@ -364,6 +389,7 @@ final class MenuBarController: NSObject {
     private let onShowMainWindow: () -> Void
     private let onShowPreferences: () -> Void
     private let onQuitApp: () -> Void
+    private var savedUnmutedVolume: Double = 0.85
 
     init(
         viewModel: CloudTuneViewModel,
@@ -442,6 +468,47 @@ final class MenuBarController: NSObject {
         shuffleItem.isEnabled = viewModel.isAuthenticated
         menu.addItem(shuffleItem)
 
+        let loopMenuItem = NSMenuItem(title: "循环模式", action: nil, keyEquivalent: "")
+        loopMenuItem.isEnabled = viewModel.isAuthenticated
+        let loopSubmenu = NSMenu(title: "循环模式")
+        loopSubmenu.autoenablesItems = false
+        for (idx, entry) in [(LoopMode.off, "不循环"), (.all, "列表循环"), (.one, "单曲循环")].enumerated() {
+            let item = NSMenuItem(title: entry.1, action: #selector(menuSelectLoopMode(_:)), keyEquivalent: "")
+            item.tag = idx
+            item.target = self
+            item.state = (viewModel.loopMode == entry.0) ? .on : .off
+            item.isEnabled = viewModel.isAuthenticated
+            loopSubmenu.addItem(item)
+        }
+        loopMenuItem.submenu = loopSubmenu
+        menu.addItem(loopMenuItem)
+
+        menu.addItem(.separator())
+
+        let volumePct = Int((viewModel.volume * 100).rounded())
+        let volumeHeader = NSMenuItem(title: "音量：\(volumePct)%", action: nil, keyEquivalent: "")
+        volumeHeader.isEnabled = false
+        menu.addItem(volumeHeader)
+
+        let volUpItem = NSMenuItem(title: "增大音量", action: #selector(menuVolumeUp), keyEquivalent: "")
+        volUpItem.target = self
+        volUpItem.isEnabled = viewModel.valueCanIncreaseVolume
+        menu.addItem(volUpItem)
+
+        let volDownItem = NSMenuItem(title: "减小音量", action: #selector(menuVolumeDown), keyEquivalent: "")
+        volDownItem.target = self
+        volDownItem.isEnabled = viewModel.valueCanDecreaseVolume
+        menu.addItem(volDownItem)
+
+        let muteItem = NSMenuItem(
+            title: viewModel.volume <= 0.005 ? "取消静音" : "静音",
+            action: #selector(menuToggleMute),
+            keyEquivalent: ""
+        )
+        muteItem.target = self
+        muteItem.state = viewModel.volume <= 0.005 ? .on : .off
+        menu.addItem(muteItem)
+
         menu.addItem(.separator())
 
         let prefsItem = NSMenuItem(title: "偏好设置…", action: #selector(menuShowPrefs), keyEquivalent: ",")
@@ -473,6 +540,29 @@ final class MenuBarController: NSObject {
 
     @objc private func menuToggleShuffle() {
         viewModel.toggleShuffle()
+    }
+
+    @objc private func menuSelectLoopMode(_ sender: NSMenuItem) {
+        let modes: [LoopMode] = [.off, .all, .one]
+        guard modes.indices.contains(sender.tag) else { return }
+        viewModel.loopMode = modes[sender.tag]
+    }
+
+    @objc private func menuVolumeUp() {
+        viewModel.setVolume(viewModel.volume + 0.10)
+    }
+
+    @objc private func menuVolumeDown() {
+        viewModel.setVolume(viewModel.volume - 0.10)
+    }
+
+    @objc private func menuToggleMute() {
+        if viewModel.volume <= 0.005 {
+            viewModel.setVolume(max(0.15, savedUnmutedVolume))
+        } else {
+            savedUnmutedVolume = viewModel.volume
+            viewModel.setVolume(0.0)
+        }
     }
 
     @objc private func menuShowPrefs() {
@@ -517,4 +607,9 @@ final class StatusBarTriggerView: NSView {
         )
         img.draw(in: NSRect(origin: origin, size: size))
     }
+}
+
+private extension CloudTuneViewModel {
+    var valueCanIncreaseVolume: Bool { volume < 0.999 }
+    var valueCanDecreaseVolume: Bool { volume > 0.001 }
 }

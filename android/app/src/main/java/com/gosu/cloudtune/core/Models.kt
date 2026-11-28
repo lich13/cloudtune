@@ -202,7 +202,21 @@ data class TransferStatus(
     val bytesPerSecond: Long = 0L,
     val transferredBytes: Long = 0L,
     val totalBytes: Long? = null
-)
+) {
+    val localizedStateLabel: String
+        get() = when {
+            state == "running" -> "传输中"
+            state == "streaming" -> "串流中"
+            state == "paused" -> "已暂停"
+            state == "completed" -> "已完成"
+            state == "failed" -> "失败"
+            state.startsWith("failed:") -> {
+                val reason = state.removePrefix("failed:").trim()
+                if (reason.isEmpty()) "失败" else "失败：$reason"
+            }
+            else -> state
+        }
+}
 
 data class TransferSnapshotPayload(
     val totalSpeedBytesPerSecond: Long = 0L,

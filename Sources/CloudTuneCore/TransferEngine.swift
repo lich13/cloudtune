@@ -257,6 +257,9 @@ public actor TransferEngine {
             return existing
         }
         let destination = await cacheStore.cacheFileURL(trackId: track.id, originalFileName: track.name)
+        if let existingAfterAwait = await cacheStore.existingCachedFile(trackId: track.id) {
+            return existingAfterAwait
+        }
         let cacheKey = destination.standardizedFileURL.path
         let waiterID = UUID()
 
@@ -275,10 +278,6 @@ public actor TransferEngine {
                     await self.detachCacheDownloadWaiter(cacheKey: cacheKey, waiterID: waiterID)
                 }
             }
-        }
-
-        if let existingAfterAwait = await cacheStore.existingCachedFile(trackId: track.id) {
-            return existingAfterAwait
         }
 
         let workerID = UUID()

@@ -557,6 +557,12 @@ public struct TransferRowCardView: View {
 
     public var body: some View {
         let pct = CloudTuneFormatters.formatPercent(transferred: item.transferredBytes, total: item.totalBytes)
+        let stateSummary: String = {
+            if let path = item.path, !path.isEmpty {
+                return "\(item.localizedStateLabel) · \(path)"
+            }
+            return item.localizedStateLabel
+        }()
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
@@ -565,10 +571,11 @@ public struct TransferRowCardView: View {
                         .foregroundStyle(palette.inkPrimary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(item.state)
+                    Text(stateSummary)
                         .font(.system(size: 12))
                         .foregroundStyle(palette.inkTertiary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                     if let pct {
                         progressBar(pct: pct)
                     }
@@ -609,10 +616,11 @@ public struct TransferRowCardView: View {
                     progressBar(pct: pct)
                 }
                 HStack(spacing: 8) {
-                    Text(pct != nil ? "\(item.state) · \(String(format: "%.1f%%", pct!))" : item.state)
+                    Text(pct != nil ? "\(stateSummary) · \(String(format: "%.1f%%", pct!))" : stateSummary)
                         .font(.system(size: 12, weight: .medium).monospacedDigit())
                         .foregroundStyle(palette.inkSecondary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer(minLength: 4)
                     HStack(spacing: 6) {
                         actionButtons

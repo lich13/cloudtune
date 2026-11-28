@@ -913,11 +913,32 @@ class Cloud189ProtocolAndProxyTest {
             runtime.cacheLimitDraft = "4096"
             val ok = runtime.commitCacheLimitDraft()
             assertFalse("Write failure must return false", ok)
+            assertFalse("Async write failure on Dispatchers.IO must also return false", runtime.commitCacheLimitDraftAsync())
             assertEquals(prevLimit, runtime.committedSettings.cacheLimitMb)
             assertEquals("4096", runtime.cacheLimitDraft)
             assertTrue(runtime.statusMessage?.contains("保存设置失败") == true)
+            assertEquals("传输中", TransferStatus("d1", "a.flac", "download", "running").localizedStateLabel)
+            assertEquals("已暂停", TransferStatus("d2", "a.flac", "download", "paused").localizedStateLabel)
 
+            // 5) No-proxy external video never leaks raw https:// URL, and logout resets UI dialog/module state
+            val noProxyRuntime = CloudTuneAppRuntime(
+                appContext = null,
+                cloudClient = Cloud189Client(transport),
+                accountStore = store,
+                credentialStore = memCredStore,
+                limiter = GlobalTransferLimiter(8),
+                enableLiveLoops = false,
+                ioDispatcher = kotlinx.coroutines.Dispatchers.IO
+            )
+            noProxyRuntime.bootstrap().await()
+            noProxyRuntime.cacheLimitDraft = "8192"
+            assertFalse("Dispatchers.IO write failure must return false", noProxyRuntime.commitCacheLimitDraftAsync())
+
+            runtime.activeModule = ModuleTab.SETTINGS
+            runtime.isShowingWebLoginDialog = true
             runtime.logout()
+            assertEquals(ModuleTab.MUSIC, runtime.activeModule)
+            assertFalse(runtime.isShowingWebLoginDialog)
             runtime.streamServer?.close()
             Unit
         } finally {

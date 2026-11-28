@@ -384,6 +384,27 @@ public struct TransferStatus: Codable, Equatable, Identifiable, Sendable {
         self.transferredBytes = try c.decodeIfPresent(UInt64.self, forKey: .transferredBytes) ?? 0
         self.totalBytes = try c.decodeIfPresent(UInt64.self, forKey: .totalBytes)
     }
+
+    public var localizedStateLabel: String {
+        switch state {
+        case "running":
+            return "传输中"
+        case "streaming":
+            return "串流中"
+        case "paused":
+            return "已暂停"
+        case "completed":
+            return "已完成"
+        case "failed":
+            return "失败"
+        default:
+            if state.hasPrefix("failed:") {
+                let reason = state.dropFirst("failed:".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                return reason.isEmpty ? "失败" : "失败：\(reason)"
+            }
+            return state
+        }
+    }
 }
 
 public struct TransferSnapshotPayload: Codable, Equatable, Sendable {

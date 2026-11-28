@@ -2,6 +2,10 @@ import CloudTuneCore
 import CloudTuneUI
 import Foundation
 import Testing
+#if os(macOS)
+import AppKit
+import WebKit
+#endif
 
 private func repoRootURL() -> URL {
     URL(fileURLWithPath: #filePath)
@@ -307,11 +311,38 @@ struct CloudTuneUITests {
         #expect(directURL == nil)
         let choice = try #require(vm.pendingExternalVideoChoice)
         #expect(choice.video.id == "vid-live-1")
-        #expect(choice.streamURL.host == "127.0.0.1")
+        #expect(choice.streamURL?.host == "127.0.0.1")
 
-        // 3) Logout tears down observers; re-login re-registers idempotently
+        // 2b) When streamServer is unavailable (enableLiveObservers: false), external video choice MUST NOT leak raw https:// URL
+        let freshStore = try AccountScopedStore(rootDirectory: root.appendingPathComponent("fresh-acct"))
+        let noProxyVM = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: FolderMockTransport()),
+            accountStore: freshStore,
+            userDefaults: isolatedDefaults,
+            enableLiveObservers: false
+        )
+        noProxyVM.appearancePreference = .dark
+        await noProxyVM.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=noproxy")!,
+            cookies: []
+        )
+        // Fresh account without settings.json preserves pre-login appearancePreference (.dark)
+        #expect(noProxyVM.appearancePreference == .dark)
+        #expect(noProxyVM.committedSettings.appearanceMode == .dark)
+        let noProxyDirect = await noProxyVM.requestExternalVideoPlayback(concertVideo)
+        #expect(noProxyDirect == nil)
+        let noProxyChoice = try #require(noProxyVM.pendingExternalVideoChoice)
+        #expect(noProxyChoice.streamURL == nil)
+
+        // 3) Logout tears down observers, closes sheets/modals, resets module, and re-login re-registers idempotently
+        vm.isShowingSettingsSheet = true
+        vm.isShowingWebLoginSheet = true
+        vm.activeModule = .settings
         await vm.logout()
         #expect(vm.hasActivePlayerObservers == false)
+        #expect(vm.isShowingSettingsSheet == false)
+        #expect(vm.isShowingWebLoginSheet == false)
+        #expect(vm.activeModule == .music)
         await vm.completeEmbeddedWebLogin(
             callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=ok2")!,
             cookies: []
@@ -329,7 +360,32 @@ struct CloudTuneUITests {
         #expect(saved == false)
         #expect(vm.committedSettings.cacheLimitMb == 1024)
         #expect(vm.cacheLimitDraft == "4096")
+        #expect(vm.hasUnsavedSettingsDrafts == true)
         #expect(vm.statusMessage?.contains("保存设置失败") == true)
+        #expect(TransferStatus(id: "d1", label: "a.flac", kind: "download", state: "running").localizedStateLabel == "传输中")
+        #expect(TransferStatus(id: "d2", label: "a.flac", kind: "download", state: "paused").localizedStateLabel == "已暂停")
+
+        #if os(macOS)
+        // 5) MacShortcutFocusGuard blocks Spacebar playback shortcut when NSTextField or WKWebView is first responder
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+        let textField = NSTextField(frame: NSRect(x: 10, y: 10, width: 200, height: 24))
+        let webView = WKWebView(frame: NSRect(x: 10, y: 50, width: 200, height: 100))
+        container.addSubview(textField)
+        container.addSubview(webView)
+        win.contentView = container
+        _ = win.makeFirstResponder(nil)
+        #expect(MacShortcutFocusGuard.shouldAllowSingleKeyPlaybackShortcut(in: win) == true)
+        _ = win.makeFirstResponder(textField)
+        #expect(MacShortcutFocusGuard.shouldAllowSingleKeyPlaybackShortcut(in: win) == false)
+        _ = win.makeFirstResponder(webView)
+        #expect(MacShortcutFocusGuard.shouldAllowSingleKeyPlaybackShortcut(in: win) == false)
+        #endif
     }
 
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")

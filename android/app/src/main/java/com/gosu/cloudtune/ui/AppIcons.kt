@@ -112,8 +112,6 @@ object AppIcons {
         }.build()
     }
 
-    val Download: ImageVector get() = Transfers
-
     val Settings: ImageVector by lazy {
         ImageVector.Builder("Settings", 24.dp, 24.dp, 24f, 24f).apply {
             path(

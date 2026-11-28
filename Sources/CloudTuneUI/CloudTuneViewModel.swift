@@ -1498,10 +1498,6 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func prepareVideoForExternalApp(_ video: TrackSummary) async -> URL? {
-        await requestExternalVideoPlayback(video)
-    }
-
     public func enqueueTrackDownload(_ track: TrackSummary, explicitDirectoryURL: URL? = nil) async {
         guard let accountId = activeAccountKey else { return }
         do {

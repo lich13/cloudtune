@@ -7,45 +7,6 @@ import AppKit
 import UIKit
 #endif
 
-public struct CloudTuneBackground: View {
-    public let palette: CloudTunePalette
-
-    public init(palette: CloudTunePalette) {
-        self.palette = palette
-    }
-
-    public var body: some View {
-        palette.canvasBackground
-            .ignoresSafeArea()
-    }
-}
-
-public struct GlassCard<Content: View>: View {
-    public let palette: CloudTunePalette
-    public let padding: CGFloat
-    @ViewBuilder public let content: () -> Content
-
-    public init(palette: CloudTunePalette, padding: CGFloat = 15, @ViewBuilder content: @escaping () -> Content) {
-        self.palette = palette
-        self.padding = padding
-        self.content = content
-    }
-
-    public var body: some View {
-        content()
-            .padding(padding)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(palette.surfacePrimary)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(palette.cardBorder, lineWidth: 1)
-            )
-    }
-}
-
 public struct SubtleStatusBanner: View {
     public let message: String
     public let isError: Bool
@@ -467,101 +428,6 @@ public struct ToggleChipButton: View {
     }
 }
 
-public struct MetricTile: View {
-    public let label: String
-    public let value: String
-    public let isMonospacedDigits: Bool
-    public let palette: CloudTunePalette
-
-    public init(label: String, value: String, isMonospacedDigits: Bool = true, palette: CloudTunePalette) {
-        self.label = label
-        self.value = value
-        self.isMonospacedDigits = isMonospacedDigits
-        self.palette = palette
-    }
-
-    public var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(palette.inkTertiary)
-                .lineLimit(1)
-            Text(value)
-                .font(isMonospacedDigits ? .system(size: 14, weight: .bold).monospacedDigit() : .system(size: 14, weight: .bold))
-                .foregroundStyle(palette.inkPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .frame(minWidth: 96, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(palette.cardStrong)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(palette.accentBorder, lineWidth: 1)
-        )
-    }
-}
-
-public struct WarmProgressSlider: View {
-    public let value: Double
-    public let total: Double
-    public let palette: CloudTunePalette
-    public let onSeek: (Double) -> Void
-
-    public init(value: Double, total: Double, palette: CloudTunePalette, onSeek: @escaping (Double) -> Void) {
-        self.value = value
-        self.total = total
-        self.palette = palette
-        self.onSeek = onSeek
-    }
-
-    private var ratio: CGFloat {
-        guard total > 0, value.isFinite, total.isFinite else { return 0 }
-        return CGFloat(min(1.0, max(0.0, value / total)))
-    }
-
-    public var body: some View {
-        GeometryReader { geo in
-            let width = max(1, geo.size.width)
-            let fillWidth = width * ratio
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(palette.inkPrimary.opacity(0.10))
-                    .frame(height: 6)
-                Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: [palette.onlineStart, palette.warmGold],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(width: max(6, fillWidth), height: 6)
-                Circle()
-                    .fill(palette.warmGold)
-                    .frame(width: 14, height: 14)
-                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
-                    .offset(x: min(max(0, fillWidth - 7), max(0, width - 14)))
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onEnded { gesture in
-                        guard total > 0 else { return }
-                        let pct = min(1.0, max(0.0, Double(gesture.location.x / width)))
-                        onSeek(pct * total)
-                    }
-            )
-        }
-        .frame(height: 18)
-    }
-}
-
 public struct TrackRowButton: View {
     public let track: TrackSummary
     public let isActive: Bool
@@ -588,7 +454,7 @@ public struct TrackRowButton: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(track.name)
-                        .font(.system(size: 14, weight: .bold))
+                        .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(palette.inkPrimary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -606,7 +472,7 @@ public struct TrackRowButton: View {
                         .foregroundStyle(palette.inkTertiary)
                     Text(actionLabel)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(isActive ? palette.onlineEnd : palette.inkSecondary)
+                        .foregroundStyle(isActive ? palette.accent : palette.inkSecondary)
                 }
             }
             .padding(.horizontal, 13)
@@ -617,7 +483,7 @@ public struct TrackRowButton: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .strokeBorder(isActive ? palette.rowActiveBorder : Color.clear, lineWidth: 1)
+                    .strokeBorder(isActive ? palette.rowActiveBorder : palette.cardBorder, lineWidth: 1)
             )
             .contentShape(Rectangle())
         }
@@ -641,7 +507,7 @@ public struct FolderRowButton: View {
             HStack(spacing: 8) {
                 Image(systemName: "folder.fill")
                     .font(.system(size: 13))
-                    .foregroundStyle(palette.warmGold)
+                    .foregroundStyle(palette.accent)
                 Text(folder.name)
                     .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(palette.inkPrimary)
@@ -657,6 +523,10 @@ public struct FolderRowButton: View {
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(palette.rowSurface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(palette.cardBorder, lineWidth: 1)
             )
             .contentShape(Rectangle())
         }
@@ -757,6 +627,10 @@ public struct TransferRowCardView: View {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .fill(palette.rowSurface)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(palette.cardBorder, lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -765,7 +639,7 @@ public struct TransferRowCardView: View {
             ZStack(alignment: .leading) {
                 Capsule().fill(palette.inkPrimary.opacity(0.09))
                 Capsule()
-                    .fill(LinearGradient(colors: [palette.onlineStart, palette.warmGold], startPoint: .leading, endPoint: .trailing))
+                    .fill(palette.accent)
                     .frame(width: max(4, geo.size.width * CGFloat(pct / 100.0)))
             }
         }
@@ -831,11 +705,11 @@ public struct QrCodeArtworkView: View {
             .frame(maxWidth: 320)
             .background(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(palette.cardStrong)
+                    .fill(palette.surfaceElevated)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(palette.accentBorder, lineWidth: 1)
+                    .strokeBorder(palette.cardBorder, lineWidth: 1)
             )
         } else {
             VStack(spacing: 12) {
@@ -855,11 +729,11 @@ public struct QrCodeArtworkView: View {
             .frame(maxWidth: 320)
             .background(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(palette.cardStrong.opacity(0.85))
+                    .fill(palette.surfaceElevated)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(palette.accentBorder, style: StrokeStyle(lineWidth: 1, dash: [6, 4]))
+                    .strokeBorder(palette.cardBorder, style: StrokeStyle(lineWidth: 1, dash: [6, 4]))
             )
         }
     }
@@ -888,6 +762,10 @@ public struct AirPlayRoutePicker: NSViewRepresentable {
     }
 
     public func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+
+    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: AVRoutePickerView, context: Context) -> CGSize? {
+        CGSize(width: 28, height: 28)
+    }
 }
 
 public enum MacMenuEntry {
@@ -936,6 +814,11 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
     public func updateNSView(_ nsView: PopUpTriggerNSView, context: Context) {
         context.coordinator.entries = entries
         nsView.configure(title: title, systemImage: systemImage, accessibilityTitle: accessibilityTitle)
+    }
+
+    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: PopUpTriggerNSView, context: Context) -> CGSize? {
+        let intrinsic = nsView.intrinsicContentSize
+        return CGSize(width: intrinsic.width, height: intrinsic.height)
     }
 
     @MainActor
@@ -1039,9 +922,11 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
                 NSColor.labelColor.withAlphaComponent(0.08).setFill()
                 path.fill()
             }
-            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            let tint = (titleText?.isEmpty == false) ? NSColor.labelColor : NSColor.secondaryLabelColor
+            let cfg = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
             let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
-            symbol?.isTemplate = true
+            symbol?.isTemplate = false
 
             if let titleText, !titleText.isEmpty {
                 let attrs: [NSAttributedString.Key: Any] = [

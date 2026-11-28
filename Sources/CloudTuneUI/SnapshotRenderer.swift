@@ -110,6 +110,8 @@ public enum SnapshotRenderer {
         window.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
         window.contentView = hosting
         hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        hosting.layoutSubtreeIfNeeded()
 
         guard let rep = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
             throw CloudTuneError.storageError("无法创建 macOS 离屏位图")

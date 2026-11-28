@@ -357,6 +357,8 @@ struct CloudTuneUITests {
         try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("light"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: outRoot.appendingPathComponent("dark"), withIntermediateDirectories: true)
 
+        #expect(SnapshotScene.allCases.count == 9)
+
         for scene in SnapshotScene.allCases {
             let lightPNG = try SnapshotRenderer.renderMacScenePNG(scene: scene, fixture: fixture, isDark: false)
             let darkPNG = try SnapshotRenderer.renderMacScenePNG(scene: scene, fixture: fixture, isDark: true)

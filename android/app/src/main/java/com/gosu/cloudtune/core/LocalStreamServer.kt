@@ -97,7 +97,6 @@ class HttpUrlConnectionStreamOpener : UpstreamStreamOpener {
 class LocalStreamServer(
     private val limiter: GlobalTransferLimiter,
     private val opener: UpstreamStreamOpener = HttpUrlConnectionStreamOpener(),
-    private val onStreamStatusUpdate: ((String, TransferStatus?) -> Unit)? = null,
     private val onAccountStreamStatusUpdate: ((String, String, TransferStatus?) -> Unit)? = null,
     private val onWriteThroughCompleted: ((String, String, File) -> Unit)? = null,
     private val urlRefresher: (suspend (String) -> String)? = null
@@ -232,11 +231,7 @@ class LocalStreamServer(
     }
 
     private fun publishStatus(id: String, accountHash: String, status: TransferStatus?) {
-        if (onAccountStreamStatusUpdate != null) {
-            onAccountStreamStatusUpdate.invoke(id, accountHash, status)
-        } else {
-            onStreamStatusUpdate?.invoke(id, status)
-        }
+        onAccountStreamStatusUpdate?.invoke(id, accountHash, status)
     }
 
     private suspend fun handleClient(socket: Socket, clientJob: Job?) {
@@ -336,7 +331,7 @@ class LocalStreamServer(
                         val reqEnd = requestedRange?.end
                         val isTinyProbe = (reqStart == 0L && (reqEnd ?: Long.MAX_VALUE) <= 1L)
                         val streamTaskId = "stream:${source.trackId}"
-                        val hasStatusCallback = onAccountStreamStatusUpdate != null || onStreamStatusUpdate != null
+                        val hasStatusCallback = onAccountStreamStatusUpdate != null
                         var didPublishStreamStatus = false
                         var delivered = 0L
                         var completedCleanly = false

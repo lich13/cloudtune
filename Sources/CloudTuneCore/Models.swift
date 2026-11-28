@@ -47,8 +47,6 @@ public enum ModuleTab: String, Codable, CaseIterable, Identifiable, Sendable {
     case transfers
     case settings
 
-    public static let download: ModuleTab = .transfers
-
     public var id: String { rawValue }
 
     public var title: String {
@@ -330,28 +328,6 @@ public struct AccountSettings: Codable, Equatable, Sendable {
         self.exportFolderDisplayName = try c.decodeIfPresent(String.self, forKey: .exportFolderDisplayName)
         self.appearanceMode = (try? c.decodeIfPresent(AppearanceMode.self, forKey: .appearanceMode)) ?? .system
         self.dynamicColorEnabled = try c.decodeIfPresent(Bool.self, forKey: .dynamicColorEnabled) ?? false
-    }
-}
-
-public struct PreparedTrack: Equatable, Sendable {
-    public let trackId: String
-    public let localURL: URL
-    public let playbackURL: URL
-    public let isStreaming: Bool
-    public let cacheUsageBytes: UInt64
-
-    public init(
-        trackId: String,
-        localURL: URL,
-        playbackURL: URL,
-        isStreaming: Bool,
-        cacheUsageBytes: UInt64
-    ) {
-        self.trackId = trackId
-        self.localURL = localURL
-        self.playbackURL = playbackURL
-        self.isStreaming = isStreaming
-        self.cacheUsageBytes = cacheUsageBytes
     }
 }
 

@@ -1,8 +1,6 @@
 import CloudTuneCore
 import SwiftUI
 
-public typealias AppAppearancePreference = AppearanceMode
-
 extension AppearanceMode {
     public var preferredColorScheme: ColorScheme? {
         switch self {
@@ -22,12 +20,6 @@ public struct CloudTunePalette: Sendable {
     public let surfacePrimary: Color
     public let surfaceSecondary: Color
     public let surfaceElevated: Color
-    public let bgTop: Color
-    public let bgBottom: Color
-    public let warmGlow: Color
-    public let pineGlow: Color
-    public let cardSurface: Color
-    public let cardStrong: Color
     public let rowSurface: Color
     public let rowHoverSurface: Color
     public let rowActiveSurface: Color
@@ -44,13 +36,8 @@ public struct CloudTunePalette: Sendable {
     public let primaryStart: Color
     public let primaryEnd: Color
     public let primaryForeground: Color
-    public let onlineStart: Color
-    public let onlineEnd: Color
-    public let warmGold: Color
     public let destructive: Color
     public let noticeBackground: Color
-    public let busyBackground: Color
-    public let busyForeground: Color
     // Fixed across light and dark modes so QR scanners always read dark-on-light reliably
     public let qrSubstrate: Color
     public let qrForeground: Color
@@ -73,12 +60,6 @@ public struct CloudTunePalette: Sendable {
             self.surfacePrimary = surface
             self.surfaceSecondary = secondary
             self.surfaceElevated = elevated
-            self.bgTop = canvas
-            self.bgBottom = canvas
-            self.warmGlow = .clear
-            self.pineGlow = .clear
-            self.cardSurface = surface
-            self.cardStrong = elevated
             self.rowSurface = surface
             self.rowHoverSurface = Color.white.opacity(0.04)
             self.rowActiveSurface = pine.opacity(0.18)
@@ -95,13 +76,8 @@ public struct CloudTunePalette: Sendable {
             self.primaryStart = Color(red: 0x2D / 255.0, green: 0x7A / 255.0, blue: 0x64 / 255.0)
             self.primaryEnd = Color(red: 0x3A / 255.0, green: 0x8D / 255.0, blue: 0x75 / 255.0)
             self.primaryForeground = Color(red: 0xF8 / 255.0, green: 0xFA / 255.0, blue: 0xF9 / 255.0)
-            self.onlineStart = self.primaryStart
-            self.onlineEnd = pine
-            self.warmGold = pine
             self.destructive = Color(red: 0xE5 / 255.0, green: 0x6B / 255.0, blue: 0x6F / 255.0)
             self.noticeBackground = pine.opacity(0.14)
-            self.busyBackground = secondary
-            self.busyForeground = self.inkSecondary
         } else {
             // Pure neutral #F7F8FA / #FFFFFF + low-saturation pine-teal #2A6F5B
             let canvas = Color(red: 0xF7 / 255.0, green: 0xF8 / 255.0, blue: 0xFA / 255.0)
@@ -114,12 +90,6 @@ public struct CloudTunePalette: Sendable {
             self.surfacePrimary = surface
             self.surfaceSecondary = secondary
             self.surfaceElevated = surface
-            self.bgTop = canvas
-            self.bgBottom = canvas
-            self.warmGlow = .clear
-            self.pineGlow = .clear
-            self.cardSurface = surface
-            self.cardStrong = surface
             self.rowSurface = surface
             self.rowHoverSurface = Color.black.opacity(0.03)
             self.rowActiveSurface = pine.opacity(0.10)
@@ -136,22 +106,13 @@ public struct CloudTunePalette: Sendable {
             self.primaryStart = pine
             self.primaryEnd = Color(red: 0x33 / 255.0, green: 0x80 / 255.0, blue: 0x69 / 255.0)
             self.primaryForeground = Color.white
-            self.onlineStart = pine
-            self.onlineEnd = Color(red: 0x33 / 255.0, green: 0x80 / 255.0, blue: 0x69 / 255.0)
-            self.warmGold = pine
             self.destructive = Color(red: 0xC9 / 255.0, green: 0x3B / 255.0, blue: 0x3B / 255.0)
             self.noticeBackground = pine.opacity(0.08)
-            self.busyBackground = secondary
-            self.busyForeground = self.inkSecondary
         }
     }
 
     public var primaryGradient: LinearGradient {
         LinearGradient(colors: [primaryStart, primaryEnd], startPoint: .topLeading, endPoint: .bottomTrailing)
-    }
-
-    public var onlineGradient: LinearGradient {
-        LinearGradient(colors: [onlineStart, onlineEnd], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 

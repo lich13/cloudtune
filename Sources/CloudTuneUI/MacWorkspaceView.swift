@@ -364,6 +364,7 @@ public struct MacWorkspaceView: View {
                             .font(.system(size: 12.5, weight: .medium))
                         Text("偏好设置…")
                             .font(.system(size: 12.5, weight: .medium))
+                            .lineLimit(1)
                     }
                     .foregroundStyle(palette.inkSecondary)
                     .padding(.horizontal, 10)
@@ -1408,6 +1409,7 @@ public struct MacPreferencesView: View {
                 }
             }
             .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(palette.surfaceSecondary))
 
             VStack(alignment: .leading, spacing: 12) {
@@ -1460,8 +1462,32 @@ public struct MacPreferencesView: View {
                         Task { await viewModel.commitTransferThreadsDraft() }
                     }
                 }
+
+                HStack(spacing: 8) {
+                    Text("本地导出目录")
+                        .font(.system(size: 13))
+                        .foregroundStyle(palette.inkPrimary)
+                        .frame(width: 96, alignment: .leading)
+                    Text(viewModel.committedSettings.exportFolderDisplayName ?? "未授权目录")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(palette.inkSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    SecondaryActionButton("选择目录…", systemImage: "folder.badge.gearshape", palette: palette) {
+                        let panel = NSOpenPanel()
+                        panel.canChooseDirectories = true
+                        panel.canChooseFiles = false
+                        panel.allowsMultipleSelection = false
+                        panel.canCreateDirectories = true
+                        if panel.runModal() == .OK, let dir = panel.url {
+                            Task { await viewModel.saveExportDirectoryBookmark(dir) }
+                        }
+                    }
+                }
             }
             .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(palette.surfaceSecondary))
 
             HStack(spacing: 10) {

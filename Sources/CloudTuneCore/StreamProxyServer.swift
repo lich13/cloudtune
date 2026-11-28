@@ -192,7 +192,6 @@ public actor StreamProxyServer {
     private nonisolated let semaphore: GlobalTransferSemaphore
     private nonisolated let fetcher: UpstreamStreamFetcher
     private nonisolated let urlRefresher: (@Sendable (String) async throws -> URL)?
-    private nonisolated let onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)?
     private nonisolated let onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)?
     private nonisolated let onWriteThroughCompleted: (@Sendable (String, String, URL) async -> Void)?
     private var sourcesByToken: [String: StreamSourceRegistration] = [:]
@@ -202,7 +201,6 @@ public actor StreamProxyServer {
     public init(
         semaphore: GlobalTransferSemaphore,
         fetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
-        onStreamStatusUpdate: (@Sendable (String, TransferStatus?) async -> Void)? = nil,
         onAccountStreamStatusUpdate: (@Sendable (String, String, TransferStatus?) async -> Void)? = nil,
         onWriteThroughCompleted: (@Sendable (String, String, URL) async -> Void)? = nil,
         urlRefresher: (@Sendable (String) async throws -> URL)? = nil
@@ -245,7 +243,6 @@ public actor StreamProxyServer {
         self.port = UInt16(bigEndian: bound.sin_port)
         self.semaphore = semaphore
         self.fetcher = fetcher
-        self.onStreamStatusUpdate = onStreamStatusUpdate
         self.onAccountStreamStatusUpdate = onAccountStreamStatusUpdate
         self.onWriteThroughCompleted = onWriteThroughCompleted
         self.urlRefresher = urlRefresher
@@ -382,8 +379,6 @@ public actor StreamProxyServer {
     ) async {
         if let onAccountStreamStatusUpdate {
             await onAccountStreamStatusUpdate(id, accountHash, status)
-        } else if let onStreamStatusUpdate {
-            await onStreamStatusUpdate(id, status)
         }
     }
 
@@ -507,7 +502,7 @@ public actor StreamProxyServer {
             let reqEnd = requestedRange?.end
             let isTinyProbe = (reqStart == 0 && (reqEnd ?? UInt64.max) <= 1)
             let streamTaskId = "stream:\(source.trackId)"
-            let hasStatusCallback = (onAccountStreamStatusUpdate != nil) || (onStreamStatusUpdate != nil)
+            let hasStatusCallback = onAccountStreamStatusUpdate != nil
             var didPublishStreamStatus = false
             defer {
                 if didPublishStreamStatus && hasStatusCallback {

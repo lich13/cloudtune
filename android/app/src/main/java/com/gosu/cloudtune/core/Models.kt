@@ -32,8 +32,6 @@ enum class ModuleTab(val wireValue: String, val title: String) {
     SETTINGS("settings", "设置");
 
     companion object {
-        val DOWNLOAD: ModuleTab = TRANSFERS
-
         fun fromWire(raw: String?): ModuleTab {
             val clean = raw?.trim()?.lowercase(Locale.ROOT)
             if (clean == "download") return TRANSFERS
@@ -54,8 +52,6 @@ enum class AppearanceMode(val wireValue: String, val title: String) {
         }
     }
 }
-
-typealias AppThemeMode = AppearanceMode
 
 enum class SnapshotScene(val fileStem: String) {
     AUTH_IDLE("01-auth-idle"),

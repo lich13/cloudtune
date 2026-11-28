@@ -6,6 +6,8 @@ DerivedData/
 dist/
 artifacts/
 *.xcuserdata/
+xcuserdata/
+project.xcworkspace/
 
 # Android & Gradle
 android/.gradle/

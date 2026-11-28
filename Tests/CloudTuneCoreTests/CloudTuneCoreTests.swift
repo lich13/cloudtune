@@ -22,27 +22,6 @@ private struct MockUpstreamFetcher: UpstreamStreamFetcher {
     }
 }
 
-private final class MockKeychainBackend: KeychainBackend, @unchecked Sendable {
-    var nextReadResult: KeychainLoadResult = .notFound
-    var savedCredential: PersistedRefreshCredential?
-    var readCallCount = 0
-
-    func readCredential() -> KeychainLoadResult {
-        readCallCount += 1
-        return nextReadResult
-    }
-
-    func saveCredential(_ credential: PersistedRefreshCredential) throws {
-        savedCredential = credential
-        nextReadResult = .found(credential)
-    }
-
-    func deleteCredential() {
-        savedCredential = nil
-        nextReadResult = .notFound
-    }
-}
-
 private func repoRootURL() -> URL {
     URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
@@ -111,6 +90,34 @@ struct CloudTuneCoreTests {
             let expectedHash = try #require(entry["expectedBucketHash"] as? String)
             #expect(Cloud189Protocol.accountBucketHash(for: raw) == expectedHash)
         }
+
+        // 7) Unified media extension classification & MIME mapping (including AIFF / AIF / DSF / DFF)
+        for losslessName in ["Suite.aiff", "Track.AIF", "Master.dsf", "Studio.DFF", "Aria.flac", "Take.wav", "Album.alac", "Concert.ape"] {
+            #expect(Cloud189Protocol.isAudioFile(losslessName) == true)
+            #expect(Cloud189Protocol.isLosslessAudioFile(losslessName) == true)
+            #expect(Cloud189Protocol.isVideoFile(losslessName) == false)
+            #expect(TrackSummary(id: "x", name: losslessName, folderPath: "M", sizeBytes: 1).isLosslessAudio == true)
+        }
+        for lossyName in ["Song.mp3", "Voice.m4a", "Clip.aac", "Stream.ogg", "Podcast.opus", "Legacy.wma"] {
+            #expect(Cloud189Protocol.isAudioFile(lossyName) == true)
+            #expect(Cloud189Protocol.isLosslessAudioFile(lossyName) == false)
+            #expect(Cloud189Protocol.isVideoFile(lossyName) == false)
+        }
+        for videoName in ["Live.mp4", "Show.mkv", "Stage.mov", "Film.m4v", "Clip.webm", "Old.avi"] {
+            #expect(Cloud189Protocol.isVideoFile(videoName) == true)
+            #expect(Cloud189Protocol.isAudioFile(videoName) == false)
+        }
+        #expect(Cloud189Protocol.guessMimeType(for: "Suite.aiff") == "audio/aiff")
+        #expect(Cloud189Protocol.guessMimeType(for: "Track.AIF") == "audio/aiff")
+        #expect(Cloud189Protocol.guessMimeType(for: "Master.dsf") == "audio/dsf")
+        #expect(Cloud189Protocol.guessMimeType(for: "Studio.DFF") == "audio/dff")
+        #expect(Cloud189Protocol.guessMimeType(for: "Aria.flac") == "audio/flac")
+        #expect(Cloud189Protocol.guessMimeType(for: "Song.mp3") == "audio/mpeg")
+        #expect(Cloud189Protocol.guessMimeType(for: "Album.alac") == "audio/mp4")
+        #expect(Cloud189Protocol.guessMimeType(for: "Live.mp4") == "video/mp4")
+        #expect(Cloud189Protocol.guessMimeType(for: "Show.mkv") == "video/x-matroska")
+        #expect(Cloud189Protocol.guessMimeType(for: "Concert.ape") == "application/octet-stream")
+        #expect(Cloud189Protocol.guessMimeType(for: "Notes.txt") == "application/octet-stream")
     }
 
     @Test("Loopback StreamProxyServer: bytes=0-1 probe never writes cache; full stream writes; non-zero 206 resume succeeds & 200 rejected")
@@ -223,8 +230,13 @@ struct CloudTuneCoreTests {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for _ in 0..<24 {
                 group.addTask {
-                    try await semaphore.withPermit {
+                    try await semaphore.acquire()
+                    do {
                         try await Task.sleep(for: .milliseconds(15))
+                        await semaphore.release()
+                    } catch {
+                        await semaphore.release()
+                        throw error
                     }
                 }
             }
@@ -324,11 +336,11 @@ struct CloudTuneCoreTests {
 
     @Test("Keychain CredentialStateMachine handles DarkWake deferral without false logout or retry loops")
     func verifyKeychainStateMachine() throws {
-        let backend = MockKeychainBackend()
+        let backend = InMemoryKeychainBackend()
         var machine = CredentialStateMachine()
 
         // DarkWake deferred error must NOT mark missing and must suppress non-GUI / cooldown retries
-        backend.nextReadResult = .deferredBySystem(KeychainLoadResult.cssmErrCSPInDarkWake)
+        backend.setNextReadResult(.deferredBySystem(KeychainLoadResult.cssmErrCSPInDarkWake))
         let t0 = Date()
         let first = machine.load(isInteractiveGUI: false, now: t0, backend: backend)
         #expect(first.credential == nil)
@@ -341,9 +353,9 @@ struct CloudTuneCoreTests {
         #expect(suppressed.issue == .deferredBySystem(status: KeychainLoadResult.cssmErrCSPInDarkWake))
         #expect(backend.readCallCount == 1)
 
-        //After cooldown expires and system unlocks, credential loads cleanly
+        // After cooldown expires and system unlocks, credential loads cleanly
         let cred = try #require(PersistedRefreshCredential(refreshToken: "rt_valid", accountName: "alice@example.invalid"))
-        backend.nextReadResult = .found(cred)
+        backend.setNextReadResult(.found(cred))
         let recovered = machine.load(isInteractiveGUI: true, now: t0.addingTimeInterval(4.0), backend: backend)
         #expect(recovered.credential == cred)
         #expect(recovered.issue == nil)
@@ -415,7 +427,7 @@ struct CloudTuneCoreTests {
 
         let savedManifest = StagedDownloadManifest(
             taskId: taskId,
-            accountId: accountId,
+            accountHash: Cloud189Protocol.accountBucketHash(for: accountId),
             trackId: "track-resumable",
             fileName: "ResumableConcert.flac",
             relativeExportSubpath: "ResumableConcert.flac",
@@ -888,7 +900,7 @@ struct CloudTuneCoreTests {
         #expect(migratedCred.refreshToken == "rt_legacy_gosu")
         #expect(migratedCred.accountName == "legacy_user@example.invalid")
 
-        let migratedSettings = try await store.loadSettings(for: "legacy_user@example.invalid")
+        let migratedSettings = try #require(try await store.loadSettingsIfPresent(for: "legacy_user@example.invalid"))
         #expect(migratedSettings.musicFolder == FolderSelection(id: "f-legacy-99", name: "经典无损收藏"))
         #expect(migratedSettings.cacheLimitMb == 4096)
         #expect(migratedSettings.downloadThreads == 12)
@@ -910,7 +922,7 @@ struct CloudTuneCoreTests {
         try Data(legacyLibrary.utf8).write(to: root2.appendingPathComponent("library.json"))
 
         _ = await store2.migrateLegacyTauriDataIfPresent()
-        #expect(try await store2.loadSettings(for: "legacy_user@example.invalid").cacheLimitMb == 8192)
+        #expect(try #require(try await store2.loadSettingsIfPresent(for: "legacy_user@example.invalid")).cacheLimitMb == 8192)
         #expect(try await store2.loadLibrary(for: "legacy_user@example.invalid").first?.id == "new-1")
 
         // Logged-out flat root settings.json MUST NOT shadow portable candidate that holds live refreshToken
@@ -1063,7 +1075,7 @@ struct CloudTuneCoreTests {
             }
             try await group.waitForAll()
         }
-        let merged = try await concurrentStore.loadSettings(for: acctId)
+        let merged = try #require(try await concurrentStore.loadSettingsIfPresent(for: acctId))
         #expect(merged.appearanceMode == .dark)
         #expect(merged.playbackMode == .streamCache)
         #expect(merged.cacheLimitMb == 4096)
@@ -1144,9 +1156,9 @@ struct CloudTuneCoreTests {
             accountHash: "hashA",
             status: TransferStatus(id: "stream:t1", label: "01.flac", kind: "stream", state: "running", bytesPerSecond: 1024)
         )
-        #expect(await engine.hasActiveTransfers() == true)
+        #expect(await engine.snapshot().hasActiveItems == true)
         await engine.updateExternalTransferStatus(id: "stream:t1", accountHash: "hashA", status: nil)
-        #expect(await engine.hasActiveTransfers() == false)
+        #expect(await engine.snapshot().hasActiveItems == false)
         #expect(activityTransitions.withValue { $0 } == [true, false])
     }
 
@@ -1409,7 +1421,7 @@ struct CloudTuneCoreTests {
         )
 
         // 1) Set default export directory to dirA and enqueue task 1 without explicitDirectoryURL
-        _ = try await store.saveExportDirectoryBookmark(dirA, for: accountId)
+        _ = try await store.saveExportDirectoryBookmarkAndSettings(dirA, for: accountId)
         let task1 = try await engine.enqueueExportDownload(
             accountId: accountId,
             track: TrackSummary(id: "t-1", name: "Track1.flac", folderPath: "Music", sizeBytes: UInt64(payload1.count)),
@@ -1424,7 +1436,7 @@ struct CloudTuneCoreTests {
         #expect(persistedManifests.first(where: { $0.taskId == task1 })?.exportBookmarkData != nil)
 
         // 2) Switch default export directory to dirB while task 1 is still in-flight, then enqueue task 2
-        _ = try await store.saveExportDirectoryBookmark(dirB, for: accountId)
+        _ = try await store.saveExportDirectoryBookmarkAndSettings(dirB, for: accountId)
         let task2 = try await engine.enqueueExportDownload(
             accountId: accountId,
             track: TrackSummary(id: "t-2", name: "Track2.flac", folderPath: "Music", sizeBytes: UInt64(payload2.count)),
@@ -1436,7 +1448,7 @@ struct CloudTuneCoreTests {
 
         await gate.releaseAll()
         let deadline = ContinuousClock.now + .seconds(5)
-        while await engine.hasActiveTransfers() && ContinuousClock.now < deadline {
+        while await engine.snapshot().hasActiveItems && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(25))
         }
 

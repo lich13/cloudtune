@@ -14,45 +14,6 @@ private func repoRootURL() -> URL {
         .deletingLastPathComponent()
 }
 
-private final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: PersistedRefreshCredential?
-    private var simulatedSaveError: Error?
-
-    init(_ initial: PersistedRefreshCredential? = nil, simulatedSaveError: Error? = nil) {
-        self.stored = initial
-        self.simulatedSaveError = simulatedSaveError
-    }
-
-    var current: PersistedRefreshCredential? {
-        lock.withLock { stored }
-    }
-
-    func setSaveError(_ error: Error?) {
-        lock.withLock { simulatedSaveError = error }
-    }
-
-    func readCredential() -> KeychainLoadResult {
-        lock.withLock {
-            if let stored { return .found(stored) }
-            return .notFound
-        }
-    }
-
-    func saveCredential(_ credential: PersistedRefreshCredential) throws {
-        try lock.withLock {
-            if let simulatedSaveError {
-                throw simulatedSaveError
-            }
-            stored = credential
-        }
-    }
-
-    func deleteCredential() {
-        lock.withLock { stored = nil }
-    }
-}
-
 @Suite("CloudTuneUI Draft Isolation & Offscreen Light/Dark Snapshot Verification")
 struct CloudTuneUITests {
     @Test("Settings draft edits stay isolated from committedSettings across module switches and validate on commit")
@@ -241,17 +202,17 @@ struct CloudTuneUITests {
 
         // 2) Browsing into CD 1 and CD 2 preserves real folder names (never "当前目录")
         await vm.browseTo(folderId: "cd1", nextBreadcrumbs: [.root, BreadcrumbItem(id: "cd1", name: "CD 1")])
-        #expect(vm.browser?.currentFolderName == "CD 1")
-        #expect(vm.browser?.audioFiles.first?.folderPath == "CD 1")
+        #expect(vm.cloudBrowser.payload?.currentFolderName == "CD 1")
+        #expect(vm.cloudBrowser.payload?.audioFiles.first?.folderPath == "CD 1")
 
         await vm.saveExportDirectoryBookmark(exportDir)
-        await vm.enqueueCurrentFolderDownload(explicitDirectoryURL: exportDir)
+        await vm.enqueueFolderDownload(from: vm.cloudBrowser, explicitDirectoryURL: exportDir)
         let cd1Subpath = vm.downloadTransfers.first?.path
         #expect(cd1Subpath == "CD 1/01. Track.flac")
 
         await vm.browseTo(folderId: "cd2", nextBreadcrumbs: [.root, BreadcrumbItem(id: "cd2", name: "CD 2")])
-        #expect(vm.browser?.currentFolderName == "CD 2")
-        await vm.enqueueCurrentFolderDownload(explicitDirectoryURL: exportDir)
+        #expect(vm.cloudBrowser.payload?.currentFolderName == "CD 2")
+        await vm.enqueueFolderDownload(from: vm.cloudBrowser, explicitDirectoryURL: exportDir)
         let allPaths = Set(vm.downloadTransfers.compactMap(\.path))
         #expect(allPaths.contains("CD 1/01. Track.flac"))
         #expect(allPaths.contains("CD 2/01. Track.flac"))
@@ -312,23 +273,13 @@ struct CloudTuneUITests {
         vm.retryBaseDelayMs = 5
 
         // 5) Bootstrap must NOT overwrite an existing native Keychain credential with legacy Tauri settings.json
-        final class PreseededKeychain: KeychainBackend, @unchecked Sendable {
-            var current: PersistedRefreshCredential?
-            init(_ cred: PersistedRefreshCredential) { self.current = cred }
-            func readCredential() -> KeychainLoadResult {
-                if let current { return .found(current) }
-                return .notFound
-            }
-            func saveCredential(_ credential: PersistedRefreshCredential) throws { current = credential }
-            func deleteCredential() { current = nil }
-        }
         let migRoot = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-boot-mig-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: migRoot) }
         try FileManager.default.createDirectory(at: migRoot, withIntermediateDirectories: true)
         try Data(#"{"refreshToken":"rt_old_legacy","accountName":"old@example.invalid","cacheLimitMb":1024}"#.utf8)
             .write(to: migRoot.appendingPathComponent("settings.json"))
         let nativeCred = try #require(PersistedRefreshCredential(refreshToken: "rt_native_keep", accountName: "native@example.invalid"))
-        let kc = PreseededKeychain(nativeCred)
+        let kc = InMemoryKeychainBackend(nativeCred)
         let migStore = try AccountScopedStore(rootDirectory: migRoot)
         let bootVM = CloudTuneViewModel(cloudClient: client, accountStore: migStore, keychainBackend: kc, enableLiveObservers: false)
         await bootVM.bootstrap()
@@ -847,7 +798,7 @@ struct CloudTuneUITests {
         async let modeTask: Void = vm.updatePlaybackMode(.streamCache)
         _ = await (appearanceTask, modeTask)
         let acctKey = try #require(vm.accountStorageKey)
-        let diskSettings = try await store.loadSettings(for: acctKey)
+        let diskSettings = try #require(try await store.loadSettingsIfPresent(for: acctKey))
         #expect(vm.committedSettings.appearanceMode == .dark)
         #expect(vm.committedSettings.playbackMode == .streamCache)
         #expect(diskSettings.appearanceMode == .dark)

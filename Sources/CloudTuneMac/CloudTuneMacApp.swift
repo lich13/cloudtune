@@ -400,10 +400,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     @objc private func handleToggleQueueInspector() {
-        viewModel.isShowingQueuePopover.toggle()
-        if !viewModel.isShowingQueuePopover {
-            viewModel.isShowingNowPlayingSheet = false
-        }
+        viewModel.isShowingNowPlaying.toggle()
     }
 
     @objc private func handleDockTogglePlay() {

@@ -26,28 +26,6 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
 
     public init(
         taskId: String,
-        accountId: String,
-        trackId: String,
-        fileName: String,
-        relativeExportSubpath: String,
-        totalSize: UInt64,
-        partCount: Int,
-        state: String,
-        exportBookmarkData: Data? = nil
-    ) {
-        self.taskId = taskId
-        self.accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
-        self.trackId = trackId
-        self.fileName = fileName
-        self.relativeExportSubpath = relativeExportSubpath
-        self.totalSize = totalSize
-        self.partCount = partCount
-        self.state = state
-        self.exportBookmarkData = exportBookmarkData
-    }
-
-    public init(
-        taskId: String,
         accountHash: String,
         trackId: String,
         fileName: String,
@@ -171,10 +149,6 @@ public actor TransferEngine {
         let snap = snapshot()
         let active = snap.hasActiveItems
         self.lastNotifiedHasActive = active
-    }
-
-    public func hasActiveTransfers() -> Bool {
-        statuses.values.contains { $0.state == "running" || $0.state == "streaming" }
     }
 
     public func hasInFlightCacheDownload(for cacheFileURL: URL) -> Bool {

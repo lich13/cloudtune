@@ -11,7 +11,6 @@ public enum KeychainLoadResult: Equatable, Sendable {
     public static let errSecInteractionNotAllowedCode: Int32 = -25_308
     public static let errSecInteractionRequiredCode: Int32 = -25_315
     public static let errSecItemNotFoundCode: Int32 = -25_300
-    public static let errSecAuthFailedCode: Int32 = -25_293
 
     public static func classify(status: Int32, data: Data?) -> KeychainLoadResult {
         if status == errSecSuccess {
@@ -195,3 +194,64 @@ public struct SystemKeychainBackend: KeychainBackend {
         _ = SecItemDelete(query as CFDictionary)
     }
 }
+
+#if DEBUG
+public final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: PersistedRefreshCredential?
+    private var nextReadOverride: KeychainLoadResult?
+    private var simulatedSaveError: Error?
+    private var _readCallCount: Int = 0
+
+    public init(_ initial: PersistedRefreshCredential? = nil, simulatedSaveError: Error? = nil) {
+        self.stored = initial
+        self.simulatedSaveError = simulatedSaveError
+    }
+
+    public var current: PersistedRefreshCredential? {
+        lock.withLock { stored }
+    }
+
+    public var readCallCount: Int {
+        lock.withLock { _readCallCount }
+    }
+
+    public func setNextReadResult(_ result: KeychainLoadResult?) {
+        lock.withLock { nextReadOverride = result }
+    }
+
+    public func setSaveError(_ error: Error?) {
+        lock.withLock { simulatedSaveError = error }
+    }
+
+    public func readCredential() -> KeychainLoadResult {
+        lock.withLock {
+            _readCallCount += 1
+            if let nextReadOverride {
+                return nextReadOverride
+            }
+            if let stored {
+                return .found(stored)
+            }
+            return .notFound
+        }
+    }
+
+    public func saveCredential(_ credential: PersistedRefreshCredential) throws {
+        try lock.withLock {
+            if let simulatedSaveError {
+                throw simulatedSaveError
+            }
+            stored = credential
+            nextReadOverride = nil
+        }
+    }
+
+    public func deleteCredential() {
+        lock.withLock {
+            stored = nil
+            nextReadOverride = nil
+        }
+    }
+}
+#endif

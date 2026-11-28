@@ -1,3 +1,4 @@
+#if DEBUG
 import CloudTuneCore
 import CoreGraphics
 import Foundation
@@ -188,3 +189,4 @@ public enum SnapshotRenderer {
     }
     #endif
 }
+#endif

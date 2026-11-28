@@ -1,5 +1,6 @@
 import Foundation
 
+#if DEBUG
 public struct RepresentativeFixture: Codable, Equatable, Sendable {
     public struct QrLoginFixture: Codable, Equatable, Sendable {
         public var qrContent: String
@@ -50,6 +51,7 @@ public struct RepresentativeFixture: Codable, Equatable, Sendable {
         return try JSONDecoder().decode(RepresentativeFixture.self, from: data)
     }
 }
+#endif
 
 public enum CloudTuneFormatters {
     public static func formatBytes(_ value: UInt64) -> String {

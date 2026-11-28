@@ -43,51 +43,6 @@ private final class WriteThroughEventRelay: @unchecked Sendable {
     }
 }
 
-private final class SettingsMutationSequence: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: UInt64 = 0
-
-    func next() -> UInt64 {
-        lock.withLock {
-            current += 1
-            return current
-        }
-    }
-}
-
-private final class SettingsMutationSequenceBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: UInt64 = 0
-
-    func store(_ next: UInt64) {
-        lock.withLock { value = next }
-    }
-
-    func load() -> UInt64 {
-        lock.withLock { value }
-    }
-}
-
-private final class IsolatedFixtureKeychainBackend: KeychainBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: PersistedRefreshCredential?
-
-    func readCredential() -> KeychainLoadResult {
-        lock.withLock {
-            if let stored { return .found(stored) }
-            return .notFound
-        }
-    }
-
-    func saveCredential(_ credential: PersistedRefreshCredential) throws {
-        lock.withLock { stored = credential }
-    }
-
-    func deleteCredential() {
-        lock.withLock { stored = nil }
-    }
-}
-
 private enum DraftSyncScope {
     case none
     case cacheLimitOnly
@@ -150,16 +105,6 @@ public final class CloudTuneViewModel {
     }
     public var searchQuery: String = ""
 
-    public var breadcrumbs: [BreadcrumbItem] {
-        get { cloudBrowser.breadcrumbs }
-        set { cloudBrowser.breadcrumbs = newValue }
-    }
-
-    public var browser: FolderBrowsePayload? {
-        get { cloudBrowser.payload }
-        set { cloudBrowser.payload = newValue }
-    }
-
     // Playback & unified queue state
     public var activeTrack: TrackSummary? {
         didSet { syncRemoteCommandAvailability() }
@@ -205,9 +150,8 @@ public final class CloudTuneViewModel {
     public private(set) var shuffleOrderIds: [String] = []
 
     // Presentation state (shared across live app & offscreen snapshot scenes)
-    public var isShowingNowPlayingSheet: Bool = false
+    public var isShowingNowPlaying: Bool = false
     public var isShowingSettingsSheet: Bool = false
-    public var isShowingQueuePopover: Bool = false
 
     // Video sheet / external handoff state
     public var activeVideoURL: URL? {
@@ -278,7 +222,6 @@ public final class CloudTuneViewModel {
     private var videoBrowserIdleGeneration: Int = 0
     private var browserBusyToken: Int = 0
     private var operationBusyToken: Int = 0
-    private let settingsSequence = SettingsMutationSequence()
     private var lastAppliedSettingsSeq: UInt64 = 0
     private var recoveryAttempts: Int = 0
     private var currentPlaybackIsLoopback: Bool = false
@@ -364,6 +307,7 @@ public final class CloudTuneViewModel {
         }
     }
 
+    #if DEBUG
     public static func fixture(scene: SnapshotScene, fixture: RepresentativeFixture) -> CloudTuneViewModel {
         let isolatedRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("cloudtune-fixture-\(UUID().uuidString)", isDirectory: true)
@@ -375,7 +319,7 @@ public final class CloudTuneViewModel {
         }
         let vm = CloudTuneViewModel(
             accountStore: isolatedStore,
-            keychainBackend: IsolatedFixtureKeychainBackend(),
+            keychainBackend: InMemoryKeychainBackend(),
             enableLiveObservers: false
         )
         let resolvedAppearance = fixture.settings.appearanceMode ?? .system
@@ -448,14 +392,14 @@ public final class CloudTuneViewModel {
                 vm.isShowingSettingsSheet = true
             case .nowPlaying:
                 vm.activeModule = .music
-                vm.isShowingNowPlayingSheet = true
-                vm.isShowingQueuePopover = true
+                vm.isShowingNowPlaying = true
             default:
                 vm.activeModule = .music
             }
         }
         return vm
     }
+    #endif
 
     public var visibleTracks: [TrackSummary] {
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -761,20 +705,18 @@ public final class CloudTuneViewModel {
         }
 
         let baseSnapshot = committedSettings
-        let seqBox = SettingsMutationSequenceBox()
-        let sequenceGenerator = settingsSequence
         do {
-            let updated = try await accountStore.mutateSettings(for: accountId, base: baseSnapshot) { settings in
-                transform(&settings)
-                seqBox.store(sequenceGenerator.next())
-            }
+            let mutated = try await accountStore.mutateSettings(
+                for: accountId,
+                base: baseSnapshot,
+                transform
+            )
             guard isAuthenticated, activeAccountKey == accountId else {
                 return false
             }
-            let seq = seqBox.load()
-            if seq >= lastAppliedSettingsSeq {
-                lastAppliedSettingsSeq = seq
-                committedSettings = updated
+            if mutated.sequence >= lastAppliedSettingsSeq {
+                lastAppliedSettingsSeq = mutated.sequence
+                committedSettings = mutated.settings
             }
             applyDraftSync(draftSync)
             if let successMessage {
@@ -790,15 +732,7 @@ public final class CloudTuneViewModel {
     }
 
     private var activeAccountKey: String? {
-        if let key = accountStorageKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
-            return key
-        }
-        guard let trimmed = accountName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty,
-              trimmed != Cloud189Constants.defaultAccountDisplayName else {
-            return nil
-        }
-        return trimmed
+        accountStorageKey?.trimmedNilIfEmpty ?? accountName?.nilIfNotDefaultDisplayName
     }
 
     @discardableResult
@@ -1186,10 +1120,9 @@ public final class CloudTuneViewModel {
         activeVideoTrack = nil
         shareFileURL = nil
         pendingExternalVideoChoice = nil
-        isShowingNowPlayingSheet = false
+        isShowingNowPlaying = false
         isShowingSettingsSheet = false
         isShowingWebLoginSheet = false
-        isShowingQueuePopover = false
         activeModule = .music
         transferSnapshot = TransferSnapshotPayload()
         committedSettings = AccountSettings(appearanceMode: appearancePreference)
@@ -1316,10 +1249,6 @@ public final class CloudTuneViewModel {
         let nextCrumbs = Array(crumbs.dropLast())
         let targetId = nextCrumbs.last?.id
         await browseTo(scope: scope, folderId: targetId, nextBreadcrumbs: nextCrumbs)
-    }
-
-    public func setCurrentFolderAsMusicLibrary() async {
-        await setFolderAsMusicLibrary(from: cloudBrowser)
     }
 
     public func setFolderAsMusicLibrary(from pane: BrowserPaneState) async {
@@ -2308,10 +2237,6 @@ public final class CloudTuneViewModel {
         }
     }
 
-    public func enqueueCurrentFolderDownload(explicitDirectoryURL: URL? = nil) async {
-        await enqueueFolderDownload(from: cloudBrowser, explicitDirectoryURL: explicitDirectoryURL)
-    }
-
     public func enqueueFolderDownload(from pane: BrowserPaneState, explicitDirectoryURL: URL? = nil) async {
         guard isAuthenticated, let payload = pane.payload, let accountId = activeAccountKey else { return }
         let expectedAuthGen = authGeneration
@@ -2396,21 +2321,15 @@ public final class CloudTuneViewModel {
     public func saveExportDirectoryBookmark(_ url: URL) async -> Bool {
         guard isAuthenticated, let accountId = activeAccountKey else { return false }
         let baseSnapshot = committedSettings
-        let seqBox = SettingsMutationSequenceBox()
-        let sequenceGenerator = settingsSequence
         do {
             let result = try await accountStore.saveExportDirectoryBookmarkAndSettings(
                 url,
                 baseSettings: baseSnapshot,
-                for: accountId,
-                afterMutate: {
-                    seqBox.store(sequenceGenerator.next())
-                }
+                for: accountId
             )
             guard isAuthenticated, activeAccountKey == accountId else { return false }
-            let seq = seqBox.load()
-            if seq >= lastAppliedSettingsSeq {
-                lastAppliedSettingsSeq = seq
+            if result.sequence >= lastAppliedSettingsSeq {
+                lastAppliedSettingsSeq = result.sequence
                 committedSettings = result.settings
             }
             statusMessage = "下载导出目录已设为 \(result.displayName)"

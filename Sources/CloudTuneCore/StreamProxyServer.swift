@@ -512,7 +512,7 @@ public actor StreamProxyServer {
                 return
             }
 
-            let mime = PlaybackDecisionPolicy.guessMimeType(for: source.fileName)
+            let mime = Cloud189Protocol.guessMimeType(for: source.fileName)
             let fullLength = RangeHeaderValidator.extractFullAssetLength(
                 statusCode: opened.statusCode,
                 requestHadRange: upstreamInitialRange != nil,

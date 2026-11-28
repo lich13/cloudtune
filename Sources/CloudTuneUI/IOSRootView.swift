@@ -18,7 +18,7 @@ public struct IOSRootView: View {
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var hapticCounter: Int = 0
     @State private var scrubPreviewSeconds: Double?
-    @State private var isSearchPresented: Bool = false
+    @State private var pendingIPadSearchFocus: Bool = false
     @FocusState private var isIPadSearchFocused: Bool
 
     public init(viewModel: CloudTuneViewModel) {
@@ -51,7 +51,7 @@ public struct IOSRootView: View {
                 iphoneAdaptiveLayout(palette: palette)
             }
 
-            if viewModel.isAuthenticated && viewModel.isShowingNowPlayingSheet && !viewModel.hasActivePlayerObservers {
+            if viewModel.isAuthenticated && viewModel.isShowingNowPlaying && !viewModel.hasActivePlayerObservers {
                 iosFullPlayerView(palette: palette)
                     .transition(.move(edge: .bottom))
             }
@@ -64,8 +64,8 @@ public struct IOSRootView: View {
         }
         .sheet(
             isPresented: Binding(
-                get: { viewModel.isShowingNowPlayingSheet && viewModel.hasActivePlayerObservers },
-                set: { viewModel.isShowingNowPlayingSheet = $0 }
+                get: { viewModel.isShowingNowPlaying && viewModel.hasActivePlayerObservers },
+                set: { viewModel.isShowingNowPlaying = $0 }
             )
         ) {
             iosFullPlayerView(palette: palette)
@@ -110,24 +110,14 @@ public struct IOSRootView: View {
             if !authenticated {
                 isShowingShareSheet = false
                 isShowingFolderPicker = false
+                pendingIPadSearchFocus = false
                 isIPadSearchFocused = false
-                isSearchPresented = false
-            }
-        }
-        .onChange(of: isIPadSearchFocused) { _, focused in
-            if horizontalSizeClass == .regular, isSearchPresented != focused {
-                isSearchPresented = focused
-            }
-        }
-        .onChange(of: isSearchPresented) { _, presented in
-            if horizontalSizeClass == .regular, viewModel.activeModule == .music, isIPadSearchFocused != presented {
-                isIPadSearchFocused = presented
             }
         }
         .onChange(of: viewModel.activeModule) { _, nextModule in
-            if nextModule != .music && horizontalSizeClass == .regular {
+            if nextModule != .music {
+                pendingIPadSearchFocus = false
                 isIPadSearchFocused = false
-                isSearchPresented = false
             }
         }
         .sheet(isPresented: $isShowingShareSheet) {
@@ -390,7 +380,7 @@ public struct IOSRootView: View {
                 Task { await viewModel.togglePlayback() }
             }
             .keyboardShortcut(.space, modifiers: [])
-            .disabled(isSearchPresented || isIPadSearchFocused || viewModel.activeModule == .settings)
+            .disabled(isIPadSearchFocused || viewModel.activeModule == .settings)
 
             Button("") {
                 Task { await viewModel.playAdjacent(direction: -1) }
@@ -405,21 +395,11 @@ public struct IOSRootView: View {
             .disabled(!viewModel.canSkipNext)
 
             Button("") {
-                let alreadyOnMusic = (viewModel.activeModule == .music)
-                viewModel.activeModule = .music
-                isSearchPresented = true
-                if alreadyOnMusic {
+                if viewModel.activeModule == .music {
                     isIPadSearchFocused = true
-                    Task { @MainActor in
-                        do {
-                            try await Task.sleep(for: .milliseconds(50))
-                        } catch {
-                            return
-                        }
-                        if !isIPadSearchFocused {
-                            isSearchPresented = false
-                        }
-                    }
+                } else {
+                    pendingIPadSearchFocus = true
+                    viewModel.activeModule = .music
                 }
             }
             .keyboardShortcut("f", modifiers: [.command])
@@ -462,7 +442,7 @@ public struct IOSRootView: View {
 
             Button {
                 hapticCounter += 1
-                viewModel.isShowingNowPlayingSheet = true
+                viewModel.isShowingNowPlaying = true
             } label: {
                 VStack(spacing: 14) {
                     ArtworkView(
@@ -656,7 +636,7 @@ public struct IOSRootView: View {
         HStack(spacing: 10) {
             Button {
                 hapticCounter += 1
-                viewModel.isShowingNowPlayingSheet = true
+                viewModel.isShowingNowPlaying = true
             } label: {
                 HStack(spacing: 10) {
                     ArtworkView(
@@ -752,7 +732,7 @@ public struct IOSRootView: View {
             VStack(spacing: 20) {
                 HStack {
                     Button {
-                        viewModel.isShowingNowPlayingSheet = false
+                        viewModel.isShowingNowPlaying = false
                     } label: {
                         Image(systemName: "chevron.down")
                             .font(.system(size: 16, weight: .semibold))
@@ -1026,7 +1006,6 @@ public struct IOSRootView: View {
             iosMusicTrackList(palette: palette)
                 .searchable(
                     text: $viewModel.searchQuery,
-                    isPresented: $isSearchPresented,
                     placement: .navigationBarDrawer(displayMode: .always),
                     prompt: "搜索曲目或目录"
                 )
@@ -1076,17 +1055,11 @@ public struct IOSRootView: View {
         .padding(.vertical, 8)
         .background(palette.surfacePrimary)
         .onAppear {
-            guard isSearchPresented else { return }
+            guard pendingIPadSearchFocus else { return }
+            pendingIPadSearchFocus = false
             Task { @MainActor in
-                guard isSearchPresented, viewModel.activeModule == .music else { return }
-                isIPadSearchFocused = true
-                do {
-                    try await Task.sleep(for: .milliseconds(50))
-                } catch {
-                    return
-                }
-                if !isIPadSearchFocused {
-                    isSearchPresented = false
+                if viewModel.isAuthenticated, viewModel.activeModule == .music {
+                    isIPadSearchFocused = true
                 }
             }
         }

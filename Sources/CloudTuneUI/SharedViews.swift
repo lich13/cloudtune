@@ -7,6 +7,18 @@ import AppKit
 import UIKit
 #endif
 
+private func decodePlatformImage(_ data: Data) -> Image? {
+    #if os(macOS)
+    guard let nsImage = NSImage(data: data) else { return nil }
+    return Image(nsImage: nsImage)
+    #elseif os(iOS)
+    guard let uiImage = UIImage(data: data) else { return nil }
+    return Image(uiImage: uiImage)
+    #else
+    return nil
+    #endif
+}
+
 public struct SubtleStatusBanner: View {
     public let message: String
     public let isError: Bool
@@ -140,18 +152,6 @@ public struct ArtworkView: View {
             .clipShape(shape)
             .overlay(shape.strokeBorder(palette.separator, lineWidth: 0.5))
         }
-    }
-
-    private func decodePlatformImage(_ data: Data) -> Image? {
-        #if os(macOS)
-        guard let nsImage = NSImage(data: data) else { return nil }
-        return Image(nsImage: nsImage)
-        #elseif os(iOS)
-        guard let uiImage = UIImage(data: data) else { return nil }
-        return Image(uiImage: uiImage)
-        #else
-        return nil
-        #endif
     }
 }
 
@@ -712,7 +712,7 @@ public struct QrCodeArtworkView: View {
     }
 
     public var body: some View {
-        if let pngData, let image = platformImage(from: pngData) {
+        if let pngData, let image = decodePlatformImage(pngData) {
             VStack(spacing: 10) {
                 image
                     .interpolation(.none)
@@ -775,18 +775,6 @@ public struct QrCodeArtworkView: View {
             )
         }
     }
-
-    private func platformImage(from data: Data) -> Image? {
-        #if os(macOS)
-        guard let nsImage = NSImage(data: data) else { return nil }
-        return Image(nsImage: nsImage)
-        #elseif os(iOS)
-        guard let uiImage = UIImage(data: data) else { return nil }
-        return Image(uiImage: uiImage)
-        #else
-        return nil
-        #endif
-    }
 }
 
 #if os(macOS)
@@ -819,18 +807,15 @@ public enum MacMenuEntry {
 
 /// Native AppKit `NSView` + `NSMenu.popUp` trigger with full rectangular hit area (never uses SwiftUI `Menu`).
 public struct MacPopUpMenuButton: NSViewRepresentable {
-    public let title: String?
     public let systemImage: String
     public let accessibilityTitle: String
     public let entries: () -> [MacMenuEntry]
 
     public init(
-        title: String? = nil,
         systemImage: String,
         accessibilityTitle: String,
         entries: @escaping () -> [MacMenuEntry]
     ) {
-        self.title = title
         self.systemImage = systemImage
         self.accessibilityTitle = accessibilityTitle
         self.entries = entries
@@ -842,7 +827,7 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
 
     public func makeNSView(context: Context) -> PopUpTriggerNSView {
         let view = PopUpTriggerNSView()
-        view.configure(title: title, systemImage: systemImage, accessibilityTitle: accessibilityTitle)
+        view.configure(systemImage: systemImage, accessibilityTitle: accessibilityTitle)
         view.onTrigger = { [weak coordinator = context.coordinator] anchor in
             coordinator?.presentMenu(from: anchor)
         }
@@ -851,7 +836,7 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
 
     public func updateNSView(_ nsView: PopUpTriggerNSView, context: Context) {
         context.coordinator.entries = entries
-        nsView.configure(title: title, systemImage: systemImage, accessibilityTitle: accessibilityTitle)
+        nsView.configure(systemImage: systemImage, accessibilityTitle: accessibilityTitle)
     }
 
     public func sizeThatFits(_ proposal: ProposedViewSize, nsView: PopUpTriggerNSView, context: Context) -> CGSize? {
@@ -901,7 +886,6 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
 
     public final class PopUpTriggerNSView: NSView {
         var onTrigger: ((NSView) -> Void)?
-        private var titleText: String?
         private var symbolName: String = "ellipsis.circle"
         private var isHovered = false {
             didSet { needsDisplay = true }
@@ -909,19 +893,13 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
         private var trackingRef: NSTrackingArea?
 
         override public var intrinsicContentSize: NSSize {
-            if let titleText, !titleText.isEmpty {
-                let textWidth = (titleText as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12.5, weight: .medium)]).width
-                return NSSize(width: ceil(textWidth) + 34, height: 28)
-            }
-            return NSSize(width: 28, height: 28)
+            NSSize(width: 28, height: 28)
         }
 
-        func configure(title: String?, systemImage: String, accessibilityTitle: String) {
-            self.titleText = title
+        func configure(systemImage: String, accessibilityTitle: String) {
             self.symbolName = systemImage
             setAccessibilityLabel(accessibilityTitle)
             setAccessibilityRole(.popUpButton)
-            invalidateIntrinsicContentSize()
             needsDisplay = true
         }
 
@@ -960,47 +938,21 @@ public struct MacPopUpMenuButton: NSViewRepresentable {
                 NSColor.labelColor.withAlphaComponent(0.08).setFill()
                 path.fill()
             }
-            let tint = (titleText?.isEmpty == false) ? NSColor.labelColor : NSColor.secondaryLabelColor
             let cfg = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
-                .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-            let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
-            symbol?.isTemplate = false
-
-            if let titleText, !titleText.isEmpty {
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
-                    .foregroundColor: NSColor.labelColor
-                ]
-                let textSize = (titleText as NSString).size(withAttributes: attrs)
-                var cursorX: CGFloat = 8
-                if let symbol {
-                    let sSize = symbol.size
-                    let iconRect = NSRect(
-                        x: cursorX,
-                        y: (bounds.height - sSize.height) / 2.0,
-                        width: sSize.width,
-                        height: sSize.height
-                    )
-                    symbol.draw(in: iconRect)
-                    cursorX += sSize.width + 5
-                }
-                let textRect = NSRect(
-                    x: cursorX,
-                    y: (bounds.height - textSize.height) / 2.0,
-                    width: textSize.width,
-                    height: textSize.height
-                )
-                (titleText as NSString).draw(in: textRect, withAttributes: attrs)
-            } else if let symbol {
-                let sSize = symbol.size
-                let iconRect = NSRect(
-                    x: (bounds.width - sSize.width) / 2.0,
-                    y: (bounds.height - sSize.height) / 2.0,
-                    width: sSize.width,
-                    height: sSize.height
-                )
-                symbol.draw(in: iconRect)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [NSColor.secondaryLabelColor]))
+            guard let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg) else {
+                return
             }
+            symbol.isTemplate = false
+            let sSize = symbol.size
+            let iconRect = NSRect(
+                x: (bounds.width - sSize.width) / 2.0,
+                y: (bounds.height - sSize.height) / 2.0,
+                width: sSize.width,
+                height: sSize.height
+            )
+            symbol.draw(in: iconRect)
         }
     }
 }

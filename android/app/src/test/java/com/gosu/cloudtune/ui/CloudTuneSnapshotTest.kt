@@ -461,6 +461,7 @@ class CloudTuneSnapshotTest {
             extJob2?.join()
             assertNull(runtime.pendingExternalVideoAction)
             assertEquals("vid-inapp", runtime.activeVideoTrack?.id)
+            runtime.closeVideoPlayer()
             Unit
         } finally {
             controller.pause().stop().destroy()

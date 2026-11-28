@@ -19,6 +19,7 @@ public struct IOSRootView: View {
     @State private var hapticCounter: Int = 0
     @State private var scrubPreviewSeconds: Double?
     @State private var isSearchPresented: Bool = false
+    @FocusState private var isIPadSearchFocused: Bool
 
     public init(viewModel: CloudTuneViewModel) {
         self.viewModel = viewModel
@@ -109,6 +110,24 @@ public struct IOSRootView: View {
             if !authenticated {
                 isShowingShareSheet = false
                 isShowingFolderPicker = false
+                isIPadSearchFocused = false
+                isSearchPresented = false
+            }
+        }
+        .onChange(of: isIPadSearchFocused) { _, focused in
+            if horizontalSizeClass == .regular, isSearchPresented != focused {
+                isSearchPresented = focused
+            }
+        }
+        .onChange(of: isSearchPresented) { _, presented in
+            if horizontalSizeClass == .regular, viewModel.activeModule == .music, isIPadSearchFocused != presented {
+                isIPadSearchFocused = presented
+            }
+        }
+        .onChange(of: viewModel.activeModule) { _, nextModule in
+            if nextModule != .music && horizontalSizeClass == .regular {
+                isIPadSearchFocused = false
+                isSearchPresented = false
             }
         }
         .sheet(isPresented: $isShowingShareSheet) {
@@ -248,6 +267,8 @@ public struct IOSRootView: View {
                 iosSettingsContent(palette: palette)
                     .navigationTitle("设置")
                     .navigationBarTitleDisplayMode(.inline)
+                    .toolbarBackground(.visible, for: .navigationBar)
+                    .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
                     .toolbar {
                         ToolbarItem(placement: .topBarLeading) {
                             Button("完成") {
@@ -263,6 +284,10 @@ public struct IOSRootView: View {
                         moduleBody(for: tab, palette: palette)
                             .navigationTitle(tab.title)
                             .navigationBarTitleDisplayMode(.inline)
+                            .toolbarBackground(.visible, for: .navigationBar)
+                            .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
+                            .toolbarBackground(.visible, for: .tabBar)
+                            .toolbarBackground(palette.surfacePrimary, for: .tabBar)
                             .toolbar {
                                 ToolbarItem(placement: .topBarTrailing) {
                                     Button {
@@ -273,11 +298,16 @@ public struct IOSRootView: View {
                                     .accessibilityLabel("设置")
                                 }
                             }
-                            .safeAreaInset(edge: .bottom) {
-                                iosMiniPlayerBar(palette: palette)
-                                    .padding(.horizontal, 12)
-                                    .padding(.bottom, 6)
+                            .safeAreaInset(edge: .bottom, spacing: 0) {
+                                VStack(spacing: 0) {
+                                    Divider().overlay(palette.separator)
+                                    iosMiniPlayerBar(palette: palette)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                }
+                                .background(palette.canvasBackground)
                             }
+                            .background(IOSTabBarConfigurator(palette: palette))
                     }
                     .tabItem {
                         Label(tab.title, systemImage: tab.systemImage)
@@ -294,7 +324,7 @@ public struct IOSRootView: View {
     private func ipadSplitLayout(palette: CloudTunePalette) -> some View {
         NavigationSplitView(columnVisibility: $splitVisibility) {
             List {
-                Section("CloudTune") {
+                Section {
                     ForEach(ModuleTab.allCases) { tab in
                         Button {
                             viewModel.activeModule = tab
@@ -323,12 +353,8 @@ public struct IOSRootView: View {
             .navigationTitle("CloudTune")
         } detail: {
             HStack(spacing: 0) {
-                NavigationStack {
-                    moduleBody(for: viewModel.activeModule, palette: palette)
-                        .navigationTitle(viewModel.activeModule.title)
-                        .navigationBarTitleDisplayMode(.inline)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                moduleBody(for: viewModel.activeModule, palette: palette)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if viewModel.activeModule != .settings {
                     Divider().overlay(palette.separator)
@@ -340,6 +366,17 @@ public struct IOSRootView: View {
             .background {
                 ipadKeyboardShortcuts
             }
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(palette.surfacePrimary, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Text(viewModel.activeModule.title)
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(palette.inkPrimary)
+                }
+            }
         }
     }
 
@@ -350,7 +387,7 @@ public struct IOSRootView: View {
                 Task { await viewModel.togglePlayback() }
             }
             .keyboardShortcut(.space, modifiers: [])
-            .disabled(isSearchPresented || viewModel.activeModule == .settings)
+            .disabled(isSearchPresented || isIPadSearchFocused || viewModel.activeModule == .settings)
 
             Button("") {
                 Task { await viewModel.playAdjacent(direction: -1) }
@@ -365,8 +402,22 @@ public struct IOSRootView: View {
             .disabled(!viewModel.canSkipNext)
 
             Button("") {
+                let alreadyOnMusic = (viewModel.activeModule == .music)
                 viewModel.activeModule = .music
                 isSearchPresented = true
+                if alreadyOnMusic {
+                    isIPadSearchFocused = true
+                    Task { @MainActor in
+                        do {
+                            try await Task.sleep(for: .milliseconds(50))
+                        } catch {
+                            return
+                        }
+                        if !isIPadSearchFocused {
+                            isSearchPresented = false
+                        }
+                    }
+                }
             }
             .keyboardShortcut("f", modifiers: [.command])
 
@@ -661,12 +712,15 @@ public struct IOSRootView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .background(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(palette.surfaceElevated)
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .strokeBorder(palette.separator, lineWidth: 0.8)
+                .strokeBorder(palette.cardBorder, lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(palette.isDark ? 0.30 : 0.08), radius: 10, x: 0, y: 4)
+        .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.06), radius: 8, x: 0, y: 3)
         .gesture(
             DragGesture(minimumDistance: 28)
                 .onEnded { gesture in
@@ -958,6 +1012,85 @@ public struct IOSRootView: View {
 
     @ViewBuilder
     private func iosMusicContent(palette: CloudTunePalette) -> some View {
+        if horizontalSizeClass == .regular {
+            VStack(spacing: 0) {
+                ipadMusicSearchBar(palette: palette)
+                Divider().overlay(palette.separator)
+                iosMusicTrackList(palette: palette)
+            }
+            .background(palette.canvasBackground)
+        } else {
+            iosMusicTrackList(palette: palette)
+                .searchable(
+                    text: $viewModel.searchQuery,
+                    isPresented: $isSearchPresented,
+                    placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "搜索曲目或目录"
+                )
+        }
+    }
+
+    @ViewBuilder
+    private func ipadMusicSearchBar(palette: CloudTunePalette) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(palette.inkTertiary)
+
+            TextField("搜索曲目或目录", text: $viewModel.searchQuery)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.system(size: 14))
+                .foregroundStyle(palette.inkPrimary)
+                .focused($isIPadSearchFocused)
+                .submitLabel(.search)
+
+            if !viewModel.searchQuery.isEmpty {
+                Button {
+                    viewModel.searchQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(palette.inkTertiary)
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("清除搜索词")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(palette.inputSurface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(palette.cardBorder, lineWidth: 0.8)
+        )
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(palette.surfacePrimary)
+        .onAppear {
+            guard isSearchPresented else { return }
+            Task { @MainActor in
+                guard isSearchPresented, viewModel.activeModule == .music else { return }
+                isIPadSearchFocused = true
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                } catch {
+                    return
+                }
+                if !isIPadSearchFocused {
+                    isSearchPresented = false
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func iosMusicTrackList(palette: CloudTunePalette) -> some View {
         List {
             iosStatusRow(palette: palette)
 
@@ -1022,7 +1155,6 @@ public struct IOSRootView: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(palette.canvasBackground)
-        .searchable(text: $viewModel.searchQuery, isPresented: $isSearchPresented, prompt: "搜索曲目或目录")
         .refreshable {
             await viewModel.scanMusicLibrary(showBusy: false)
         }
@@ -1647,5 +1779,237 @@ struct IOSActivityShareSheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: items, applicationActivities: nil)
     }
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+@MainActor
+enum IOSTabBarAppearanceHelper {
+    private static func resolvedColor(_ color: Color, isDark: Bool) -> UIColor {
+        let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
+        return UIColor(color).resolvedColor(with: traits)
+    }
+
+    static func makeAppearance(palette: CloudTunePalette) -> UITabBarAppearance {
+        let surfaceColor = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
+        let separatorColor = resolvedColor(palette.separator, isDark: palette.isDark)
+        let normalColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
+        let selectedColor = resolvedColor(palette.accent, isDark: palette.isDark)
+
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        appearance.backgroundEffect = nil
+        appearance.backgroundColor = surfaceColor
+        appearance.shadowColor = separatorColor
+
+        let normalTitleAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: normalColor
+        ]
+        let selectedTitleAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: selectedColor
+        ]
+
+        for itemAppearance in [
+            appearance.stackedLayoutAppearance,
+            appearance.inlineLayoutAppearance,
+            appearance.compactInlineLayoutAppearance
+        ] {
+            itemAppearance.normal.iconColor = normalColor
+            itemAppearance.normal.titleTextAttributes = normalTitleAttrs
+            itemAppearance.selected.iconColor = selectedColor
+            itemAppearance.selected.titleTextAttributes = selectedTitleAttrs
+            itemAppearance.focused.iconColor = selectedColor
+            itemAppearance.focused.titleTextAttributes = selectedTitleAttrs
+        }
+        return appearance
+    }
+
+    static func needsApply(to tabBar: UITabBar, palette: CloudTunePalette) -> Bool {
+        let expectedSurface = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
+        let expectedNormal = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
+        let expectedSelected = resolvedColor(palette.accent, isDark: palette.isDark)
+        if tabBar.isTranslucent
+            || tabBar.standardAppearance.backgroundEffect != nil
+            || tabBar.standardAppearance.backgroundColor != expectedSurface
+            || tabBar.standardAppearance.stackedLayoutAppearance.normal.iconColor != expectedNormal
+            || tabBar.standardAppearance.stackedLayoutAppearance.selected.iconColor != expectedSelected
+            || tabBar.scrollEdgeAppearance?.backgroundEffect != nil
+            || tabBar.scrollEdgeAppearance?.backgroundColor != expectedSurface
+            || tabBar.scrollEdgeAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal
+            || tabBar.scrollEdgeAppearance?.stackedLayoutAppearance.selected.iconColor != expectedSelected {
+            return true
+        }
+        for item in tabBar.items ?? [] {
+            if item.standardAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal
+                || item.scrollEdgeAppearance?.stackedLayoutAppearance.normal.iconColor != expectedNormal {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func applyGlobalDefaults(palette: CloudTunePalette) {
+        let appearance = makeAppearance(palette: palette)
+        let proxy = UITabBar.appearance()
+        proxy.standardAppearance = appearance
+        proxy.scrollEdgeAppearance = appearance
+        proxy.isTranslucent = false
+        proxy.tintColor = resolvedColor(palette.accent, isDark: palette.isDark)
+        proxy.unselectedItemTintColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
+    }
+
+    static func apply(
+        to tabBar: UITabBar,
+        viewControllers: [UIViewController]? = nil,
+        palette: CloudTunePalette
+    ) {
+        let appearance = makeAppearance(palette: palette)
+        let surfaceColor = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
+        let normalColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
+        let selectedColor = resolvedColor(palette.accent, isDark: palette.isDark)
+
+        tabBar.standardAppearance = appearance
+        tabBar.scrollEdgeAppearance = appearance
+        tabBar.isTranslucent = false
+        tabBar.barTintColor = surfaceColor
+        tabBar.backgroundColor = surfaceColor
+        tabBar.tintColor = selectedColor
+        tabBar.unselectedItemTintColor = normalColor
+        for item in tabBar.items ?? [] {
+            item.standardAppearance = appearance
+            item.scrollEdgeAppearance = appearance
+        }
+        for vc in viewControllers ?? [] {
+            vc.tabBarItem.standardAppearance = appearance
+            vc.tabBarItem.scrollEdgeAppearance = appearance
+        }
+        tabBar.setNeedsLayout()
+        tabBar.layoutIfNeeded()
+    }
+
+    static func applyRecursively(in viewController: UIViewController?, view: UIView?, palette: CloudTunePalette) {
+        if let tabController = viewController as? UITabBarController {
+            apply(to: tabController.tabBar, viewControllers: tabController.viewControllers, palette: palette)
+        }
+        for child in viewController?.children ?? [] {
+            applyRecursively(in: child, view: nil, palette: palette)
+        }
+        if let tabBar = view as? UITabBar {
+            apply(to: tabBar, palette: palette)
+        }
+        for subview in view?.subviews ?? [] {
+            applyRecursively(in: nil, view: subview, palette: palette)
+        }
+    }
+}
+
+private struct IOSTabBarConfigurator: UIViewControllerRepresentable {
+    let palette: CloudTunePalette
+
+    func makeUIViewController(context: Context) -> TabBarSyncViewController {
+        IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: palette)
+        return TabBarSyncViewController(palette: palette)
+    }
+
+    func updateUIViewController(_ uiViewController: TabBarSyncViewController, context: Context) {
+        uiViewController.updatePalette(palette)
+    }
+}
+
+private final class TabBarObserverView: UIView {
+    var onWindowAttached: (() -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            onWindowAttached?()
+        }
+    }
+}
+
+private final class TabBarSyncViewController: UIViewController {
+    private var palette: CloudTunePalette
+    private var lastAppliedIsDark: Bool?
+
+    init(palette: CloudTunePalette) {
+        self.palette = palette
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let observer = TabBarObserverView(frame: .zero)
+        observer.backgroundColor = .clear
+        observer.isUserInteractionEnabled = false
+        observer.onWindowAttached = { [weak self] in
+            self?.syncTabBar(force: true)
+        }
+        self.view = observer
+    }
+
+    override func didMove(toParent parent: UIViewController?) {
+        super.didMove(toParent: parent)
+        syncTabBar(force: true)
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        syncTabBar(force: true)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        syncTabBar(force: false)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        syncTabBar(force: false)
+    }
+
+    func updatePalette(_ nextPalette: CloudTunePalette) {
+        let changed = (lastAppliedIsDark != nextPalette.isDark)
+        palette = nextPalette
+        if changed {
+            IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: nextPalette)
+        }
+        syncTabBar(force: changed)
+    }
+
+    private func syncTabBar(force: Bool) {
+        if let tabController = tabBarController {
+            let tabBar = tabController.tabBar
+            if force || lastAppliedIsDark != palette.isDark || IOSTabBarAppearanceHelper.needsApply(to: tabBar, palette: palette) {
+                IOSTabBarAppearanceHelper.apply(
+                    to: tabBar,
+                    viewControllers: tabController.viewControllers,
+                    palette: palette
+                )
+                lastAppliedIsDark = palette.isDark
+            }
+        } else if let window = viewIfLoaded?.window, force || lastAppliedIsDark != palette.isDark {
+            IOSTabBarAppearanceHelper.applyRecursively(in: window.rootViewController, view: window, palette: palette)
+            lastAppliedIsDark = palette.isDark
+        }
+        if force {
+            let capturedPalette = palette
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let tabController = self.tabBarController {
+                    IOSTabBarAppearanceHelper.apply(
+                        to: tabController.tabBar,
+                        viewControllers: tabController.viewControllers,
+                        palette: capturedPalette
+                    )
+                    self.lastAppliedIsDark = capturedPalette.isDark
+                } else if let window = self.viewIfLoaded?.window {
+                    IOSTabBarAppearanceHelper.applyRecursively(in: window.rootViewController, view: window, palette: capturedPalette)
+                    self.lastAppliedIsDark = capturedPalette.isDark
+                }
+            }
+        }
+    }
 }
 #endif

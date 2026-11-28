@@ -165,41 +165,44 @@ class AccountStore(val rootDir: File) {
         return target.readText(Charsets.UTF_8)
     }
 
-    private fun writeAtomicText(target: File, content: String) = synchronized(ioLock) {
-        target.parentFile?.mkdirs()
-        val bytes = content.toByteArray(Charsets.UTF_8)
-        val af = AtomicFile(target)
-        if (af.baseFile != null) {
-            val stream = af.startWrite()
+    private fun writeAtomicText(target: File, content: String) {
+        synchronized(ioLock) {
+            target.parentFile?.mkdirs()
+            val bytes = content.toByteArray(Charsets.UTF_8)
+            val af = AtomicFile(target)
+            if (af.baseFile != null) {
+                val stream = af.startWrite()
+                try {
+                    stream.write(bytes)
+                    af.finishWrite(stream)
+                    return
+                } catch (e: Exception) {
+                    af.failWrite(stream)
+                    throw e
+                }
+            }
+            val tmp = File(target.parentFile ?: File("."), ".${target.name}.${UUID.randomUUID()}.tmp")
             try {
-                stream.write(bytes)
-                af.finishWrite(stream)
-                return
-            } catch (e: Exception) {
-                af.failWrite(stream)
-                throw e
+                FileOutputStream(tmp).use { out ->
+                    out.write(bytes)
+                    out.fd.sync()
+                }
+                try {
+                    Files.move(
+                        tmp.toPath(),
+                        target.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE
+                    )
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                }
+            } finally {
+                if (tmp.exists()) {
+                    tmp.delete()
+                }
             }
-        }
-        val tmp = File(target.parentFile ?: File("."), ".${target.name}.${UUID.randomUUID()}.tmp")
-        try {
-            FileOutputStream(tmp).use { out ->
-                out.write(bytes)
-                out.fd.sync()
-            }
-            try {
-                Files.move(
-                    tmp.toPath(),
-                    target.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE
-                )
-            } catch (_: AtomicMoveNotSupportedException) {
-                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            }
-        } finally {
-            if (tmp.exists()) {
-                tmp.delete()
-            }
+            Unit
         }
     }
 

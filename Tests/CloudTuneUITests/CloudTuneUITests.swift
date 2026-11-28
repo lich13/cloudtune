@@ -122,6 +122,7 @@ struct CloudTuneUITests {
             var sessionIndex = 0
             var failDownloadUrlCalls = false
             var downloadUrlCallCount = 0
+            private var downloadUrlWaiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
             func setSessionIndex(_ idx: Int) { sessionIndex = idx }
             func setFailDownloadUrl(_ fail: Bool) {
@@ -129,6 +130,46 @@ struct CloudTuneUITests {
                 downloadUrlCallCount = 0
             }
             func getDownloadUrlCalls() -> Int { downloadUrlCallCount }
+
+            private func notifyDownloadUrlWaiters() {
+                var remaining: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+                for waiter in downloadUrlWaiters {
+                    if downloadUrlCallCount >= waiter.target {
+                        waiter.continuation.resume()
+                    } else {
+                        remaining.append(waiter)
+                    }
+                }
+                downloadUrlWaiters = remaining
+            }
+
+            private func removeWaiter(id: UUID) {
+                if let idx = downloadUrlWaiters.firstIndex(where: { $0.id == id }) {
+                    let waiter = downloadUrlWaiters.remove(at: idx)
+                    waiter.continuation.resume()
+                }
+            }
+
+            func waitUntilDownloadUrlCalls(atLeast target: Int, timeout: Duration = .seconds(5)) async -> Bool {
+                if downloadUrlCallCount >= target {
+                    return true
+                }
+                let waiterID = UUID()
+                var timeoutTask: Task<Void, Never>?
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    if downloadUrlCallCount >= target {
+                        continuation.resume()
+                    } else {
+                        downloadUrlWaiters.append((id: waiterID, target: target, continuation: continuation))
+                        timeoutTask = Task {
+                            try? await Task.sleep(for: timeout)
+                            self.removeWaiter(id: waiterID)
+                        }
+                    }
+                }
+                timeoutTask?.cancel()
+                return downloadUrlCallCount >= target
+            }
 
             func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
                 let url = request.url!
@@ -156,6 +197,7 @@ struct CloudTuneUITests {
                 if path.contains("getFileDownloadUrl.action") {
                     if query.contains("fileId=f-transient") {
                         downloadUrlCallCount += 1
+                        notifyDownloadUrlWaiters()
                         if failDownloadUrlCalls {
                             throw URLError(.cannotFindHost)
                         }
@@ -223,12 +265,28 @@ struct CloudTuneUITests {
         #expect(vm.statusMessage?.contains("已停止自动重试") == true)
 
         // 4) Manual logout or opening video in-app during retry backoff cancels stale retry
-        vm.retryBaseDelayMs = 80
+        @MainActor
+        func waitForRetryBackoffEntry() async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while vm.statusMessage?.contains("正在重试") != true {
+                guard ContinuousClock.now < deadline else {
+                    break
+                }
+                await Task.yield()
+                if vm.statusMessage?.contains("正在重试") != true {
+                    try await Task.sleep(for: .milliseconds(2))
+                }
+            }
+            #expect(vm.statusMessage?.contains("正在重试") == true)
+        }
+
+        vm.retryBaseDelayMs = 5_000
         await transport.setFailDownloadUrl(true)
         let videoInterruptTask = Task { @MainActor in
             await vm.playTrack(smallTrack)
         }
-        try await Task.sleep(for: .milliseconds(25))
+        #expect(await transport.waitUntilDownloadUrlCalls(atLeast: 1))
+        try await waitForRetryBackoffEntry()
         await vm.openVideoInApp(TrackSummary(id: "vid-1", name: "Concert.mp4", folderPath: "CD 2", sizeBytes: 4096))
         await videoInterruptTask.value
         #expect(await transport.getDownloadUrlCalls() == 1)
@@ -241,15 +299,17 @@ struct CloudTuneUITests {
         #expect(await transport.getDownloadUrlCalls() == 1 + PlaybackDecisionPolicy.maxRecoveryAttempts)
         #expect(vm.statusMessage?.contains("已停止自动重试") == true)
 
-        vm.retryBaseDelayMs = 80
+        vm.retryBaseDelayMs = 5_000
         await transport.setFailDownloadUrl(true)
         let retryTask = Task { @MainActor in
             await vm.playTrack(smallTrack)
         }
-        try await Task.sleep(for: .milliseconds(25))
+        #expect(await transport.waitUntilDownloadUrlCalls(atLeast: 1))
+        try await waitForRetryBackoffEntry()
         await vm.logout()
         await retryTask.value
         #expect(await transport.getDownloadUrlCalls() == 1)
+        vm.retryBaseDelayMs = 5
 
         // 5) Bootstrap must NOT overwrite an existing native Keychain credential with legacy Tauri settings.json
         final class PreseededKeychain: KeychainBackend, @unchecked Sendable {

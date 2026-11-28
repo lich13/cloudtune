@@ -251,6 +251,7 @@ public final class CloudTuneViewModel {
     @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
     private var qrPollTask: Task<Void, Never>?
     private var transferRefreshTask: Task<Void, Never>?
+    private var retrySleepTask: Task<Void, Error>?
     private var prefetchedTrackId: String?
     private var prefetchingTrackId: String?
     private var authGeneration: Int = 0
@@ -1031,6 +1032,8 @@ public final class CloudTuneViewModel {
         self.accountName = displayName
         self.credentialIssue = nil
         self.lastAppliedSettingsSeq = 0
+        self.retrySleepTask?.cancel()
+        self.retrySleepTask = nil
         self.playbackGeneration += 1
         self.externalVideoGeneration += 1
         self.cloudBrowserGeneration += 1
@@ -1097,6 +1100,8 @@ public final class CloudTuneViewModel {
         qrPollTask = nil
         transferRefreshTask?.cancel()
         transferRefreshTask = nil
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
         playbackGeneration += 1
         externalVideoGeneration += 1
         cloudBrowserGeneration += 1
@@ -1380,6 +1385,8 @@ public final class CloudTuneViewModel {
         isRecoveryRetry: Bool = false
     ) async {
         guard let accountId = activeAccountKey, let cacheStore else { return }
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
         playbackGeneration += 1
         let gen = playbackGeneration
         activeTrack = track
@@ -1705,8 +1712,22 @@ public final class CloudTuneViewModel {
             statusMessage = "播放波动，正在重试《\(track.name)》(\(attempt)/\(PlaybackDecisionPolicy.maxRecoveryAttempts))"
             let delayMs = max(0, retryBaseDelayMs) * attempt
             if delayMs > 0 {
-                do {
+                let sleepTask = Task {
                     try await Task.sleep(for: .milliseconds(delayMs))
+                }
+                retrySleepTask?.cancel()
+                retrySleepTask = sleepTask
+                defer {
+                    if retrySleepTask == sleepTask {
+                        retrySleepTask = nil
+                    }
+                }
+                do {
+                    try await withTaskCancellationHandler {
+                        try await sleepTask.value
+                    } onCancel: {
+                        sleepTask.cancel()
+                    }
                 } catch {
                     return
                 }
@@ -1826,6 +1847,8 @@ public final class CloudTuneViewModel {
 
     public func openVideoInApp(_ video: TrackSummary) async {
         guard isAuthenticated else { return }
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
         playbackGeneration += 1
         externalVideoGeneration += 1
         pendingExternalVideoChoice = nil

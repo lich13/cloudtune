@@ -1773,6 +1773,10 @@ class CloudTuneAppRuntime(
     }
 
     private fun prepareRuntimeVideoPlayer(playUrl: String) {
+        if (!enableLiveLoops) {
+            isVideoPlaying = true
+            return
+        }
         val ctx = appCtx ?: return
         val player = videoPlayer ?: run {
             val videoAttrs = AudioAttributes.Builder()

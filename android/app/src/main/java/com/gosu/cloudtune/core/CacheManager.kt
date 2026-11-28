@@ -45,13 +45,19 @@ class CacheManager(
         true
     }
 
-    fun finishWriteThrough(trackId: String) = synchronized(lock) {
-        activeWriters.remove(trackId)
+    fun finishWriteThrough(trackId: String) {
+        synchronized(lock) {
+            activeWriters.remove(trackId)
+            Unit
+        }
     }
 
-    fun setProtectedTrackIds(ids: Set<String>) = synchronized(lock) {
-        protectedTrackIds.clear()
-        protectedTrackIds.addAll(ids)
+    fun setProtectedTrackIds(ids: Set<String>) {
+        synchronized(lock) {
+            protectedTrackIds.clear()
+            protectedTrackIds.addAll(ids)
+            Unit
+        }
     }
 
     fun cacheFile(trackId: String, originalFileName: String): File =

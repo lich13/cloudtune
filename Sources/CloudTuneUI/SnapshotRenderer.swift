@@ -3,6 +3,9 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 public struct SnapshotPixelMetrics: Equatable, Sendable {
     public let width: Int
@@ -131,6 +134,9 @@ public enum SnapshotRenderer {
         isIPad: Bool
     ) throws -> Data {
         let size = isIPad ? CGSize(width: 1194, height: 834) : CGSize(width: 393, height: 852)
+        let palette = CloudTunePalette(isDark: isDark)
+        IOSTabBarAppearanceHelper.applyGlobalDefaults(palette: palette)
+
         let vm = CloudTuneViewModel.fixture(scene: scene, fixture: fixture)
         vm.appearancePreference = isDark ? .dark : .light
         let rootView = IOSRootView(viewModel: vm)
@@ -160,8 +166,11 @@ public enum SnapshotRenderer {
         window.layoutIfNeeded()
         controller.view.setNeedsLayout()
         controller.view.layoutIfNeeded()
+        IOSTabBarAppearanceHelper.applyRecursively(in: controller, view: window, palette: palette)
         RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        window.setNeedsLayout()
         window.layoutIfNeeded()
+        IOSTabBarAppearanceHelper.applyRecursively(in: controller, view: window, palette: palette)
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 2.0

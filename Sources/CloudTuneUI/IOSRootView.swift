@@ -1826,7 +1826,7 @@ enum IOSTabBarAppearanceHelper {
         let expectedSurface = resolvedColor(palette.surfacePrimary, isDark: palette.isDark)
         let expectedNormal = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
         let expectedSelected = resolvedColor(palette.accent, isDark: palette.isDark)
-        if tabBar.isTranslucent
+        if !tabBar.isTranslucent
             || tabBar.standardAppearance.backgroundEffect != nil
             || tabBar.standardAppearance.backgroundColor != expectedSurface
             || tabBar.standardAppearance.stackedLayoutAppearance.normal.iconColor != expectedNormal
@@ -1851,7 +1851,7 @@ enum IOSTabBarAppearanceHelper {
         let proxy = UITabBar.appearance()
         proxy.standardAppearance = appearance
         proxy.scrollEdgeAppearance = appearance
-        proxy.isTranslucent = false
+        proxy.isTranslucent = true
         proxy.tintColor = resolvedColor(palette.accent, isDark: palette.isDark)
         proxy.unselectedItemTintColor = resolvedColor(palette.inkSecondary, isDark: palette.isDark)
     }
@@ -1868,7 +1868,7 @@ enum IOSTabBarAppearanceHelper {
 
         tabBar.standardAppearance = appearance
         tabBar.scrollEdgeAppearance = appearance
-        tabBar.isTranslucent = false
+        tabBar.isTranslucent = true
         tabBar.barTintColor = surfaceColor
         tabBar.backgroundColor = surfaceColor
         tabBar.tintColor = selectedColor

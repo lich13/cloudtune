@@ -1036,23 +1036,25 @@ class Cloud189ProtocolAndProxyTest {
                 override fun clearCookies() {}
             }
 
-            @Volatile var savedCred = PersistedRefreshCredential.createOrNull("rt_r14_init", "r14@example.invalid")
+            val savedCred = java.util.concurrent.atomic.AtomicReference(
+                PersistedRefreshCredential.createOrNull("rt_r14_init", "r14@example.invalid")
+            )
             val failSave = AtomicBoolean(false)
             val delayClearMs = AtomicInteger(0)
             val gatedCredStore = object : CredentialStore {
-                override fun loadCredential(): PersistedRefreshCredential? = savedCred
+                override fun loadCredential(): PersistedRefreshCredential? = savedCred.get()
                 override fun saveCredential(credential: PersistedRefreshCredential) {
                     if (failSave.get()) {
                         throw CloudTuneException("Keystore 写入受阻")
                     }
-                    savedCred = credential
+                    savedCred.set(credential)
                 }
                 override fun clearCredential() {
                     val waitMs = delayClearMs.get()
                     if (waitMs > 0) {
                         Thread.sleep(waitMs.toLong())
                     }
-                    savedCred = null
+                    savedCred.set(null)
                 }
             }
 
@@ -1076,11 +1078,11 @@ class Cloud189ProtocolAndProxyTest {
             racingBoot.await()
             ioRuntime.cookieCleanupDeferred?.await()
             assertFalse("Immediate bootstrap() after logout() must not resurrect session", ioRuntime.isAuthenticated)
-            assertNull(savedCred)
+            assertNull(savedCred.get())
 
             // Issue 2b: logout() with slow cookieCleanupDeferred followed immediately by completeEmbeddedWebLogin()
             // MUST NOT let stale cookieCleanupDeferred wipe the newly saved login credential or let bootstrap() race
-            savedCred = PersistedRefreshCredential.createOrNull("rt_r14_seed2", "r14@example.invalid")
+            savedCred.set(PersistedRefreshCredential.createOrNull("rt_r14_seed2", "r14@example.invalid"))
             delayClearMs.set(0)
             ioRuntime.bootstrap().await()
             assertTrue(ioRuntime.isAuthenticated)
@@ -1095,7 +1097,7 @@ class Cloud189ProtocolAndProxyTest {
             runCatching { supersededBoot.await() }
             ioRuntime.cookieCleanupDeferred?.await()
             assertTrue("Rapid re-login after logout must stay authenticated", ioRuntime.isAuthenticated)
-            assertNotNull("Prior logout cleanup must NOT delete newly saved login credential", savedCred)
+            assertNotNull("Prior logout cleanup must NOT delete newly saved login credential", savedCred.get())
             delayClearMs.set(0)
 
             // Issue 8: Credential save warning preserved in completeEmbeddedWebLogin statusMessage

@@ -359,8 +359,9 @@ class CloudTuneSnapshotTest {
                     DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
                     DocumentsContract.Document.FLAG_SUPPORTS_RENAME
             }
-            val values = cursor.columnNames.map { col ->
-                when (col) {
+            val names = cursor.columnNames
+            val values = Array<Any?>(names.size) { idx ->
+                when (names[idx]) {
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME -> file.name
                     DocumentsContract.Document.COLUMN_MIME_TYPE -> mime
@@ -368,7 +369,7 @@ class CloudTuneSnapshotTest {
                     DocumentsContract.Document.COLUMN_FLAGS -> flags
                     else -> null
                 }
-            }.toTypedArray()
+            }
             cursor.addRow(values)
         }
 

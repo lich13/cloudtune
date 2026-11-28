@@ -14,7 +14,7 @@ import UIKit
 #endif
 
 package enum QRCodeGenerator {
-    nonisolated(unsafe) private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private static let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     /// Fixed warm-parchment `#F6F1E8` substrate and deep-pine `#13271F` modules across light & dark themes.

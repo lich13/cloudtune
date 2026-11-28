@@ -14,6 +14,45 @@ private func repoRootURL() -> URL {
         .deletingLastPathComponent()
 }
 
+private final class InMemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: PersistedRefreshCredential?
+    private var simulatedSaveError: Error?
+
+    init(_ initial: PersistedRefreshCredential? = nil, simulatedSaveError: Error? = nil) {
+        self.stored = initial
+        self.simulatedSaveError = simulatedSaveError
+    }
+
+    var current: PersistedRefreshCredential? {
+        lock.withLock { stored }
+    }
+
+    func setSaveError(_ error: Error?) {
+        lock.withLock { simulatedSaveError = error }
+    }
+
+    func readCredential() -> KeychainLoadResult {
+        lock.withLock {
+            if let stored { return .found(stored) }
+            return .notFound
+        }
+    }
+
+    func saveCredential(_ credential: PersistedRefreshCredential) throws {
+        try lock.withLock {
+            if let simulatedSaveError {
+                throw simulatedSaveError
+            }
+            stored = credential
+        }
+    }
+
+    func deleteCredential() {
+        lock.withLock { stored = nil }
+    }
+}
+
 @Suite("CloudTuneUI Draft Isolation & Offscreen Light/Dark Snapshot Verification")
 struct CloudTuneUITests {
     @Test("Settings draft edits stay isolated from committedSettings across module switches and validate on commit")
@@ -133,7 +172,13 @@ struct CloudTuneUITests {
         let transport = DynamicMockTransport()
         let client = Cloud189Client(transport: transport)
         let store = try AccountScopedStore(rootDirectory: root)
-        let vm = CloudTuneViewModel(cloudClient: client, accountStore: store, enableLiveObservers: false)
+        let isolatedKC = InMemoryKeychainBackend()
+        let vm = CloudTuneViewModel(
+            cloudClient: client,
+            accountStore: store,
+            keychainBackend: isolatedKC,
+            enableLiveObservers: false
+        )
         vm.retryBaseDelayMs = 5
 
         // 1) Two accounts that both omit loginName MUST NOT share storage bucket
@@ -273,9 +318,11 @@ struct CloudTuneUITests {
         }
 
         let store = try AccountScopedStore(rootDirectory: root)
+        let vmKeychain = InMemoryKeychainBackend()
         let vm = CloudTuneViewModel(
             cloudClient: Cloud189Client(transport: FolderMockTransport()),
             accountStore: store,
+            keychainBackend: vmKeychain,
             userDefaults: isolatedDefaults,
             enableLiveObservers: true
         )
@@ -318,6 +365,7 @@ struct CloudTuneUITests {
         let noProxyVM = CloudTuneViewModel(
             cloudClient: Cloud189Client(transport: FolderMockTransport()),
             accountStore: freshStore,
+            keychainBackend: InMemoryKeychainBackend(),
             userDefaults: isolatedDefaults,
             enableLiveObservers: false
         )
@@ -408,6 +456,7 @@ struct CloudTuneUITests {
         let raceVM = CloudTuneViewModel(
             cloudClient: Cloud189Client(transport: gatedTransport),
             accountStore: freshStore,
+            keychainBackend: InMemoryKeychainBackend(),
             userDefaults: isolatedDefaults,
             enableLiveObservers: false
         )
@@ -502,6 +551,277 @@ struct CloudTuneUITests {
         _ = win.makeFirstResponder(webView)
         #expect(MacShortcutFocusGuard.shouldAllowSingleKeyPlaybackShortcut(in: win) == false)
         #endif
+    }
+
+    @Test("Browser generation guard, simultaneous draft commit, concurrent settings mutation, login warning preservation, decoupled external video, and queue consumption")
+    @MainActor
+    func verifyBrowserGenerationSettingsAtomicityExternalVideoAndQueueConsumption() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-vm-r14-\(UUID().uuidString)")
+        let suiteName = "com.gosu.cloudtune.test.r14.\(UUID().uuidString)"
+        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            isolatedDefaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        actor SequencedMockTransport: CloudHTTPTransport {
+            private var slowFolderEntered: CheckedContinuation<Void, Never>?
+            private var slowFolderRelease: CheckedContinuation<Void, Never>?
+            private var hasEnteredSlowFolder = false
+            private var isSlowFolderReleased = false
+            private var videoUrlEntered: CheckedContinuation<Void, Never>?
+            private var videoUrlRelease: CheckedContinuation<Void, Never>?
+            private var hasEnteredVideoUrl = false
+            private var isVideoUrlReleased = false
+            private var downloadUrlCount = 0
+
+            func resetVideoGate() {
+                hasEnteredVideoUrl = false
+                isVideoUrlReleased = false
+                videoUrlEntered = nil
+                videoUrlRelease = nil
+            }
+
+            func resetSlowFolderGate() {
+                hasEnteredSlowFolder = false
+                isSlowFolderReleased = false
+                slowFolderEntered = nil
+                slowFolderRelease = nil
+            }
+
+            func waitUntilEnteredSlowFolder() async {
+                if hasEnteredSlowFolder { return }
+                await withCheckedContinuation { cont in slowFolderEntered = cont }
+            }
+
+            func releaseSlowFolder() {
+                isSlowFolderReleased = true
+                slowFolderRelease?.resume()
+                slowFolderRelease = nil
+            }
+
+            func waitUntilEnteredVideoUrl() async {
+                if hasEnteredVideoUrl { return }
+                await withCheckedContinuation { cont in videoUrlEntered = cont }
+            }
+
+            func releaseVideoUrl() {
+                isVideoUrlReleased = true
+                videoUrlRelease?.resume()
+                videoUrlRelease = nil
+            }
+
+            func getDownloadUrlCount() -> Int { downloadUrlCount }
+            func clearDownloadUrlCount() { downloadUrlCount = 0 }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                let path = url.path
+                let query = url.query ?? ""
+                if path.contains("getSessionForPC.action") {
+                    let b = #"{"res_code":0,"loginName":"r14@example.invalid","accessToken":"at","refreshToken":"rt_r14","sessionKey":"sk","sessionSecret":"ss"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                if path.contains("listFiles.action") {
+                    if query.contains("folderId=slow-a") {
+                        hasEnteredSlowFolder = true
+                        slowFolderEntered?.resume()
+                        slowFolderEntered = nil
+                        if !isSlowFolderReleased {
+                            await withCheckedContinuation { cont in slowFolderRelease = cont }
+                        }
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"a-1","name":"OldFolder.flac","size":1024}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    if query.contains("folderId=fast-b") {
+                        let b = #"{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"b-1","name":"NewFolder.flac","size":1024}]}}"#
+                        return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                    }
+                    let rootBody = #"{"res_code":0,"fileListAO":{"count":2,"folderList":[{"id":"slow-a","name":"SlowA"},{"id":"fast-b","name":"FastB"}],"fileList":[]}}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(rootBody.utf8), finalURL: url)
+                }
+                if path.contains("getFileDownloadUrl.action") {
+                    downloadUrlCount += 1
+                    if query.contains("fileId=vid-gated") {
+                        hasEnteredVideoUrl = true
+                        videoUrlEntered?.resume()
+                        videoUrlEntered = nil
+                        if !isVideoUrlReleased {
+                            await withCheckedContinuation { cont in videoUrlRelease = cont }
+                        }
+                    }
+                    let b = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/stream.bin"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(b.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+
+        let transport = SequencedMockTransport()
+        let store = try AccountScopedStore(rootDirectory: root)
+        let keychain = InMemoryKeychainBackend(simulatedSaveError: CloudTuneError.storageError("模拟钥匙串拒绝写入"))
+        let vm = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: transport),
+            accountStore: store,
+            keychainBackend: keychain,
+            userDefaults: isolatedDefaults,
+            enableLiveObservers: false
+        )
+
+        // Issue 8: Credential save failure warning MUST be preserved in final completeEmbeddedWebLogin statusMessage
+        await vm.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=warn")!,
+            cookies: []
+        )
+        #expect(vm.isAuthenticated == true)
+        #expect(vm.statusMessage?.contains("天翼官方网页登录成功") == true)
+        #expect(vm.statusMessage?.contains("钥匙串保存凭据失败") == true)
+        keychain.setSaveError(nil)
+
+        // Issue 3: Out-of-order folder navigation must keep newer folder, and post-logout completion must never mutate state
+        let slowBrowseTask = Task { @MainActor in
+            await vm.browseTo(scope: .cloud, folderId: "slow-a", nextBreadcrumbs: [.root, BreadcrumbItem(id: "slow-a", name: "SlowA")])
+        }
+        await transport.waitUntilEnteredSlowFolder()
+        await vm.browseTo(scope: .cloud, folderId: "fast-b", nextBreadcrumbs: [.root, BreadcrumbItem(id: "fast-b", name: "FastB")])
+        #expect(vm.cloudBrowser.payload?.currentFolderId == "fast-b")
+        await transport.releaseSlowFolder()
+        await slowBrowseTask.value
+        #expect(vm.cloudBrowser.payload?.currentFolderId == "fast-b")
+        #expect(vm.busyLabel == nil)
+
+        await transport.resetSlowFolderGate()
+        let logoutBrowseTask = Task { @MainActor in
+            await vm.browseTo(scope: .video, folderId: "slow-a", nextBreadcrumbs: [.root, BreadcrumbItem(id: "slow-a", name: "SlowA")])
+        }
+        await transport.waitUntilEnteredSlowFolder()
+        await vm.logout()
+        await transport.releaseSlowFolder()
+        await logoutBrowseTask.value
+        #expect(vm.videoBrowser.payload == nil)
+        #expect(vm.busyLabel == nil)
+
+        // Re-login cleanly for settings, write-through, video, and queue checks
+        await vm.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=clean")!,
+            cookies: []
+        )
+        #expect(vm.statusMessage == "天翼官方网页登录成功")
+
+        // Issue 6: Simultaneous dirty cacheLimitDraft + thread drafts must NOT clobber each other
+        vm.cacheLimitDraft = "3072"
+        vm.downloadThreadsDraft = "12"
+        vm.cacheThreadsDraft = "6"
+        #expect(await vm.commitCacheLimitDraft() == true)
+        #expect(vm.committedSettings.cacheLimitMb == 3072)
+        #expect(vm.downloadThreadsDraft == "12")
+        #expect(vm.cacheThreadsDraft == "6")
+        #expect(vm.hasUnsavedSettingsDrafts == true)
+
+        // Invalid thread draft rejects upfront in commitPendingSettingsDraftsIfNeeded without partial save
+        vm.cacheLimitDraft = "4096"
+        vm.downloadThreadsDraft = "99"
+        #expect(await vm.commitPendingSettingsDraftsIfNeeded() == false)
+        #expect(vm.committedSettings.cacheLimitMb == 3072)
+        #expect(vm.cacheLimitDraft == "4096")
+
+        // Valid simultaneous dirty cacheLimitDraft + thread drafts persist together atomically
+        vm.downloadThreadsDraft = "14"
+        vm.cacheThreadsDraft = "7"
+        #expect(await vm.commitPendingSettingsDraftsIfNeeded() == true)
+        #expect(vm.committedSettings.cacheLimitMb == 4096)
+        #expect(vm.committedSettings.downloadThreads == 14)
+        #expect(vm.committedSettings.cacheThreads == 7)
+        #expect(vm.hasUnsavedSettingsDrafts == false)
+
+        // Issue 7: Overlapping setAppearanceMode + updatePlaybackMode preserve both fields
+        async let appearanceTask: Void = vm.setAppearanceMode(.dark)
+        async let modeTask: Void = vm.updatePlaybackMode(.streamCache)
+        _ = await (appearanceTask, modeTask)
+        let acctKey = try #require(vm.accountStorageKey)
+        let diskSettings = try await store.loadSettings(for: acctKey)
+        #expect(vm.committedSettings.appearanceMode == .dark)
+        #expect(vm.committedSettings.playbackMode == .streamCache)
+        #expect(diskSettings.appearanceMode == .dark)
+        #expect(diskSettings.playbackMode == .streamCache)
+        #expect(diskSettings.cacheLimitMb == 4096)
+        #expect(diskSettings.downloadThreads == 14)
+
+        // Issue 11: prepareLoopbackStream: false skips getFileDownloadUrl.action on iOS external video prompt
+        await transport.clearDownloadUrlCount()
+        let iosVideo = TrackSummary(id: "vid-ios-prompt", name: "ConcertIOS.mp4", folderPath: "Videos", sizeBytes: 4096)
+        let iosDirect = await vm.requestExternalVideoPlayback(iosVideo, prepareLoopbackStream: false)
+        #expect(iosDirect == nil)
+        #expect(await transport.getDownloadUrlCount() == 0)
+        #expect(vm.pendingExternalVideoChoice == PendingExternalVideoChoice(video: iosVideo, streamURL: nil))
+        vm.pendingExternalVideoChoice = nil
+
+        // Issue 10: Background audio track auto-advance (incrementing playbackGeneration) MUST NOT abort external video prep
+        let gatedVideo = TrackSummary(id: "vid-gated", name: "Stage4K.mp4", folderPath: "Videos", sizeBytes: 8192)
+        let extTask = Task { @MainActor in
+            await vm.requestExternalVideoPlayback(gatedVideo, prepareLoopbackStream: true)
+        }
+        await transport.waitUntilEnteredVideoUrl()
+        await vm.playTrack(TrackSummary(id: "bg-song-1", name: "AutoAdvance.flac", folderPath: "Music", sizeBytes: 1024))
+        await transport.releaseVideoUrl()
+        _ = await extTask.value
+        #expect(vm.pendingExternalVideoChoice?.video.id == "vid-gated")
+
+        // Conversely, openVideoInApp MUST invalidate in-flight external video preparation
+        vm.pendingExternalVideoChoice = nil
+        await transport.resetVideoGate()
+        let cancelledByInAppTask = Task { @MainActor in
+            await vm.requestExternalVideoPlayback(gatedVideo, prepareLoopbackStream: true)
+        }
+        await transport.waitUntilEnteredVideoUrl()
+        let inAppTask = Task { @MainActor in
+            await vm.openVideoInApp(TrackSummary(id: "vid-inapp", name: "InApp.mp4", folderPath: "Videos", sizeBytes: 2048))
+        }
+        await transport.releaseVideoUrl()
+        _ = await cancelledByInAppTask.value
+        await inAppTask.value
+        #expect(vm.pendingExternalVideoChoice == nil)
+        #expect(vm.activeVideoTrack?.id == "vid-inapp")
+
+        // Issue 5: Write-through callback completing after track change must not overwrite newer track's nowPlayingMetadata
+        let songA = TrackSummary(id: "wt-song-a", name: "SongA.flac", folderPath: "AlbumA", sizeBytes: 1024)
+        let songB = TrackSummary(id: "wt-song-b", name: "SongB.flac", folderPath: "AlbumB", sizeBytes: 1024)
+        await vm.playTrack(songB)
+        #expect(vm.currentTrackId == "wt-song-b")
+        let fakeCachedURL = root.appendingPathComponent("nonexistent-a.flac")
+        await vm.handleWriteThroughCompleted(
+            accountHash: Cloud189Protocol.accountBucketHash(for: acctKey),
+            trackId: songA.id,
+            localFileURL: fakeCachedURL
+        )
+        #expect(vm.nowPlayingMetadata?.title == "SongB.flac")
+
+        // Issue 12 & 13: togglePlayback() when currentTrack == nil consumes upNextQueue first; playFromUpcomingQueue removes manual item
+        vm.activeTrack = nil
+        vm.currentTrackId = nil
+        let lib1 = TrackSummary(id: "lib-1", name: "Lib1.flac", folderPath: "Music", sizeBytes: 512)
+        let lib2 = TrackSummary(id: "lib-2", name: "Lib2.flac", folderPath: "Music", sizeBytes: 512)
+        let queuedCloud = TrackSummary(id: "queued-cloud", name: "QueuedCloud.flac", folderPath: "Cloud", sizeBytes: 512)
+        let manualSecond = TrackSummary(id: "manual-2", name: "Manual2.flac", folderPath: "Cloud", sizeBytes: 512)
+        vm.tracks = [lib1, lib2]
+        vm.shuffle = false
+        vm.loopMode = .off
+        vm.playNext(manualSecond)
+        vm.playNext(queuedCloud)
+        #expect(vm.upNextQueue.map(\.id) == ["queued-cloud", "manual-2"])
+
+        await vm.togglePlayback()
+        #expect(vm.currentTrack?.id == "queued-cloud")
+        #expect(vm.upNextQueue.map(\.id) == ["manual-2"])
+
+        await vm.playFromUpcomingQueue(manualSecond)
+        #expect(vm.currentTrack?.id == "manual-2")
+        #expect(vm.upNextQueue.isEmpty)
+        await vm.playAdjacent(direction: 1)
+        #expect(vm.currentTrack?.id == "lib-1")
     }
 
     @Test("QRCodeGenerator maintains high-contrast dark-on-light substrate")

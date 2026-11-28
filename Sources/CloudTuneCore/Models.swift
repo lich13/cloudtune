@@ -640,8 +640,9 @@ public enum PlaybackQueueResolver {
             queuedIds.insert(currentId)
         }
 
+        let anchorId = upNextQueue.last?.id ?? currentTrack?.id
         let startIndex: Int
-        if let currentId = currentTrack?.id, let idx = ordered.firstIndex(where: { $0.id == currentId }) {
+        if let anchorId, let idx = ordered.firstIndex(where: { $0.id == anchorId }) {
             startIndex = idx + 1
         } else {
             startIndex = 0

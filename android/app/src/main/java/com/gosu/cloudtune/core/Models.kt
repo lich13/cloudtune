@@ -413,7 +413,8 @@ object PlaybackQueueResolver {
         val seen = out.mapTo(HashSet()) { it.id }
         currentTrack?.id?.let { seen.add(it) }
 
-        val startIndex = currentTrack?.id?.let { id ->
+        val anchorId = upNextQueue.lastOrNull()?.id ?: currentTrack?.id
+        val startIndex = anchorId?.let { id ->
             val idx = ordered.indexOfFirst { it.id == id }
             if (idx >= 0) idx + 1 else 0
         } ?: 0

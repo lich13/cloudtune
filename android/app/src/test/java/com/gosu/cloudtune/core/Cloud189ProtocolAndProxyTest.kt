@@ -18,10 +18,13 @@ import java.nio.file.Files
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -264,17 +267,49 @@ class Cloud189ProtocolAndProxyTest {
         vm.activeModule = ModuleTab.SETTINGS
         assertEquals("64", vm.cacheLimitDraft)
         assertEquals(2048L, vm.committedSettings.cacheLimitMb)
-        assertFalse(vm.commitCacheLimitDraft())
+        assertFalse(vm.commitCacheLimitDraftAsync())
         assertNotNull(vm.settingsValidationError)
         assertEquals(vm.settingsValidationError, vm.statusMessage)
         assertEquals(2048L, vm.committedSettings.cacheLimitMb)
 
         vm.cacheLimitDraft = "4096"
+        vm.runtime.downloadThreadsDraft = "12"
+        vm.runtime.cacheThreadsDraft = "6"
         vm.noteDraftEdited()
         assertNull(vm.settingsValidationError)
         assertNull(vm.statusMessage)
-        assertTrue(vm.commitCacheLimitDraft())
+        assertTrue(vm.commitCacheLimitDraftAsync())
         assertEquals(4096L, vm.committedSettings.cacheLimitMb)
+        assertEquals("12", vm.runtime.downloadThreadsDraft)
+        assertEquals("6", vm.runtime.cacheThreadsDraft)
+        assertTrue(vm.commitTransferThreadsDraftAsync())
+        assertEquals(12, vm.committedSettings.downloadThreads)
+        assertEquals(6, vm.committedSettings.cacheThreads)
+
+        // 5) PlaybackQueueResolver.upcomingPreview anchors library continuation on upNextQueue.last ?? currentTrack
+        val qa = TrackSummary("qa", "01.flac", "A", 100L)
+        val qb = TrackSummary("qb", "02.flac", "A", 100L)
+        val qc = TrackSummary("qc", "03.flac", "A", 100L)
+        val libABC = listOf(qa, qb, qc)
+        val previewOff = PlaybackQueueResolver.upcomingPreview(
+            currentTrack = qa,
+            libraryTracks = libABC,
+            upNextQueue = listOf(qc),
+            shuffle = false,
+            shuffleOrderIds = emptyList(),
+            loopMode = LoopMode.OFF
+        )
+        assertEquals(listOf("qc"), previewOff.map { it.id })
+
+        val previewAll = PlaybackQueueResolver.upcomingPreview(
+            currentTrack = qa,
+            libraryTracks = libABC,
+            upNextQueue = listOf(qc),
+            shuffle = false,
+            shuffleOrderIds = emptyList(),
+            loopMode = LoopMode.ALL
+        )
+        assertEquals(listOf("qc", "qb"), previewAll.map { it.id })
     }
 
     @Test
@@ -911,12 +946,14 @@ class Cloud189ProtocolAndProxyTest {
             acctPaths.settingsFile.mkdirs()
             val prevLimit = runtime.committedSettings.cacheLimitMb
             runtime.cacheLimitDraft = "4096"
-            val ok = runtime.commitCacheLimitDraft()
-            assertFalse("Write failure must return false", ok)
-            assertFalse("Async write failure on Dispatchers.IO must also return false", runtime.commitCacheLimitDraftAsync())
+            runtime.commitCacheLimitDraft()
+            assertFalse("Async write failure must return false", runtime.commitCacheLimitDraftAsync())
             assertEquals(prevLimit, runtime.committedSettings.cacheLimitMb)
             assertEquals("4096", runtime.cacheLimitDraft)
             assertTrue(runtime.statusMessage?.contains("保存设置失败") == true)
+            runtime.downloadThreadsDraft = "10"
+            runtime.cacheThreadsDraft = "5"
+            assertFalse("Async thread write failure must return false", runtime.commitTransferThreadsDraftAsync())
             assertEquals("传输中", TransferStatus("d1", "a.flac", "download", "running").localizedStateLabel)
             assertEquals("已暂停", TransferStatus("d2", "a.flac", "download", "paused").localizedStateLabel)
 
@@ -928,7 +965,7 @@ class Cloud189ProtocolAndProxyTest {
                 credentialStore = memCredStore,
                 limiter = GlobalTransferLimiter(8),
                 enableLiveLoops = false,
-                ioDispatcher = kotlinx.coroutines.Dispatchers.IO
+                ioDispatcher = Dispatchers.IO
             )
             noProxyRuntime.bootstrap().await()
             noProxyRuntime.cacheLimitDraft = "8192"
@@ -940,6 +977,194 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals(ModuleTab.MUSIC, runtime.activeModule)
             assertFalse(runtime.isShowingWebLoginDialog)
             runtime.streamServer?.close()
+            Unit
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyLogoutBootstrapRaceBrowserGenerationLoginWarningWriteThroughAndQueueConsumption(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-r14-android").toFile()
+        try {
+            var slowFolderEntered = CompletableDeferred<Unit>()
+            var slowFolderRelease = CompletableDeferred<Unit>()
+            val transport = object : CloudHttpTransport {
+                override suspend fun send(
+                    url: String,
+                    method: String,
+                    headers: Map<String, String>,
+                    formBody: List<Pair<String, String>>?
+                ): CloudHttpResponse {
+                    return when {
+                        url.contains("refreshToken.do") -> {
+                            val b = """{"res_code":0,"accessToken":"at_r14","refreshToken":"rt_r14_next"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("getSessionForPC.action") -> {
+                            val b = """{"res_code":0,"loginName":"r14@example.invalid","sessionKey":"sk_r14","sessionSecret":"ss_r14","refreshToken":"rt_r14_next"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("listFiles.action") -> {
+                            when {
+                                url.contains("folderId=slow-a") -> {
+                                    slowFolderEntered.complete(Unit)
+                                    slowFolderRelease.await()
+                                    val b = """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"slow-1","name":"Slow.flac","size":1024}]}}"""
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                }
+                                url.contains("folderId=fast-b") -> {
+                                    val b = """{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[{"id":"fast-1","name":"Fast.flac","size":1024}]}}"""
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                }
+                                else -> {
+                                    val b = """{"res_code":0,"fileListAO":{"count":0,"folderList":[],"fileList":[]}}"""
+                                    CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                                }
+                            }
+                        }
+                        url.contains("getFileDownloadUrl.action") -> {
+                            val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/track.flac"}"""
+                            CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        else -> CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                    }
+                }
+                override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
+                override fun clearCookies() {}
+            }
+
+            @Volatile var savedCred = PersistedRefreshCredential.createOrNull("rt_r14_init", "r14@example.invalid")
+            val failSave = AtomicBoolean(false)
+            val delayClearMs = AtomicInteger(0)
+            val gatedCredStore = object : CredentialStore {
+                override fun loadCredential(): PersistedRefreshCredential? = savedCred
+                override fun saveCredential(credential: PersistedRefreshCredential) {
+                    if (failSave.get()) {
+                        throw CloudTuneException("Keystore 写入受阻")
+                    }
+                    savedCred = credential
+                }
+                override fun clearCredential() {
+                    val waitMs = delayClearMs.get()
+                    if (waitMs > 0) {
+                        Thread.sleep(waitMs.toLong())
+                    }
+                    savedCred = null
+                }
+            }
+
+            val store = AccountStore(tempRoot)
+            val ioRuntime = CloudTuneAppRuntime(
+                appContext = null,
+                cloudClient = Cloud189Client(transport),
+                accountStore = store,
+                credentialStore = gatedCredStore,
+                limiter = GlobalTransferLimiter(8),
+                enableLiveLoops = false,
+                ioDispatcher = Dispatchers.IO
+            )
+
+            // Issue 2: logout() followed immediately by bootstrap() awaits cookieCleanupDeferred and NEVER restores logged-out session
+            ioRuntime.bootstrap().await()
+            assertTrue(ioRuntime.isAuthenticated)
+            delayClearMs.set(80)
+            ioRuntime.logout()
+            val racingBoot = ioRuntime.bootstrap()
+            racingBoot.await()
+            ioRuntime.cookieCleanupDeferred?.await()
+            assertFalse("Immediate bootstrap() after logout() must not resurrect session", ioRuntime.isAuthenticated)
+            assertNull(savedCred)
+            delayClearMs.set(0)
+
+            // Issue 8: Credential save warning preserved in completeEmbeddedWebLogin statusMessage
+            val rt = CloudTuneAppRuntime(
+                appContext = null,
+                cloudClient = Cloud189Client(transport),
+                accountStore = store,
+                credentialStore = gatedCredStore,
+                limiter = GlobalTransferLimiter(8),
+                enableLiveLoops = false
+            )
+            failSave.set(true)
+            rt.completeEmbeddedWebLogin(
+                "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=warn",
+                emptyMap()
+            )
+            repeat(40) { if (rt.isAuthenticated) return@repeat; delay(15L) }
+            assertTrue(rt.isAuthenticated)
+            assertTrue("Expected login success prefix, got: ${rt.statusMessage}", rt.statusMessage?.contains("天翼官方网页一键登录成功") == true)
+            assertTrue("Expected credential warning in statusMessage, got: ${rt.statusMessage}", rt.statusMessage?.contains("登录凭据保存异常") == true)
+            failSave.set(false)
+
+            // Issue 3: Out-of-order browseTo keeps newer folder, and post-logout completion does not mutate state
+            rt.browseTo(BrowserScope.CLOUD, "slow-a", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("slow-a", "SlowA")))
+            withTimeout(5000L) { slowFolderEntered.await() }
+            rt.browseTo(BrowserScope.CLOUD, "fast-b", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("fast-b", "FastB")))
+            assertEquals("fast-b", rt.cloudBrowser.payload?.currentFolderId)
+            slowFolderRelease.complete(Unit)
+            delay(30L)
+            assertEquals("Older folder response must not overwrite newer folder", "fast-b", rt.cloudBrowser.payload?.currentFolderId)
+            assertNull(rt.busyLabel)
+
+            slowFolderEntered = CompletableDeferred()
+            slowFolderRelease = CompletableDeferred()
+            rt.browseTo(BrowserScope.VIDEO, "slow-a", listOf(BreadcrumbItem.ROOT, BreadcrumbItem("slow-a", "SlowA")))
+            withTimeout(5000L) { slowFolderEntered.await() }
+            rt.logout()
+            slowFolderRelease.complete(Unit)
+            rt.cookieCleanupDeferred?.await()
+            delay(30L)
+            assertNull(rt.videoBrowser.payload)
+            assertNull(rt.busyLabel)
+
+            // Re-login for write-through and queue consumption checks
+            rt.completeEmbeddedWebLogin(
+                "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=ok",
+                emptyMap()
+            )
+            repeat(40) { if (rt.isAuthenticated) return@repeat; delay(15L) }
+            val acctKey = rt.accountStorageKey!!
+
+            // Issue 5: handleWriteThroughCompleted after track change must not overwrite newer track title
+            val songB = TrackSummary("wt-b", "CurrentSongB.flac", "Album", 1024L)
+            rt.updatePlaybackMode(PlaybackMode.STREAM_CACHE)
+            rt.playTrack(songB)
+            repeat(40) { if (rt.currentTrackId == "wt-b") return@repeat; delay(15L) }
+            rt.handleWriteThroughCompleted(
+                accountHash = Cloud189Protocol.accountBucketHash(acctKey),
+                trackId = "wt-a-stale",
+                localFile = File(tempRoot, "missing.flac")
+            )
+            assertEquals("CurrentSongB.flac", rt.nowPlayingTitle)
+
+            // Issue 12 & 13: togglePlayback() consumes upNextQueue first when currentTrack == null; playFromUpcomingQueue removes manual item
+            rt.activeTrack = null
+            rt.currentTrackId = null
+            val lib1 = TrackSummary("lib-1", "Lib1.flac", "Music", 512L)
+            val lib2 = TrackSummary("lib-2", "Lib2.flac", "Music", 512L)
+            val queuedCloud = TrackSummary("q-cloud", "QueuedCloud.flac", "Cloud", 512L)
+            val manual2 = TrackSummary("manual-2", "Manual2.flac", "Cloud", 512L)
+            rt.tracks = listOf(lib1, lib2)
+            rt.shuffle = false
+            rt.loopMode = LoopMode.OFF
+            rt.playNext(manual2)
+            rt.playNext(queuedCloud)
+            assertEquals(listOf("q-cloud", "manual-2"), rt.upNextQueue.map { it.id })
+
+            rt.togglePlayback()
+            repeat(40) { if (rt.currentTrackId == "q-cloud") return@repeat; delay(15L) }
+            assertEquals("q-cloud", rt.currentTrack?.id)
+            assertEquals(listOf("manual-2"), rt.upNextQueue.map { it.id })
+
+            rt.playFromUpcomingQueue(manual2)
+            repeat(40) { if (rt.currentTrackId == "manual-2") return@repeat; delay(15L) }
+            assertEquals("manual-2", rt.currentTrack?.id)
+            assertTrue(rt.upNextQueue.isEmpty())
+
+            rt.playAdjacent(1)
+            repeat(40) { if (rt.currentTrackId == "lib-1") return@repeat; delay(15L) }
+            assertEquals("lib-1", rt.currentTrack?.id)
             Unit
         } finally {
             tempRoot.deleteRecursively()

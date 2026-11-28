@@ -101,6 +101,18 @@ public actor AccountScopedStore {
         try data.write(to: p.settingsURL, options: .atomic)
     }
 
+    @discardableResult
+    public func mutateSettings(
+        for accountId: String,
+        base: AccountSettings = AccountSettings(),
+        _ transform: @Sendable (inout AccountSettings) -> Void
+    ) throws -> AccountSettings {
+        var settings = (try loadSettingsIfPresent(for: accountId)) ?? base
+        transform(&settings)
+        try saveSettings(settings, for: accountId)
+        return settings
+    }
+
     public func loadLibrary(for accountId: String) throws -> [TrackSummary] {
         let p = try paths(for: accountId)
         guard let data = try? Data(contentsOf: p.libraryURL) else {
@@ -120,6 +132,19 @@ public actor AccountScopedStore {
         baseSettings: AccountSettings? = nil,
         for accountId: String
     ) throws -> String {
+        try saveExportDirectoryBookmarkAndSettings(
+            folderURL,
+            baseSettings: baseSettings,
+            for: accountId
+        ).displayName
+    }
+
+    public func saveExportDirectoryBookmarkAndSettings(
+        _ folderURL: URL,
+        baseSettings: AccountSettings? = nil,
+        for accountId: String,
+        afterMutate: (@Sendable () -> Void)? = nil
+    ) throws -> (displayName: String, settings: AccountSettings) {
         let p = try paths(for: accountId)
         let didStart = folderURL.startAccessingSecurityScopedResource()
         defer {
@@ -138,10 +163,12 @@ public actor AccountScopedStore {
             relativeTo: nil
         )
         try bookmarkData.write(to: p.exportBookmarkURL, options: .atomic)
-        var settings = (try loadSettingsIfPresent(for: accountId)) ?? baseSettings ?? AccountSettings()
-        settings.exportFolderDisplayName = folderURL.lastPathComponent
-        try saveSettings(settings, for: accountId)
-        return folderURL.lastPathComponent
+        let displayName = folderURL.lastPathComponent
+        let updated = try mutateSettings(for: accountId, base: baseSettings ?? AccountSettings()) { settings in
+            settings.exportFolderDisplayName = displayName
+            afterMutate?()
+        }
+        return (displayName, updated)
     }
 
     /// Exports a verified staged file into the user-selected folder using security-scoped bookmark + NSFileCoordinator.

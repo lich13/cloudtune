@@ -1207,7 +1207,7 @@ private fun NowPlayingFullSheetContent(
                 track = upcoming,
                 isActive = false,
                 trailingLabel = if (isManualUpNext) "插播" else "待播",
-                onPlay = { runtime.playTrack(upcoming) },
+                onPlay = { runtime.playFromUpcomingQueue(upcoming) },
                 onPlayNext = if (isManualUpNext) ({ runtime.removeFromQueue(upcoming.id) }) else ({ runtime.playNext(upcoming) }),
                 playNextActionTitle = if (isManualUpNext) "移出插播" else "下一首"
             )
@@ -1386,7 +1386,7 @@ private fun TabletNowPlayingQueuePane(
                     track = upcoming,
                     isActive = false,
                     trailingLabel = if (isManual) "插播" else "待播",
-                    onPlay = { runtime.playTrack(upcoming) },
+                    onPlay = { runtime.playFromUpcomingQueue(upcoming) },
                     onPlayNext = if (isManual) ({ runtime.removeFromQueue(upcoming.id) }) else null,
                     playNextActionTitle = if (isManual) "移出" else null
                 )
@@ -1405,8 +1405,11 @@ private fun MusicLibraryContent(runtime: CloudTuneAppRuntime) {
         val queued = pendingTrack
         pendingTrack = null
         if (uri != null) {
-            runtime.onSafTreeSelected(context, uri)
-            if (queued != null) runtime.enqueueDownload(context, queued)
+            runtime.onSafTreeSelected(context, uri) { savedTreeUri ->
+                if (queued != null) {
+                    runtime.enqueueDownload(context, queued, treeUriString = savedTreeUri)
+                }
+            }
         }
     }
 
@@ -1537,14 +1540,16 @@ private fun CloudBrowserContent(runtime: CloudTuneAppRuntime) {
     val safLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         val fileTarget = pendingFile
         val folderTarget = pendingFolder
+        val capturedPane = pane
         pendingFile = null
         pendingFolder = false
         if (uri != null) {
-            runtime.onSafTreeSelected(context, uri)
-            if (fileTarget != null) {
-                runtime.enqueueDownload(context, fileTarget)
-            } else if (folderTarget) {
-                runtime.enqueueCurrentFolderDownload(context, pane)
+            runtime.onSafTreeSelected(context, uri) { savedTreeUri ->
+                if (fileTarget != null) {
+                    runtime.enqueueDownload(context, fileTarget, treeUriString = savedTreeUri)
+                } else if (folderTarget) {
+                    runtime.enqueueCurrentFolderDownload(context, capturedPane, treeUriString = savedTreeUri)
+                }
             }
         }
     }

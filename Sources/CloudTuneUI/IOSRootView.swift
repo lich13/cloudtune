@@ -550,7 +550,7 @@ public struct IOSRootView: View {
                     ForEach(viewModel.upcomingTracks) { item in
                         let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
                         Button {
-                            Task { await viewModel.playTrack(item) }
+                            Task { await viewModel.playFromUpcomingQueue(item) }
                         } label: {
                             HStack(spacing: 8) {
                                 ArtworkView(
@@ -863,7 +863,7 @@ public struct IOSRootView: View {
                         let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
                         HStack(spacing: 10) {
                             Button {
-                                Task { await viewModel.playTrack(item) }
+                                Task { await viewModel.playFromUpcomingQueue(item) }
                             } label: {
                                 HStack(spacing: 10) {
                                     ArtworkView(
@@ -1181,7 +1181,7 @@ public struct IOSRootView: View {
                                 }
                                 SecondaryActionButton("其他应用", systemImage: "square.and.arrow.up", palette: palette) {
                                     Task {
-                                        if let cachedURL = await viewModel.requestExternalVideoPlayback(video) {
+                                        if let cachedURL = await viewModel.requestExternalVideoPlayback(video, prepareLoopbackStream: false) {
                                             viewModel.shareFileURL = cachedURL
                                             isShowingShareSheet = true
                                         }

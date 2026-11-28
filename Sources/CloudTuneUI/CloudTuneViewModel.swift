@@ -43,6 +43,58 @@ private final class WriteThroughEventRelay: @unchecked Sendable {
     }
 }
 
+private final class SettingsMutationSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.withLock {
+            current += 1
+            return current
+        }
+    }
+}
+
+private final class SettingsMutationSequenceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func store(_ next: UInt64) {
+        lock.withLock { value = next }
+    }
+
+    func load() -> UInt64 {
+        lock.withLock { value }
+    }
+}
+
+private final class IsolatedFixtureKeychainBackend: KeychainBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: PersistedRefreshCredential?
+
+    func readCredential() -> KeychainLoadResult {
+        lock.withLock {
+            if let stored { return .found(stored) }
+            return .notFound
+        }
+    }
+
+    func saveCredential(_ credential: PersistedRefreshCredential) throws {
+        lock.withLock { stored = credential }
+    }
+
+    func deleteCredential() {
+        lock.withLock { stored = nil }
+    }
+}
+
+private enum DraftSyncScope {
+    case none
+    case cacheLimitOnly
+    case threadsOnly
+    case all
+}
+
 @MainActor
 @Observable
 public final class CloudTuneViewModel {
@@ -203,6 +255,13 @@ public final class CloudTuneViewModel {
     private var prefetchingTrackId: String?
     private var playbackGeneration: Int = 0
     private var externalVideoGeneration: Int = 0
+    private var cloudBrowserGeneration: Int = 0
+    private var videoBrowserGeneration: Int = 0
+    private var cloudBrowserIdleGeneration: Int = 0
+    private var videoBrowserIdleGeneration: Int = 0
+    private var browserBusyToken: Int = 0
+    private let settingsSequence = SettingsMutationSequence()
+    private var lastAppliedSettingsSeq: UInt64 = 0
     private var recoveryAttempts: Int = 0
     private var currentPlaybackIsLoopback: Bool = false
     private var wasPlayingBeforeInterruption: Bool = false
@@ -294,7 +353,11 @@ public final class CloudTuneViewModel {
         } catch {
             isolatedStore = nil
         }
-        let vm = CloudTuneViewModel(accountStore: isolatedStore, enableLiveObservers: false)
+        let vm = CloudTuneViewModel(
+            accountStore: isolatedStore,
+            keychainBackend: IsolatedFixtureKeychainBackend(),
+            enableLiveObservers: false
+        )
         let resolvedAppearance = fixture.settings.appearanceMode ?? .system
         let committed = AccountSettings(
             musicFolder: fixture.currentFolder,
@@ -446,9 +509,23 @@ public final class CloudTuneViewModel {
     // MARK: - Settings Draft Safety & Checked Persistence
 
     public func syncDraftsFromCommitted() {
-        cacheLimitDraft = String(committedSettings.cacheLimitMb)
-        downloadThreadsDraft = String(committedSettings.downloadThreads)
-        cacheThreadsDraft = String(committedSettings.cacheThreads)
+        applyDraftSync(.all)
+    }
+
+    private func applyDraftSync(_ scope: DraftSyncScope) {
+        switch scope {
+        case .none:
+            return
+        case .cacheLimitOnly:
+            cacheLimitDraft = String(committedSettings.cacheLimitMb)
+        case .threadsOnly:
+            downloadThreadsDraft = String(committedSettings.downloadThreads)
+            cacheThreadsDraft = String(committedSettings.cacheThreads)
+        case .all:
+            cacheLimitDraft = String(committedSettings.cacheLimitMb)
+            downloadThreadsDraft = String(committedSettings.downloadThreads)
+            cacheThreadsDraft = String(committedSettings.cacheThreads)
+        }
         if let previousError = settingsValidationError, statusMessage == previousError {
             statusMessage = nil
         }
@@ -482,37 +559,128 @@ public final class CloudTuneViewModel {
         return true
     }
 
+    private func parseValidatedCacheLimitDraft() -> UInt64? {
+        guard let parsed = UInt64(cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
+              parsed >= AccountSettings.minCacheLimitMB else {
+            let msg = "缓存上限至少设为 256 MB。"
+            settingsValidationError = msg
+            statusMessage = msg
+            return nil
+        }
+        return parsed
+    }
+
+    private func parseValidatedTransferThreadsDraft() -> (downloadThreads: Int, cacheThreads: Int)? {
+        guard let dl = Int(downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1...AccountSettings.maxDownloadThreads).contains(dl) else {
+            let msg = "下载线程范围是 1-\(AccountSettings.maxDownloadThreads)"
+            settingsValidationError = msg
+            statusMessage = msg
+            return nil
+        }
+        guard let ct = Int(cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1...AccountSettings.maxCacheThreads).contains(ct) else {
+            let msg = "缓存线程范围是 1-\(AccountSettings.maxCacheThreads)"
+            settingsValidationError = msg
+            statusMessage = msg
+            return nil
+        }
+        return (dl, ct)
+    }
+
     @discardableResult
     public func commitPendingSettingsDraftsIfNeeded() async -> Bool {
-        if cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb) {
-            guard await commitCacheLimitDraft() else { return false }
+        let cacheDirty = cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb)
+        let threadsDirty = downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
+            || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads)
+        guard cacheDirty || threadsDirty else {
+            return true
         }
-        if downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
-            || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads) {
-            guard await commitTransferThreadsDraft() else { return false }
+
+        let parsedCacheLimit: UInt64?
+        if cacheDirty {
+            guard let validLimit = parseValidatedCacheLimitDraft() else { return false }
+            parsedCacheLimit = validLimit
+        } else {
+            parsedCacheLimit = nil
+        }
+
+        let parsedThreads: (downloadThreads: Int, cacheThreads: Int)?
+        if threadsDirty {
+            guard let validThreads = parseValidatedTransferThreadsDraft() else { return false }
+            parsedThreads = validThreads
+        } else {
+            parsedThreads = nil
+        }
+
+        let successMessage: String = switch (cacheDirty, threadsDirty) {
+        case (true, true): "设置已更新"
+        case (true, false): "缓存限制已更新"
+        case (false, true): "传输参数已更新"
+        case (false, false): "设置已更新"
+        }
+        let syncScope: DraftSyncScope = switch (cacheDirty, threadsDirty) {
+        case (true, true): .all
+        case (true, false): .cacheLimitOnly
+        case (false, true): .threadsOnly
+        case (false, false): .none
+        }
+
+        guard await mutateCommittedSettings(
+            successMessage: successMessage,
+            draftSync: syncScope,
+            { settings in
+                if let parsedCacheLimit {
+                    settings.cacheLimitMb = parsedCacheLimit
+                }
+                if let parsedThreads {
+                    settings.downloadThreads = parsedThreads.downloadThreads
+                    settings.cacheThreads = parsedThreads.cacheThreads
+                }
+            }
+        ) else {
+            return false
+        }
+
+        if parsedCacheLimit != nil, let capturedStore = cacheStore {
+            let expectedAccount = activeAccountKey
+            do {
+                let pruned = try await capturedStore.pruneToLimit(limitBytes: committedSettings.cacheLimitBytes)
+                if isAuthenticated, activeAccountKey == expectedAccount, cacheStore === capturedStore {
+                    cacheUsageBytes = pruned
+                }
+            } catch {
+                if isAuthenticated, activeAccountKey == expectedAccount {
+                    statusMessage = "缓存清理遇到异常：\(error.localizedDescription)"
+                }
+            }
         }
         return true
     }
 
     @discardableResult
     public func commitCacheLimitDraft() async -> Bool {
-        guard let parsed = UInt64(cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
-              parsed >= AccountSettings.minCacheLimitMB else {
-            let msg = "缓存上限至少设为 256 MB。"
-            settingsValidationError = msg
-            statusMessage = msg
+        guard let parsed = parseValidatedCacheLimitDraft() else {
             return false
         }
-        var next = committedSettings
-        next.cacheLimitMb = parsed
-        guard await persistCommittedSettings(next, successMessage: "缓存限制已更新") else {
+        guard await mutateCommittedSettings(
+            successMessage: "缓存限制已更新",
+            draftSync: .cacheLimitOnly,
+            { $0.cacheLimitMb = parsed }
+        ) else {
             return false
         }
-        if let cacheStore {
+        if let capturedStore = cacheStore {
+            let expectedAccount = activeAccountKey
             do {
-                cacheUsageBytes = try await cacheStore.pruneToLimit(limitBytes: next.cacheLimitBytes)
+                let pruned = try await capturedStore.pruneToLimit(limitBytes: committedSettings.cacheLimitBytes)
+                if isAuthenticated, activeAccountKey == expectedAccount, cacheStore === capturedStore {
+                    cacheUsageBytes = pruned
+                }
             } catch {
-                statusMessage = "缓存清理遇到异常：\(error.localizedDescription)"
+                if isAuthenticated, activeAccountKey == expectedAccount {
+                    statusMessage = "缓存清理遇到异常：\(error.localizedDescription)"
+                }
             }
         }
         return true
@@ -520,69 +688,85 @@ public final class CloudTuneViewModel {
 
     @discardableResult
     public func commitTransferThreadsDraft() async -> Bool {
-        guard let dl = Int(downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
-              (1...AccountSettings.maxDownloadThreads).contains(dl) else {
-            let msg = "下载线程范围是 1-\(AccountSettings.maxDownloadThreads)"
-            settingsValidationError = msg
-            statusMessage = msg
+        guard let parsed = parseValidatedTransferThreadsDraft() else {
             return false
         }
-        guard let ct = Int(cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines)),
-              (1...AccountSettings.maxCacheThreads).contains(ct) else {
-            let msg = "缓存线程范围是 1-\(AccountSettings.maxCacheThreads)"
-            settingsValidationError = msg
-            statusMessage = msg
-            return false
-        }
-        var next = committedSettings
-        next.downloadThreads = dl
-        next.cacheThreads = ct
-        return await persistCommittedSettings(next, successMessage: "传输参数已更新")
+        return await mutateCommittedSettings(
+            successMessage: "传输参数已更新",
+            draftSync: .threadsOnly,
+            { settings in
+                settings.downloadThreads = parsed.downloadThreads
+                settings.cacheThreads = parsed.cacheThreads
+            }
+        )
     }
 
     public func updatePlaybackMode(_ mode: PlaybackMode) async {
-        var next = committedSettings
-        next.playbackMode = mode
         let msg = mode == .downloadFirst ? "已切到优先缓存播放" : "已切到边播边缓存"
-        _ = await persistCommittedSettings(next, successMessage: msg, resyncDrafts: false)
+        _ = await mutateCommittedSettings(successMessage: msg, draftSync: .none) {
+            $0.playbackMode = mode
+        }
     }
 
     public func setAppearanceMode(_ mode: AppearanceMode) async {
         appearancePreference = mode
-        var next = committedSettings
-        next.appearanceMode = mode
-        if let accountId = activeAccountKey {
-            do {
-                try await accountStore.saveSettings(next, for: accountId)
-                committedSettings = next
-            } catch {
-                statusMessage = "保存外观设置失败：\(error.localizedDescription)"
-            }
-        } else {
-            committedSettings = next
+        _ = await mutateCommittedSettings(
+            successMessage: nil,
+            failurePrefix: "保存外观设置失败",
+            draftSync: .none
+        ) {
+            $0.appearanceMode = mode
         }
     }
 
     @discardableResult
-    private func persistCommittedSettings(
-        _ next: AccountSettings,
-        successMessage: String,
-        resyncDrafts: Bool = true
+    private func mutateCommittedSettings(
+        expectedAccount: String? = nil,
+        successMessage: String?,
+        failurePrefix: String = "保存设置失败",
+        draftSync: DraftSyncScope,
+        _ transform: @escaping @Sendable (inout AccountSettings) -> Void
     ) async -> Bool {
-        if let accountId = activeAccountKey {
-            do {
-                try await accountStore.saveSettings(next, for: accountId)
-            } catch {
-                statusMessage = "保存设置失败：\(error.localizedDescription)"
+        let targetAccount = expectedAccount ?? activeAccountKey
+        guard let accountId = targetAccount else {
+            guard expectedAccount == nil else { return false }
+            var next = committedSettings
+            transform(&next)
+            committedSettings = next
+            applyDraftSync(draftSync)
+            if let successMessage {
+                statusMessage = successMessage
+            }
+            return true
+        }
+
+        let baseSnapshot = committedSettings
+        let seqBox = SettingsMutationSequenceBox()
+        let sequenceGenerator = settingsSequence
+        do {
+            let updated = try await accountStore.mutateSettings(for: accountId, base: baseSnapshot) { settings in
+                transform(&settings)
+                seqBox.store(sequenceGenerator.next())
+            }
+            guard isAuthenticated, activeAccountKey == accountId else {
                 return false
             }
+            let seq = seqBox.load()
+            if seq >= lastAppliedSettingsSeq {
+                lastAppliedSettingsSeq = seq
+                committedSettings = updated
+            }
+            applyDraftSync(draftSync)
+            if let successMessage {
+                statusMessage = successMessage
+            }
+            return true
+        } catch {
+            if isAuthenticated, activeAccountKey == accountId {
+                statusMessage = "\(failurePrefix)：\(error.localizedDescription)"
+            }
+            return false
         }
-        committedSettings = next
-        if resyncDrafts {
-            syncDraftsFromCommitted()
-        }
-        statusMessage = successMessage
-        return true
     }
 
     private var activeAccountKey: String? {
@@ -597,11 +781,15 @@ public final class CloudTuneViewModel {
         return trimmed
     }
 
-    private func saveCredentialReportingIssue(_ credential: PersistedRefreshCredential) {
+    @discardableResult
+    private func saveCredentialReportingIssue(_ credential: PersistedRefreshCredential) -> String? {
         do {
             try credentialMachine.save(credential, backend: keychainBackend)
+            return nil
         } catch {
-            statusMessage = "钥匙串保存凭据失败：\(error.localizedDescription)"
+            let warning = "钥匙串保存凭据失败：\(error.localizedDescription)"
+            statusMessage = warning
+            return warning
         }
     }
 
@@ -750,8 +938,9 @@ public final class CloudTuneViewModel {
                 activeSession: parsed.activeSession,
                 persistedCredential: parsed.persistedCredential
             )
+            var credentialWarning: String?
             if let persisted = parsed.persistedCredential {
-                saveCredentialReportingIssue(persisted.withAccountKey(identity.storageKey))
+                credentialWarning = saveCredentialReportingIssue(persisted.withAccountKey(identity.storageKey))
             }
             isShowingWebLoginSheet = false
             qrPollTask?.cancel()
@@ -762,7 +951,12 @@ public final class CloudTuneViewModel {
                 displayName: identity.displayName
             )
             await browseTo(scope: .cloud, folderId: nil, nextBreadcrumbs: [.root], showBusy: false)
-            statusMessage = "天翼官方网页登录成功"
+            guard isAuthenticated, activeAccountKey == identity.storageKey else { return }
+            if let credentialWarning {
+                statusMessage = "天翼官方网页登录成功（\(credentialWarning)）"
+            } else {
+                statusMessage = "天翼官方网页登录成功"
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -780,6 +974,11 @@ public final class CloudTuneViewModel {
         self.accountStorageKey = storageKey
         self.accountName = displayName
         self.credentialIssue = nil
+        self.lastAppliedSettingsSeq = 0
+        self.cloudBrowserGeneration += 1
+        self.videoBrowserGeneration += 1
+        self.cloudBrowserIdleGeneration = self.cloudBrowserGeneration
+        self.videoBrowserIdleGeneration = self.videoBrowserGeneration
 
         do {
             let paths = try await accountStore.paths(for: storageKey)
@@ -824,6 +1023,11 @@ public final class CloudTuneViewModel {
         transferRefreshTask = nil
         playbackGeneration += 1
         externalVideoGeneration += 1
+        cloudBrowserGeneration += 1
+        videoBrowserGeneration += 1
+        cloudBrowserIdleGeneration = cloudBrowserGeneration
+        videoBrowserIdleGeneration = videoBrowserGeneration
+        lastAppliedSettingsSeq = 0
         recoveryAttempts = 0
         prefetchedTrackId = nil
         prefetchingTrackId = nil
@@ -876,6 +1080,24 @@ public final class CloudTuneViewModel {
 
     // MARK: - Decoupled Cloud & Video Folder Browsers + Library
 
+    private func nextBrowserGeneration(for scope: BrowserScope) -> Int {
+        switch scope {
+        case .cloud:
+            cloudBrowserGeneration += 1
+            return cloudBrowserGeneration
+        case .video:
+            videoBrowserGeneration += 1
+            return videoBrowserGeneration
+        }
+    }
+
+    private func currentBrowserGeneration(for scope: BrowserScope) -> Int {
+        switch scope {
+        case .cloud: cloudBrowserGeneration
+        case .video: videoBrowserGeneration
+        }
+    }
+
     public func browseTo(
         scope: BrowserScope = .cloud,
         folderId: String?,
@@ -883,8 +1105,25 @@ public final class CloudTuneViewModel {
         showBusy: Bool = true
     ) async {
         guard isAuthenticated else { return }
-        if showBusy { busyLabel = "读取云盘目录..." }
-        defer { if showBusy { busyLabel = nil } }
+        let expectedAccount = activeAccountKey
+        let gen = nextBrowserGeneration(for: scope)
+        let assignedBusy: String?
+        let myBusyToken: Int
+        if showBusy {
+            let label = "读取云盘目录..."
+            busyLabel = label
+            browserBusyToken += 1
+            assignedBusy = label
+            myBusyToken = browserBusyToken
+        } else {
+            assignedBusy = nil
+            myBusyToken = 0
+        }
+        defer {
+            if let assignedBusy, browserBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         let isRoot = (folderId == nil || folderId == Cloud189Constants.rootFolderId)
         let nonRootCrumbs = nextBreadcrumbs.filter { $0.id != nil && $0.id != Cloud189Constants.rootFolderId }
         let resolvedName = isRoot
@@ -899,22 +1138,32 @@ public final class CloudTuneViewModel {
                 folderName: resolvedName,
                 folderPath: resolvedPath.isEmpty ? nil : resolvedPath
             )
+            guard gen == currentBrowserGeneration(for: scope),
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return
+            }
             let updatedPane = BrowserPaneState(breadcrumbs: nextBreadcrumbs, payload: listing)
             switch scope {
             case .cloud:
                 cloudBrowser = updatedPane
-                if isRoot && videoBrowser.payload == nil {
+                if isRoot && videoBrowser.payload == nil && videoBrowserGeneration == videoBrowserIdleGeneration {
                     videoBrowser = updatedPane
                 }
             case .video:
                 videoBrowser = updatedPane
-                if isRoot && cloudBrowser.payload == nil {
+                if isRoot && cloudBrowser.payload == nil && cloudBrowserGeneration == cloudBrowserIdleGeneration {
                     cloudBrowser = updatedPane
                 }
             }
         } catch is CancellationError {
             return
         } catch {
+            guard gen == currentBrowserGeneration(for: scope),
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return
+            }
             statusMessage = error.localizedDescription
         }
     }
@@ -936,18 +1185,24 @@ public final class CloudTuneViewModel {
         let displayName = (lastCrumb.id == payload.currentFolderId || (payload.isRoot && lastCrumb.id == nil))
             ? lastCrumb.name
             : payload.currentFolderName
-        busyLabel = "保存 \(displayName) 为音乐目录..."
-        defer { busyLabel = nil }
-        var next = committedSettings
-        next.musicFolder = FolderSelection(id: payload.currentFolderId, name: displayName)
-        do {
-            try await accountStore.saveSettings(next, for: accountId)
-            committedSettings = next
-            statusMessage = "音乐目录已设置为 \(displayName)"
-            await scanMusicLibrary(showBusy: false)
-        } catch {
-            statusMessage = "保存音乐目录失败：\(error.localizedDescription)"
+        let assignedBusy = "保存 \(displayName) 为音乐目录..."
+        busyLabel = assignedBusy
+        defer {
+            if busyLabel == assignedBusy {
+                busyLabel = nil
+            }
         }
+        let selection = FolderSelection(id: payload.currentFolderId, name: displayName)
+        guard await mutateCommittedSettings(
+            expectedAccount: accountId,
+            successMessage: "音乐目录已设置为 \(displayName)",
+            failurePrefix: "保存音乐目录失败",
+            draftSync: .none,
+            { $0.musicFolder = selection }
+        ) else {
+            return
+        }
+        await scanMusicLibrary(showBusy: false)
     }
 
     public func scanMusicLibrary(showBusy: Bool = true) async {
@@ -993,6 +1248,14 @@ public final class CloudTuneViewModel {
 
     public func clearUpNextQueue() {
         upNextQueue = []
+    }
+
+    public func playFromUpcomingQueue(_ track: TrackSummary) async {
+        if upNextQueue.contains(where: { $0.id == track.id }) {
+            upNextQueue = PlaybackQueueResolver.removeFromQueue(upNext: upNextQueue, trackId: track.id)
+            prefetchedTrackId = nil
+        }
+        await playTrack(track)
     }
 
     public func toggleShuffle() {
@@ -1202,22 +1465,49 @@ public final class CloudTuneViewModel {
 
     public func handleWriteThroughCompleted(accountHash: String, trackId: String, localFileURL: URL) async {
         guard isAuthenticated,
-              let accountId = activeAccountKey,
-              Cloud189Protocol.accountBucketHash(for: accountId) == accountHash else {
+              let expectedAccount = activeAccountKey,
+              Cloud189Protocol.accountBucketHash(for: expectedAccount) == accountHash else {
             return
         }
-        if let cacheStore {
-            cacheUsageBytes = await cacheStore.usageBytes()
-        }
-        guard currentTrackId == trackId, let track = currentTrack else { return }
+        let capturedStore = cacheStore
         let gen = playbackGeneration
-        let fallbackAlbum = track.folderPath.isEmpty ? (committedSettings.musicFolder?.name ?? "天翼云盘") : track.folderPath
+        let capturedTrack = (currentTrackId == trackId) ? currentTrack : nil
+        let fallbackAlbum = capturedTrack.map {
+            $0.folderPath.isEmpty ? (committedSettings.musicFolder?.name ?? "天翼云盘") : $0.folderPath
+        }
+
+        if let capturedStore {
+            let latestUsage = await capturedStore.usageBytes()
+            guard isAuthenticated,
+                  activeAccountKey == expectedAccount,
+                  cacheStore === capturedStore else {
+                return
+            }
+            cacheUsageBytes = latestUsage
+        }
+
+        guard isAuthenticated,
+              activeAccountKey == expectedAccount,
+              cacheStore === capturedStore,
+              gen == playbackGeneration,
+              currentTrackId == trackId,
+              let track = capturedTrack ?? currentTrack else {
+            return
+        }
+        let resolvedFallbackAlbum = fallbackAlbum
+            ?? (track.folderPath.isEmpty ? (committedSettings.musicFolder?.name ?? "天翼云盘") : track.folderPath)
         let enriched = await AudioMetadataReader.readMetadata(
             from: localFileURL,
             fallbackTitle: track.name,
-            fallbackAlbum: fallbackAlbum
+            fallbackAlbum: resolvedFallbackAlbum
         )
-        guard isAuthenticated, gen == playbackGeneration, currentTrackId == trackId else { return }
+        guard isAuthenticated,
+              activeAccountKey == expectedAccount,
+              cacheStore === capturedStore,
+              gen == playbackGeneration,
+              currentTrackId == trackId else {
+            return
+        }
         nowPlayingMetadata = enriched
         nowPlayingCoordinator.updateNowPlaying(
             metadata: enriched,
@@ -1334,6 +1624,12 @@ public final class CloudTuneViewModel {
 
     public func togglePlayback() async {
         guard let currentTrack else {
+            if let firstUpNext = upNextQueue.first {
+                upNextQueue = Array(upNextQueue.dropFirst())
+                prefetchedTrackId = nil
+                await playTrack(firstUpNext)
+                return
+            }
             let candidate = shuffle ? tracks.randomElement() : visibleTracks.first
             if let picked = candidate ?? tracks.first {
                 await playTrack(picked)
@@ -1431,8 +1727,12 @@ public final class CloudTuneViewModel {
     // MARK: - Video (Loopback Proxy + Safe External Handoff) & Transfers
 
     public func openVideoInApp(_ video: TrackSummary) async {
+        guard isAuthenticated else { return }
         playbackGeneration += 1
+        externalVideoGeneration += 1
+        pendingExternalVideoChoice = nil
         let gen = playbackGeneration
+        let expectedAccount = activeAccountKey
         recoveryAttempts = 0
         pauseIfPlaying()
         let assignedBusy = "准备视频流 \(video.name)..."
@@ -1443,20 +1743,34 @@ public final class CloudTuneViewModel {
             }
         }
         do {
-            if let cacheStore, let cached = await cacheStore.existingCachedFile(trackId: video.id) {
-                guard gen == playbackGeneration, isAuthenticated else { return }
+            if let capturedStore = cacheStore, let cached = await capturedStore.existingCachedFile(trackId: video.id) {
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == expectedAccount,
+                      cacheStore === capturedStore else {
+                    return
+                }
                 activeVideoTrack = video
                 activeVideoURL = cached
                 statusMessage = "正在播放已缓存视频：\(video.name)"
                 return
             }
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
-            guard gen == playbackGeneration, isAuthenticated else { return }
+            guard gen == playbackGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return
+            }
             let playbackURL: URL
-            if let streamServer, let cacheStore, let accountId = activeAccountKey {
+            if let streamServer, let capturedStore = cacheStore, let accountId = activeAccountKey, accountId == expectedAccount {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
-                let destURL = await cacheStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
-                guard gen == playbackGeneration, isAuthenticated, activeAccountKey == accountId else { return }
+                let destURL = await capturedStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == accountId,
+                      cacheStore === capturedStore else {
+                    return
+                }
                 playbackURL = await streamServer.registerSource(
                     StreamSourceRegistration(
                         accountHash: accountHash,
@@ -1467,28 +1781,38 @@ public final class CloudTuneViewModel {
                         fileName: video.name,
                         cacheLimitBytes: committedSettings.cacheLimitBytes
                     ),
-                    cacheStore: cacheStore
+                    cacheStore: capturedStore
                 )
             } else {
                 playbackURL = remoteURL
             }
-            guard gen == playbackGeneration, isAuthenticated else { return }
+            guard gen == playbackGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return
+            }
             activeVideoTrack = video
             activeVideoURL = playbackURL
             statusMessage = "正在应用内播放视频：\(video.name)"
         } catch is CancellationError {
             return
         } catch {
-            guard gen == playbackGeneration, isAuthenticated else { return }
+            guard gen == playbackGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return
+            }
             statusMessage = error.localizedDescription
         }
     }
 
     /// Returns a local cached `file://` URL immediately if available; otherwise prepares a loopback stream URL
-    /// and sets `pendingExternalVideoChoice` so callers NEVER hand raw `https://` URLs to a web browser.
-    public func requestExternalVideoPlayback(_ video: TrackSummary) async -> URL? {
+    /// (when `prepareLoopbackStream` is `true`) and sets `pendingExternalVideoChoice` so callers NEVER hand raw `https://` URLs to a web browser.
+    public func requestExternalVideoPlayback(
+        _ video: TrackSummary,
+        prepareLoopbackStream: Bool = true
+    ) async -> URL? {
         guard isAuthenticated else { return nil }
-        let gen = playbackGeneration
         externalVideoGeneration += 1
         let extGen = externalVideoGeneration
         let expectedAccount = activeAccountKey
@@ -1499,32 +1823,40 @@ public final class CloudTuneViewModel {
                 busyLabel = nil
             }
         }
-        if let cacheStore, let cached = await cacheStore.existingCachedFile(trackId: video.id) {
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+        if let capturedStore = cacheStore, let cached = await capturedStore.existingCachedFile(trackId: video.id) {
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
-                  activeAccountKey == expectedAccount else {
+                  activeAccountKey == expectedAccount,
+                  cacheStore === capturedStore else {
                 return nil
             }
             shareFileURL = cached
             return cached
         }
+        guard extGen == externalVideoGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            return nil
+        }
+        guard prepareLoopbackStream else {
+            pendingExternalVideoChoice = PendingExternalVideoChoice(video: video, streamURL: nil)
+            return nil
+        }
         do {
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
                   activeAccountKey == expectedAccount else {
                 return nil
             }
             let loopbackStreamURL: URL?
-            if let streamServer, let cacheStore, let accountId = activeAccountKey {
+            if let streamServer, let capturedStore = cacheStore, let accountId = activeAccountKey, accountId == expectedAccount {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
-                let destURL = await cacheStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
-                guard gen == playbackGeneration,
-                      extGen == externalVideoGeneration,
+                let destURL = await capturedStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
+                guard extGen == externalVideoGeneration,
                       isAuthenticated,
-                      activeAccountKey == expectedAccount else {
+                      activeAccountKey == expectedAccount,
+                      cacheStore === capturedStore else {
                     return nil
                 }
                 loopbackStreamURL = await streamServer.registerSource(
@@ -1537,13 +1869,12 @@ public final class CloudTuneViewModel {
                         fileName: video.name,
                         cacheLimitBytes: committedSettings.cacheLimitBytes
                     ),
-                    cacheStore: cacheStore
+                    cacheStore: capturedStore
                 )
             } else {
                 loopbackStreamURL = nil
             }
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
                   activeAccountKey == expectedAccount else {
                 return nil
@@ -1553,8 +1884,7 @@ public final class CloudTuneViewModel {
         } catch is CancellationError {
             return nil
         } catch {
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
                   activeAccountKey == expectedAccount else {
                 return nil
@@ -1565,11 +1895,10 @@ public final class CloudTuneViewModel {
     }
 
     public func downloadVideoAndPrepareLocalFile(_ video: TrackSummary) async -> URL? {
-        guard isAuthenticated, let accountId = activeAccountKey, let cacheStore else {
+        guard isAuthenticated, let accountId = activeAccountKey, let capturedStore = cacheStore else {
             statusMessage = "请先登录后再缓存视频。"
             return nil
         }
-        let gen = playbackGeneration
         externalVideoGeneration += 1
         let extGen = externalVideoGeneration
         pendingExternalVideoChoice = nil
@@ -1584,23 +1913,23 @@ public final class CloudTuneViewModel {
         do {
             let localURL = try await transferEngine.downloadTrackToCache(
                 track: video,
-                cacheStore: cacheStore,
+                cacheStore: capturedStore,
                 parallelThreads: committedSettings.downloadThreads,
                 cacheLimitBytes: max(committedSettings.cacheLimitBytes, video.sizeBytes),
                 kind: "playback",
                 accountHash: accountHash
             )
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
-                  activeAccountKey == accountId else {
+                  activeAccountKey == accountId,
+                  cacheStore === capturedStore else {
                 return nil
             }
-            let latestUsage = await cacheStore.usageBytes()
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            let latestUsage = await capturedStore.usageBytes()
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
-                  activeAccountKey == accountId else {
+                  activeAccountKey == accountId,
+                  cacheStore === capturedStore else {
                 return nil
             }
             cacheUsageBytes = latestUsage
@@ -1610,8 +1939,7 @@ public final class CloudTuneViewModel {
         } catch is CancellationError {
             return nil
         } catch {
-            guard gen == playbackGeneration,
-                  extGen == externalVideoGeneration,
+            guard extGen == externalVideoGeneration,
                   isAuthenticated,
                   activeAccountKey == accountId else {
                 return nil
@@ -1698,17 +2026,25 @@ public final class CloudTuneViewModel {
 
     public func saveExportDirectoryBookmark(_ url: URL) async {
         guard let accountId = activeAccountKey else { return }
+        let baseSnapshot = committedSettings
+        let seqBox = SettingsMutationSequenceBox()
+        let sequenceGenerator = settingsSequence
         do {
-            let name = try await accountStore.saveExportDirectoryBookmark(
+            let result = try await accountStore.saveExportDirectoryBookmarkAndSettings(
                 url,
-                baseSettings: committedSettings,
-                for: accountId
+                baseSettings: baseSnapshot,
+                for: accountId,
+                afterMutate: {
+                    seqBox.store(sequenceGenerator.next())
+                }
             )
             guard isAuthenticated, activeAccountKey == accountId else { return }
-            var next = committedSettings
-            next.exportFolderDisplayName = name
-            committedSettings = next
-            statusMessage = "下载导出目录已设为 \(name)"
+            let seq = seqBox.load()
+            if seq >= lastAppliedSettingsSeq {
+                lastAppliedSettingsSeq = seq
+                committedSettings = result.settings
+            }
+            statusMessage = "下载导出目录已设为 \(result.displayName)"
         } catch {
             guard isAuthenticated, activeAccountKey == accountId else { return }
             statusMessage = error.localizedDescription
@@ -1733,7 +2069,11 @@ public final class CloudTuneViewModel {
                         self.transferSnapshot = latest
                         if !latest.hasActiveItems {
                             if let store = self.cacheStore {
-                                self.cacheUsageBytes = await store.usageBytes()
+                                let expectedAccount = self.activeAccountKey
+                                let bytes = await store.usageBytes()
+                                if self.isAuthenticated, self.activeAccountKey == expectedAccount, self.cacheStore === store {
+                                    self.cacheUsageBytes = bytes
+                                }
                             }
                             break
                         }
@@ -1747,7 +2087,11 @@ public final class CloudTuneViewModel {
             transferRefreshTask?.cancel()
             transferRefreshTask = nil
             if let store = cacheStore {
-                cacheUsageBytes = await store.usageBytes()
+                let expectedAccount = activeAccountKey
+                let bytes = await store.usageBytes()
+                if isAuthenticated, activeAccountKey == expectedAccount, cacheStore === store {
+                    cacheUsageBytes = bytes
+                }
             }
         }
     }

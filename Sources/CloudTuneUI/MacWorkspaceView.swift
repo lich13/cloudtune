@@ -1090,7 +1090,7 @@ public struct MacWorkspaceView: View {
                         let isManual = viewModel.upNextQueue.contains { $0.id == item.id }
                         HStack(spacing: 8) {
                             Button {
-                                Task { await viewModel.playTrack(item) }
+                                Task { await viewModel.playFromUpcomingQueue(item) }
                             } label: {
                                 HStack(spacing: 8) {
                                     ArtworkView(

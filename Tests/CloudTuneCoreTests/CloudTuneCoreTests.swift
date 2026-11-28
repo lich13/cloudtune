@@ -1007,6 +1007,63 @@ struct CloudTuneCoreTests {
             loopMode: .off
         ).track?.id == "t1")
 
+        // upcomingPreview anchors library continuation on upNextQueue.last ?? currentTrack (matching resolveNext)
+        let previewOff = PlaybackQueueResolver.upcomingPreview(
+            currentTrack: t1,
+            libraryTracks: lib,
+            upNextQueue: [t3],
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .off
+        )
+        #expect(previewOff.map(\.id) == ["t3"])
+
+        let previewAll = PlaybackQueueResolver.upcomingPreview(
+            currentTrack: t1,
+            libraryTracks: lib,
+            upNextQueue: [t3],
+            shuffle: false,
+            shuffleOrderIds: [],
+            loopMode: .all
+        )
+        #expect(previewAll.map(\.id) == ["t3", "t2"])
+
+        // Concurrent AccountScopedStore.mutateSettings serializes read-modify-write without losing fields
+        let concurrentRoot = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-mut-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: concurrentRoot) }
+        let concurrentStore = try AccountScopedStore(rootDirectory: concurrentRoot)
+        let acctId = "concurrent@example.invalid"
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = try await concurrentStore.mutateSettings(for: acctId) { $0.appearanceMode = .dark }
+            }
+            group.addTask {
+                _ = try await concurrentStore.mutateSettings(for: acctId) { $0.playbackMode = .streamCache }
+            }
+            group.addTask {
+                _ = try await concurrentStore.mutateSettings(for: acctId) { $0.cacheLimitMb = 4096 }
+            }
+            group.addTask {
+                _ = try await concurrentStore.mutateSettings(for: acctId) {
+                    $0.downloadThreads = 14
+                    $0.cacheThreads = 7
+                }
+            }
+            group.addTask {
+                _ = try await concurrentStore.mutateSettings(for: acctId) {
+                    $0.musicFolder = FolderSelection(id: "m-1", name: "Lossless")
+                }
+            }
+            try await group.waitForAll()
+        }
+        let merged = try await concurrentStore.loadSettings(for: acctId)
+        #expect(merged.appearanceMode == .dark)
+        #expect(merged.playbackMode == .streamCache)
+        #expect(merged.cacheLimitMb == 4096)
+        #expect(merged.downloadThreads == 14)
+        #expect(merged.cacheThreads == 7)
+        #expect(merged.musicFolder == FolderSelection(id: "m-1", name: "Lossless"))
+
         // 3) StreamProxyServer onWriteThroughCompleted fires ONLY on full write-through, never on bytes=0-1 probe
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("cloudtune-wt-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: tempDir) }

@@ -221,6 +221,7 @@ class CloudTuneAppRuntime(
     private var prefetchedTrackId: String? = null
     private var prefetchingTrackId: String? = null
     private var playbackGeneration: Int = 0
+    private var externalVideoGeneration: Int = 0
     private var recoveryAttempts = 0
     private var currentPlaybackIsLoopback = false
     private var attachedUiCount = 0
@@ -781,6 +782,7 @@ class CloudTuneAppRuntime(
         scheduledPrefetchJob?.cancel()
         scheduledPrefetchJob = null
         playbackGeneration += 1
+        externalVideoGeneration += 1
         recoveryAttempts = 0
         pendingMediaItem = null
         prefetchedTrackId = null
@@ -1501,18 +1503,32 @@ class CloudTuneAppRuntime(
     }
 
     fun openVideoExternally(context: Context, video: TrackSummary) {
+        if (!isAuthenticated) return
+        val gen = playbackGeneration
+        externalVideoGeneration += 1
+        val extGen = externalVideoGeneration
+        val expectedAccount = activeAccountKey
         scope.launch {
             try {
                 val cached = withContext(ioDispatcher) { cacheManager?.existingCachedFile(video.id) }
+                if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                    return@launch
+                }
                 if (cached != null) {
                     launchFileProviderVideoIntent(context, cached, video.name)
                     return@launch
                 }
                 val remoteUrl = cloudClient.resolveDownloadUrl(video.id)
+                if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                    return@launch
+                }
                 val cm = cacheManager
                 val acct = activeAccountKey
                 val loopbackUrl: String? = if (streamServer != null && cm != null && acct != null) {
                     val dest = withContext(ioDispatcher) { cm.cacheFile(video.id, video.name) }
+                    if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                        return@launch
+                    }
                     streamServer.registerSource(
                         StreamSourceRegistration(
                             accountHash = Cloud189Protocol.accountBucketHash(acct),
@@ -1526,18 +1542,27 @@ class CloudTuneAppRuntime(
                         cacheManager = cm
                     )
                 } else null
+                if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != expectedAccount) {
+                    return@launch
+                }
                 pendingExternalVideoAction = PendingExternalVideoAction(video, loopbackUrl)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = "准备外部播放失败：${e.message}"
+                if (gen == playbackGeneration && extGen == externalVideoGeneration && isAuthenticated && activeAccountKey == expectedAccount) {
+                    statusMessage = "准备外部播放失败：${e.message}"
+                }
             }
         }
     }
 
     fun downloadVideoAndOpenExternally(context: Context, video: TrackSummary) {
+        if (!isAuthenticated) return
         val cm = cacheManager ?: return
         val acct = activeAccountKey ?: return
+        val gen = playbackGeneration
+        externalVideoGeneration += 1
+        val extGen = externalVideoGeneration
         pendingExternalVideoAction = null
         val appContextRef = context.applicationContext
         scope.launch {
@@ -1551,14 +1576,25 @@ class CloudTuneAppRuntime(
                     kind = "playback",
                     accountHash = Cloud189Protocol.accountBucketHash(acct)
                 )
-                cacheUsageBytes = withContext(ioDispatcher) { cm.usageBytes() }
+                if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != acct) {
+                    return@launch
+                }
+                val usage = withContext(ioDispatcher) { cm.usageBytes() }
+                if (gen != playbackGeneration || extGen != externalVideoGeneration || !isAuthenticated || activeAccountKey != acct) {
+                    return@launch
+                }
+                cacheUsageBytes = usage
                 launchFileProviderVideoIntent(appContextRef, localFile, video.name)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                statusMessage = "缓存视频失败：${e.message}"
+                if (gen == playbackGeneration && extGen == externalVideoGeneration && isAuthenticated && activeAccountKey == acct) {
+                    statusMessage = "缓存视频失败：${e.message}"
+                }
             } finally {
-                busyLabel = null
+                if (gen == playbackGeneration && extGen == externalVideoGeneration) {
+                    busyLabel = null
+                }
             }
         }
     }

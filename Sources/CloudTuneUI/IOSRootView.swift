@@ -101,7 +101,14 @@ public struct IOSRootView: View {
         )) {
             if let videoURL = viewModel.activeVideoURL {
                 IOSAVPlayerContainer(url: videoURL)
+                    .id(videoURL)
                     .ignoresSafeArea()
+            }
+        }
+        .onChange(of: viewModel.isAuthenticated) { _, authenticated in
+            if !authenticated {
+                isShowingShareSheet = false
+                isShowingFolderPicker = false
             }
         }
         .sheet(isPresented: $isShowingShareSheet) {
@@ -399,32 +406,43 @@ public struct IOSRootView: View {
                     .frame(width: 28, height: 28)
             }
 
-            ArtworkView(
-                artworkData: viewModel.nowPlayingMetadata?.artworkData,
-                seedText: title,
-                size: 168,
-                cornerRadius: 18,
-                palette: palette
-            )
-            .scaleEffect(viewModel.isPlaying ? 1.0 : 0.94)
-            .animation(.spring(response: 0.35, dampingFraction: 0.78), value: viewModel.isPlaying)
+            Button {
+                hapticCounter += 1
+                viewModel.isShowingNowPlayingSheet = true
+            } label: {
+                VStack(spacing: 14) {
+                    ArtworkView(
+                        artworkData: viewModel.nowPlayingMetadata?.artworkData,
+                        seedText: title,
+                        size: 168,
+                        cornerRadius: 18,
+                        palette: palette
+                    )
+                    .scaleEffect(viewModel.isPlaying ? 1.0 : 0.94)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.78), value: viewModel.isPlaying)
 
-            VStack(spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(palette.inkPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let track {
-                        LosslessBadge(track: track, palette: palette)
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(title)
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(palette.inkPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let track {
+                                LosslessBadge(track: track, palette: palette)
+                            }
+                        }
+                        Text(subtitle.isEmpty ? "选择左侧曲目开始播放" : subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(palette.inkSecondary)
+                            .lineLimit(1)
                     }
                 }
-                Text(subtitle.isEmpty ? "选择左侧曲目开始播放" : subtitle)
-                    .font(.system(size: 12))
-                    .foregroundStyle(palette.inkSecondary)
-                    .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("展开全屏正在播放视图")
 
             VStack(spacing: 4) {
                 InteractiveScrubSlider(
@@ -1558,6 +1576,14 @@ public struct IOSRootView: View {
 struct IOSAVPlayerContainer: UIViewControllerRepresentable {
     let url: URL
 
+    final class Coordinator {
+        var loadedURL: URL?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
@@ -1569,14 +1595,27 @@ struct IOSAVPlayerContainer: UIViewControllerRepresentable {
         vc.allowsPictureInPicturePlayback = true
         vc.canStartPictureInPictureAutomaticallyFromInline = true
         let player = AVPlayer(url: url)
+        context.coordinator.loadedURL = url
         vc.player = player
         player.play()
         return vc
     }
 
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        guard context.coordinator.loadedURL != url else { return }
+        context.coordinator.loadedURL = url
+        if let player = uiViewController.player {
+            player.pause()
+            player.replaceCurrentItem(with: AVPlayerItem(url: url))
+            player.play()
+        } else {
+            let player = AVPlayer(url: url)
+            uiViewController.player = player
+            player.play()
+        }
+    }
 
-    static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: ()) {
+    static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: Coordinator) {
         uiViewController.player?.pause()
         uiViewController.player?.replaceCurrentItem(with: nil)
         uiViewController.player = nil

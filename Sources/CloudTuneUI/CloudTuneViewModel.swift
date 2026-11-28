@@ -202,6 +202,7 @@ public final class CloudTuneViewModel {
     private var prefetchedTrackId: String?
     private var prefetchingTrackId: String?
     private var playbackGeneration: Int = 0
+    private var externalVideoGeneration: Int = 0
     private var recoveryAttempts: Int = 0
     private var currentPlaybackIsLoopback: Bool = false
     private var wasPlayingBeforeInterruption: Bool = false
@@ -465,6 +466,32 @@ public final class CloudTuneViewModel {
             statusMessage = nil
         }
         settingsValidationError = nil
+    }
+
+    @discardableResult
+    public func canCloseSettingsSurface() -> Bool {
+        guard !hasUnsavedSettingsDrafts else {
+            if settingsValidationError == nil {
+                let msg = "尚有未应用的设置草稿，请先点击「应用」或「还原修改」后再关闭。"
+                settingsValidationError = msg
+                statusMessage = msg
+            }
+            return false
+        }
+        isShowingSettingsSheet = false
+        return true
+    }
+
+    @discardableResult
+    public func commitPendingSettingsDraftsIfNeeded() async -> Bool {
+        if cacheLimitDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheLimitMb) {
+            guard await commitCacheLimitDraft() else { return false }
+        }
+        if downloadThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.downloadThreads)
+            || cacheThreadsDraft.trimmingCharacters(in: .whitespacesAndNewlines) != String(committedSettings.cacheThreads) {
+            guard await commitTransferThreadsDraft() else { return false }
+        }
+        return true
     }
 
     @discardableResult
@@ -796,6 +823,7 @@ public final class CloudTuneViewModel {
         transferRefreshTask?.cancel()
         transferRefreshTask = nil
         playbackGeneration += 1
+        externalVideoGeneration += 1
         recoveryAttempts = 0
         prefetchedTrackId = nil
         prefetchingTrackId = nil
@@ -832,6 +860,7 @@ public final class CloudTuneViewModel {
         duration = 0
         activeVideoURL = nil
         activeVideoTrack = nil
+        shareFileURL = nil
         pendingExternalVideoChoice = nil
         isShowingNowPlayingSheet = false
         isShowingSettingsSheet = false
@@ -1451,18 +1480,45 @@ public final class CloudTuneViewModel {
     /// Returns a local cached `file://` URL immediately if available; otherwise prepares a loopback stream URL
     /// and sets `pendingExternalVideoChoice` so callers NEVER hand raw `https://` URLs to a web browser.
     public func requestExternalVideoPlayback(_ video: TrackSummary) async -> URL? {
+        guard isAuthenticated else { return nil }
+        let gen = playbackGeneration
+        externalVideoGeneration += 1
+        let extGen = externalVideoGeneration
+        let expectedAccount = activeAccountKey
         busyLabel = "检查本地视频缓存 \(video.name)..."
-        defer { busyLabel = nil }
+        defer {
+            if gen == playbackGeneration && extGen == externalVideoGeneration {
+                busyLabel = nil
+            }
+        }
         if let cacheStore, let cached = await cacheStore.existingCachedFile(trackId: video.id) {
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return nil
+            }
             shareFileURL = cached
             return cached
         }
         do {
             let remoteURL = try await cloudClient.resolveDownloadURL(fileId: video.id)
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return nil
+            }
             let loopbackStreamURL: URL?
             if let streamServer, let cacheStore, let accountId = activeAccountKey {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
                 let destURL = await cacheStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
+                guard gen == playbackGeneration,
+                      extGen == externalVideoGeneration,
+                      isAuthenticated,
+                      activeAccountKey == expectedAccount else {
+                    return nil
+                }
                 loopbackStreamURL = await streamServer.registerSource(
                     StreamSourceRegistration(
                         accountHash: accountHash,
@@ -1478,24 +1534,43 @@ public final class CloudTuneViewModel {
             } else {
                 loopbackStreamURL = nil
             }
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return nil
+            }
             pendingExternalVideoChoice = PendingExternalVideoChoice(video: video, streamURL: loopbackStreamURL)
             return nil
         } catch is CancellationError {
             return nil
         } catch {
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == expectedAccount else {
+                return nil
+            }
             statusMessage = "获取视频源失败：\(error.localizedDescription)"
             return nil
         }
     }
 
     public func downloadVideoAndPrepareLocalFile(_ video: TrackSummary) async -> URL? {
-        guard let accountId = activeAccountKey, let cacheStore else {
+        guard isAuthenticated, let accountId = activeAccountKey, let cacheStore else {
             statusMessage = "请先登录后再缓存视频。"
             return nil
         }
+        let gen = playbackGeneration
+        externalVideoGeneration += 1
+        let extGen = externalVideoGeneration
         pendingExternalVideoChoice = nil
         busyLabel = "正在下载视频至本地缓存：《\(video.name)》..."
-        defer { busyLabel = nil }
+        defer {
+            if gen == playbackGeneration && extGen == externalVideoGeneration {
+                busyLabel = nil
+            }
+        }
         let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
         do {
             let localURL = try await transferEngine.downloadTrackToCache(
@@ -1506,13 +1581,32 @@ public final class CloudTuneViewModel {
                 kind: "playback",
                 accountHash: accountHash
             )
-            cacheUsageBytes = await cacheStore.usageBytes()
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return nil
+            }
+            let latestUsage = await cacheStore.usageBytes()
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return nil
+            }
+            cacheUsageBytes = latestUsage
             shareFileURL = localURL
             statusMessage = "视频缓存完成，正在调用本地播放器打开"
             return localURL
         } catch is CancellationError {
             return nil
         } catch {
+            guard gen == playbackGeneration,
+                  extGen == externalVideoGeneration,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return nil
+            }
             statusMessage = "缓存视频失败：\(error.localizedDescription)"
             return nil
         }
@@ -1596,7 +1690,11 @@ public final class CloudTuneViewModel {
     public func saveExportDirectoryBookmark(_ url: URL) async {
         guard let accountId = activeAccountKey else { return }
         do {
-            let name = try await accountStore.saveExportDirectoryBookmark(url, for: accountId)
+            let name = try await accountStore.saveExportDirectoryBookmark(
+                url,
+                baseSettings: committedSettings,
+                for: accountId
+            )
             var next = committedSettings
             next.exportFolderDisplayName = name
             committedSettings = next

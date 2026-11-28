@@ -31,7 +31,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.showOrCreatePreferencesWindow()
             }
         }
@@ -107,7 +107,14 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard !isQuittingExplicitly else { return true }
+        if sender === preferencesWindow {
+            return viewModel.canCloseSettingsSurface()
+        }
         if sender === mainWindow {
+            if viewModel.isShowingSettingsSheet {
+                _ = viewModel.canCloseSettingsSurface()
+                return false
+            }
             sender.orderOut(nil)
             return false
         }
@@ -148,7 +155,14 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         }
         let prefsView = MacPreferencesView(
             viewModel: viewModel,
-            onClose: { [weak self] in self?.preferencesWindow?.close() }
+            onClose: { [weak self] in
+                guard let self else { return }
+                Task { @MainActor in
+                    if await self.viewModel.commitPendingSettingsDraftsIfNeeded() {
+                        self.preferencesWindow?.close()
+                    }
+                }
+            }
         )
         let hosting = NSHostingController(rootView: prefsView)
         let window = NSWindow(contentViewController: hosting)
@@ -157,6 +171,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         window.styleMask = [.titled, .closable]
         window.setContentSize(NSSize(width: 520, height: 470))
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
         self.preferencesWindow = window
         window.makeKeyAndOrderFront(nil)
@@ -312,7 +327,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             return
         }
         if viewModel.isShowingSettingsSheet {
-            viewModel.isShowingSettingsSheet = false
+            _ = viewModel.canCloseSettingsSurface()
             return
         }
         if let keyWin = NSApp.keyWindow {
@@ -321,7 +336,7 @@ final class CloudTuneAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
                 return
             }
             if keyWin === preferencesWindow {
-                keyWin.close()
+                keyWin.performClose(nil)
                 return
             }
             if keyWin !== mainWindow {

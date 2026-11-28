@@ -115,7 +115,11 @@ public actor AccountScopedStore {
         try data.write(to: p.libraryURL, options: .atomic)
     }
 
-    public func saveExportDirectoryBookmark(_ folderURL: URL, for accountId: String) throws -> String {
+    public func saveExportDirectoryBookmark(
+        _ folderURL: URL,
+        baseSettings: AccountSettings? = nil,
+        for accountId: String
+    ) throws -> String {
         let p = try paths(for: accountId)
         let didStart = folderURL.startAccessingSecurityScopedResource()
         defer {
@@ -134,7 +138,7 @@ public actor AccountScopedStore {
             relativeTo: nil
         )
         try bookmarkData.write(to: p.exportBookmarkURL, options: .atomic)
-        var settings = try loadSettings(for: accountId)
+        var settings = try baseSettings ?? loadSettingsIfPresent(for: accountId) ?? AccountSettings()
         settings.exportFolderDisplayName = folderURL.lastPathComponent
         try saveSettings(settings, for: accountId)
         return folderURL.lastPathComponent

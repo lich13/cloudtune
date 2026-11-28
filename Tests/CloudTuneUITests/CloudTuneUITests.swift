@@ -327,12 +327,97 @@ struct CloudTuneUITests {
             cookies: []
         )
         // Fresh account without settings.json preserves pre-login appearancePreference (.dark)
+        // AND saveExportDirectoryBookmark persists .dark to settings.json instead of clobbering to .system
         #expect(noProxyVM.appearancePreference == .dark)
         #expect(noProxyVM.committedSettings.appearanceMode == .dark)
+        let freshExportDir = root.appendingPathComponent("fresh-export-folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: freshExportDir, withIntermediateDirectories: true)
+        await noProxyVM.saveExportDirectoryBookmark(freshExportDir)
+        let freshAccountKey = try #require(noProxyVM.accountStorageKey)
+        let persistedFreshSettings = try #require(try await freshStore.loadSettingsIfPresent(for: freshAccountKey))
+        #expect(persistedFreshSettings.appearanceMode == .dark)
+        #expect(persistedFreshSettings.exportFolderDisplayName == "fresh-export-folder")
         let noProxyDirect = await noProxyVM.requestExternalVideoPlayback(concertVideo)
         #expect(noProxyDirect == nil)
         let noProxyChoice = try #require(noProxyVM.pendingExternalVideoChoice)
         #expect(noProxyChoice.streamURL == nil)
+
+        // 2c) Dirty settings close guard blocks silent Cmd+W / window close while preserving draft
+        noProxyVM.isShowingSettingsSheet = true
+        noProxyVM.cacheLimitDraft = "4096"
+        #expect(noProxyVM.canCloseSettingsSurface() == false)
+        #expect(noProxyVM.isShowingSettingsSheet == true)
+        #expect(noProxyVM.cacheLimitDraft == "4096")
+        #expect(noProxyVM.settingsValidationError != nil)
+        #expect(await noProxyVM.commitPendingSettingsDraftsIfNeeded() == true)
+        #expect(noProxyVM.committedSettings.cacheLimitMb == 4096)
+        #expect(noProxyVM.canCloseSettingsSurface() == true)
+        #expect(noProxyVM.isShowingSettingsSheet == false)
+
+        // 2d) External video request completing after logout() MUST NOT mutate pendingExternalVideoChoice or shareFileURL
+        actor GatedVideoTransport: CloudHTTPTransport {
+            private var enteredContinuation: CheckedContinuation<Void, Never>?
+            private var releaseContinuation: CheckedContinuation<Void, Never>?
+            private var hasEntered = false
+            private var isReleased = false
+
+            func waitUntilEnteredDownloadURL() async {
+                if hasEntered { return }
+                await withCheckedContinuation { cont in
+                    enteredContinuation = cont
+                }
+            }
+
+            func releaseDownloadURL() {
+                isReleased = true
+                releaseContinuation?.resume()
+                releaseContinuation = nil
+            }
+
+            func send(_ request: URLRequest) async throws -> CloudHTTPResponse {
+                let url = request.url!
+                if url.path.contains("getSessionForPC.action") {
+                    let body = #"{"res_code":0,"loginName":"race@example.invalid","accessToken":"at","refreshToken":"rt","sessionKey":"sk","sessionSecret":"ss"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                if url.path.contains("getFileDownloadUrl.action") {
+                    hasEntered = true
+                    enteredContinuation?.resume()
+                    enteredContinuation = nil
+                    if !isReleased {
+                        await withCheckedContinuation { cont in
+                            releaseContinuation = cont
+                        }
+                    }
+                    let body = #"{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/slow.mp4"}"#
+                    return CloudHTTPResponse(statusCode: 200, body: Data(body.utf8), finalURL: url)
+                }
+                return CloudHTTPResponse(statusCode: 200, body: Data("{}".utf8), finalURL: url)
+            }
+            func importCookies(_ cookies: [HTTPCookie]) async {}
+            func clearCookies() async {}
+        }
+        let gatedTransport = GatedVideoTransport()
+        let raceVM = CloudTuneViewModel(
+            cloudClient: Cloud189Client(transport: gatedTransport),
+            accountStore: freshStore,
+            userDefaults: isolatedDefaults,
+            enableLiveObservers: false
+        )
+        await raceVM.completeEmbeddedWebLogin(
+            callbackURL: URL(string: "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html?paras=race")!,
+            cookies: []
+        )
+        let inFlightExternalTask = Task { @MainActor in
+            await raceVM.requestExternalVideoPlayback(concertVideo)
+        }
+        await gatedTransport.waitUntilEnteredDownloadURL()
+        await raceVM.logout()
+        await gatedTransport.releaseDownloadURL()
+        let lateExternalResult = await inFlightExternalTask.value
+        #expect(lateExternalResult == nil)
+        #expect(raceVM.pendingExternalVideoChoice == nil)
+        #expect(raceVM.shareFileURL == nil)
 
         // 3) Logout tears down observers, closes sheets/modals, resets module, and re-login re-registers idempotently
         vm.isShowingSettingsSheet = true

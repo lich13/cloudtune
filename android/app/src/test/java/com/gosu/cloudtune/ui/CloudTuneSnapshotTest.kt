@@ -193,4 +193,75 @@ class CloudTuneSnapshotTest {
             tempRoot.deleteRecursively()
         }
     }
+
+    @Test
+    fun verifyExternalVideoLogoutGuard(): Unit = kotlinx.coroutines.runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-ext-guard").toFile()
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            val enteredResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val releaseResolve = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val transport = object : com.gosu.cloudtune.core.CloudHttpTransport {
+                override suspend fun send(
+                    url: String,
+                    method: String,
+                    headers: Map<String, String>,
+                    formBody: List<Pair<String, String>>?
+                ): com.gosu.cloudtune.core.CloudHttpResponse {
+                    return when {
+                        url.contains("refreshToken.do") -> {
+                            val b = """{"res_code":0,"accessToken":"at_1","refreshToken":"rt_1"}"""
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("getSessionForPC.action") -> {
+                            val b = """{"res_code":0,"loginName":"guard@example.invalid","sessionKey":"sk","sessionSecret":"ss","refreshToken":"rt_1"}"""
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        url.contains("getFileDownloadUrl.action") -> {
+                            enteredResolve.complete(Unit)
+                            releaseResolve.await()
+                            val b = """{"res_code":0,"fileDownloadUrl":"https://media.example.invalid/concert.mp4"}"""
+                            com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), b.toByteArray(Charsets.UTF_8), url)
+                        }
+                        else -> com.gosu.cloudtune.core.CloudHttpResponse(200, emptyMap(), "{}".toByteArray(Charsets.UTF_8), url)
+                    }
+                }
+                override fun importCookieHeader(domainUrl: String, cookieHeader: String?) {}
+                override fun clearCookies() {}
+            }
+            var savedCred = com.gosu.cloudtune.core.PersistedRefreshCredential.createOrNull("rt_init", "guard@example.invalid")
+            val memCredStore = object : com.gosu.cloudtune.data.CredentialStore {
+                override fun loadCredential() = savedCred
+                override fun saveCredential(credential: com.gosu.cloudtune.core.PersistedRefreshCredential) { savedCred = credential }
+                override fun clearCredential() { savedCred = null }
+            }
+            val runtime = CloudTuneAppRuntime(
+                appContext = activity.applicationContext,
+                cloudClient = com.gosu.cloudtune.core.Cloud189Client(transport),
+                accountStore = com.gosu.cloudtune.data.AccountStore(tempRoot),
+                credentialStore = memCredStore,
+                limiter = com.gosu.cloudtune.core.GlobalTransferLimiter(8),
+                enableLiveLoops = false,
+                dispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
+                ioDispatcher = kotlinx.coroutines.Dispatchers.IO
+            )
+            runtime.bootstrap().await()
+            assertTrue(runtime.isAuthenticated)
+
+            val video = com.gosu.cloudtune.core.TrackSummary("vid-race", "Concert.mp4", "Videos", 4096L)
+            runtime.openVideoExternally(activity, video)
+            kotlinx.coroutines.withTimeout(5000L) { enteredResolve.await() }
+            runtime.logout()
+            releaseResolve.complete(Unit)
+            kotlinx.coroutines.delay(40L)
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("External video preparation completing after logout must not set pendingExternalVideoAction", runtime.pendingExternalVideoAction == null)
+            assertTrue("External video preparation completing after logout must not launch intent", Shadows.shadowOf(activity as android.app.Activity).nextStartedActivity == null)
+            Unit
+        } finally {
+            controller.pause().stop().destroy()
+            tempRoot.deleteRecursively()
+        }
+    }
 }

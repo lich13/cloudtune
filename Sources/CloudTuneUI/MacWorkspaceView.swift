@@ -84,12 +84,17 @@ public struct MacWorkspaceView: View {
                     Color.black.opacity(isDark ? 0.48 : 0.22)
                         .ignoresSafeArea()
                         .onTapGesture {
-                            guard !viewModel.hasUnsavedSettingsDrafts else { return }
-                            viewModel.isShowingSettingsSheet = false
+                            _ = viewModel.canCloseSettingsSurface()
                         }
                     MacPreferencesView(
                         viewModel: viewModel,
-                        onClose: { viewModel.isShowingSettingsSheet = false }
+                        onClose: {
+                            Task { @MainActor in
+                                if await viewModel.commitPendingSettingsDraftsIfNeeded() {
+                                    viewModel.isShowingSettingsSheet = false
+                                }
+                            }
+                        }
                     )
                     .frame(width: 520)
                     .background(
@@ -146,6 +151,7 @@ public struct MacWorkspaceView: View {
                         viewModel.activeVideoTrack = nil
                     }
                 )
+                .id(videoURL)
             }
         }
         .sheet(item: $viewModel.pendingExternalVideoChoice) { choice in
@@ -450,7 +456,7 @@ public struct MacWorkspaceView: View {
                 case .video:
                     "\(viewModel.videoBrowser.payload?.currentFolderName ?? "我的云盘") · \(viewModel.videoBrowser.payload?.videoFiles.count ?? 0) 个视频"
                 case .cloud:
-                    "\(viewModel.cloudBrowser.payload?.currentFolderName ?? "我的云盘") · 独立云盘目录浏览"
+                    "\(viewModel.cloudBrowser.payload?.currentFolderName ?? "我的云盘") · \(viewModel.cloudBrowser.payload?.folders.count ?? 0) 个文件夹 · \(viewModel.downloadableBrowserFiles.count) 个文件"
                 case .transfers:
                     "实时速率 \(CloudTuneFormatters.formatBytes(viewModel.transferSnapshot.totalSpeedBytesPerSecond))/s · 导出目录 \(viewModel.committedSettings.exportFolderDisplayName ?? "未指定")"
                 }
@@ -809,21 +815,21 @@ public struct MacWorkspaceView: View {
                 }
 
                 if !audios.isEmpty {
-                    Text("音频文件 (\(audios.count)) · 点击直接试听，切换目录不中断播放")
+                    Text("音频文件 (\(audios.count))")
                         .font(.system(size: 12, weight: .semibold).monospacedDigit())
                         .foregroundStyle(palette.inkTertiary)
                         .padding(.top, 4)
                     VStack(spacing: 6) {
                         ForEach(audios) { track in
-                            HStack(spacing: 10) {
-                                TrackRowButton(
-                                    track: track,
-                                    isActive: track.id == viewModel.currentTrackId,
-                                    actionLabel: track.id == viewModel.currentTrackId && viewModel.isPlaying ? "播放中" : "试听",
-                                    palette: palette
-                                ) {
+                            TrackRowButton(
+                                track: track,
+                                isActive: track.id == viewModel.currentTrackId,
+                                actionLabel: track.id == viewModel.currentTrackId && viewModel.isPlaying ? "播放中" : "试听",
+                                palette: palette,
+                                action: {
                                     Task { await viewModel.playTrack(track) }
                                 }
+                            ) {
                                 MacPopUpMenuButton(
                                     systemImage: "ellipsis.circle",
                                     accessibilityTitle: "云盘音频操作"
@@ -1385,16 +1391,16 @@ public struct MacPreferencesView: View {
     public var body: some View {
         let palette = CloudTunePalette(isDark: isDark)
         VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("CloudTune 偏好设置")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(palette.inkPrimary)
-                    Text("外观、流式缓存策略与本地导出路径")
-                        .font(.system(size: 12))
-                        .foregroundStyle(palette.inkTertiary)
-                }
+            HStack(spacing: 8) {
+                Text("CloudTune 偏好设置")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(palette.inkPrimary)
                 Spacer()
+                if viewModel.hasUnsavedSettingsDrafts {
+                    SecondaryActionButton("还原修改", palette: palette) {
+                        viewModel.syncDraftsFromCommitted()
+                    }
+                }
                 if let onClose {
                     SecondaryActionButton("完成", palette: palette, action: onClose)
                 }
@@ -1616,6 +1622,11 @@ struct MacVideoPlayerSheet: View {
             MacAVPlayerRepresentable(player: videoPlayer)
                 .frame(minWidth: 880, minHeight: 520)
                 .onAppear { videoPlayer.play() }
+                .onChange(of: url) { _, nextURL in
+                    videoPlayer.pause()
+                    videoPlayer.replaceCurrentItem(with: AVPlayerItem(url: nextURL))
+                    videoPlayer.play()
+                }
                 .onDisappear { videoPlayer.pause() }
         }
     }

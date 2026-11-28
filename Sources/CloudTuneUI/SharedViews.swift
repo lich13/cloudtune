@@ -428,12 +428,14 @@ public struct ToggleChipButton: View {
     }
 }
 
-public struct TrackRowButton: View {
+public struct TrackRowButton<TrailingAccessory: View>: View {
     public let track: TrackSummary
     public let isActive: Bool
     public let actionLabel: String
     public let palette: CloudTunePalette
     public let action: () -> Void
+    private let hasTrailingAccessory: Bool
+    private let trailingAccessory: TrailingAccessory
 
     public init(
         track: TrackSummary,
@@ -441,53 +443,81 @@ public struct TrackRowButton: View {
         actionLabel: String,
         palette: CloudTunePalette,
         action: @escaping () -> Void
+    ) where TrailingAccessory == EmptyView {
+        self.track = track
+        self.isActive = isActive
+        self.actionLabel = actionLabel
+        self.palette = palette
+        self.action = action
+        self.hasTrailingAccessory = false
+        self.trailingAccessory = EmptyView()
+    }
+
+    public init(
+        track: TrackSummary,
+        isActive: Bool = false,
+        actionLabel: String,
+        palette: CloudTunePalette,
+        action: @escaping () -> Void,
+        @ViewBuilder trailingAccessory: () -> TrailingAccessory
     ) {
         self.track = track
         self.isActive = isActive
         self.actionLabel = actionLabel
         self.palette = palette
         self.action = action
+        self.hasTrailingAccessory = true
+        self.trailingAccessory = trailingAccessory()
     }
 
     public var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(track.name)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(palette.inkPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(track.folderPath)
-                        .font(.system(size: 12))
-                        .foregroundStyle(palette.inkTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: 0) {
+            Button(action: action) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(track.name)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(palette.inkPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(track.folderPath)
+                            .font(.system(size: 12))
+                            .foregroundStyle(palette.inkTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(CloudTuneFormatters.formatBytes(track.sizeBytes))
-                        .font(.system(size: 12, weight: .medium).monospacedDigit())
-                        .foregroundStyle(palette.inkTertiary)
-                    Text(actionLabel)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(isActive ? palette.accent : palette.inkSecondary)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(CloudTuneFormatters.formatBytes(track.sizeBytes))
+                            .font(.system(size: 12, weight: .medium).monospacedDigit())
+                            .foregroundStyle(palette.inkTertiary)
+                        Text(actionLabel)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(isActive ? palette.accent : palette.inkSecondary)
+                    }
                 }
+                .padding(.leading, 13)
+                .padding(.trailing, hasTrailingAccessory ? 8 : 13)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .fill(isActive ? palette.rowActiveSurface : palette.rowSurface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .strokeBorder(isActive ? palette.rowActiveBorder : palette.cardBorder, lineWidth: 1)
-            )
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            if hasTrailingAccessory {
+                trailingAccessory
+                    .padding(.trailing, 10)
+            }
         }
-        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(isActive ? palette.rowActiveSurface : palette.rowSurface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(isActive ? palette.rowActiveBorder : palette.cardBorder, lineWidth: 1)
+        )
     }
 }
 

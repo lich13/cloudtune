@@ -5,6 +5,7 @@ import com.gosu.cloudtune.data.CredentialStore
 import com.gosu.cloudtune.media.PlaybackSessionBridge
 import com.gosu.cloudtune.ui.CloudTuneAppRuntime
 import com.gosu.cloudtune.ui.CloudTuneViewModel
+import com.gosu.cloudtune.ui.StatusKind
 import com.gosu.cloudtune.ui.fixture
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -17,8 +18,10 @@ import java.net.URI
 import java.net.URL
 import java.nio.file.Files
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -102,7 +105,76 @@ class Cloud189ProtocolAndProxyTest {
             )
         }
 
-        // 6) Account SHA-256 bucket isolation
+        // 6) Range validation vectors (probe, mid-seek, full-open, initial non-zero, resume, and suffix ranges)
+        val rv = root.getJSONObject("rangeValidation")
+        val probeHeader = rv.getString("probeRangeHeader")
+        val midSeekHeader = rv.getString("midSeekRangeHeader")
+        val fullOpenHeader = rv.getString("fullOpenRangeHeader")
+        val partialCrHeader = rv.getString("partialContentRangeHeader")
+        val expectedTotalFromCr = rv.getLong("expectedTotalFromContentRange")
+        assertEquals(ParsedByteRange(0L, 1L), RangeHeaderValidator.parseRequestRange(probeHeader))
+        assertFalse(RangeHeaderValidator.canWriteThroughToCache(probeHeader))
+        assertEquals(ParsedByteRange(65536L, null), RangeHeaderValidator.parseRequestRange(midSeekHeader))
+        assertFalse(RangeHeaderValidator.canWriteThroughToCache(midSeekHeader))
+        assertEquals(ParsedByteRange(0L, null), RangeHeaderValidator.parseRequestRange(fullOpenHeader))
+        assertTrue(RangeHeaderValidator.canWriteThroughToCache(fullOpenHeader))
+        assertTrue(RangeHeaderValidator.canWriteThroughToCache(null))
+        assertEquals(
+            expectedTotalFromCr,
+            RangeHeaderValidator.extractFullAssetLength(206, true, partialCrHeader, "2")
+        )
+
+        val resumeOffset = rv.getLong("resumeOffset")
+        val validResumeCr = rv.getString("validResumeContentRange")
+        val mismatchedResumeCr = rv.getString("mismatchedResumeContentRange")
+        RangeHeaderValidator.validateResumeResponse(resumeOffset, 206, validResumeCr)
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateResumeResponse(resumeOffset, 206, mismatchedResumeCr)
+        }
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateResumeResponse(resumeOffset, 200, validResumeCr)
+        }
+
+        val initialNonZeroOffset = rv.getLong("initialNonZeroOffset")
+        val validInitialNonZeroCr = rv.getString("validInitialNonZeroContentRange")
+        val mismatchedInitialNonZeroCr = rv.getString("mismatchedInitialNonZeroContentRange")
+        RangeHeaderValidator.validateResumeResponse(initialNonZeroOffset, 206, validInitialNonZeroCr)
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateResumeResponse(initialNonZeroOffset, 206, mismatchedInitialNonZeroCr)
+        }
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateResumeResponse(initialNonZeroOffset, 200, validInitialNonZeroCr)
+        }
+
+        val suffixHeader = rv.getString("suffixRangeHeader")
+        val suffixTotal = rv.getLong("suffixTotalLength")
+        val expectedSuffixStart = rv.getLong("expectedSuffixStart")
+        val expectedSuffixEnd = rv.getLong("expectedSuffixEnd")
+        val validSuffixCr = rv.getString("validSuffixContentRange")
+        val mismatchedSuffixCr = rv.getString("mismatchedSuffixContentRange")
+        val parsedSuffix = RangeHeaderValidator.parseRequestRange(suffixHeader)
+        assertNotNull(parsedSuffix)
+        assertTrue(parsedSuffix!!.isSuffix)
+        assertEquals(suffixHeader, parsedSuffix.headerValue)
+        assertFalse(RangeHeaderValidator.canWriteThroughToCache(suffixHeader))
+        assertEquals(expectedSuffixStart to expectedSuffixEnd, parsedSuffix.resolve(suffixTotal))
+        val validatedSuffixCr = RangeHeaderValidator.validateSuffixResponse(
+            parsedSuffix.suffixLength!!,
+            206,
+            validSuffixCr
+        )
+        assertEquals(expectedSuffixStart, validatedSuffixCr.start)
+        assertEquals(expectedSuffixEnd, validatedSuffixCr.end)
+        assertEquals(suffixTotal, validatedSuffixCr.totalLength)
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateSuffixResponse(parsedSuffix.suffixLength!!, 206, mismatchedSuffixCr)
+        }
+        assertThrows(CloudTuneException::class.java) {
+            RangeHeaderValidator.validateSuffixResponse(parsedSuffix.suffixLength!!, 200, validSuffixCr)
+        }
+        assertNull(RangeHeaderValidator.parseRequestRange("bytes=-0"))
+
+        // 7) Account SHA-256 bucket isolation
         val acctArr = root.getJSONArray("accountIsolation")
         for (i in 0 until acctArr.length()) {
             val entry = acctArr.getJSONObject(i)
@@ -1421,6 +1493,433 @@ class Cloud189ProtocolAndProxyTest {
             assertEquals("completed", engine2.snapshot().items.first { it.id == taskId }.state)
             assertEquals("Resumed task must keep its pinned exportTreeUri", pinnedUri, observedUri.get())
             assertArrayEquals(filePayload, exportedFile.readBytes())
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyProxyNonZeroRangeRejectionSuffixStreamingAndDirectLocalCache(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-slice2-proxy").toFile()
+        try {
+            val cacheManager = CacheManager(File(tempRoot, "cache"))
+            val fullPayload = ByteArray(10_000) { ((it * 31 + 7) and 0xFF).toByte() }
+            val limiter = GlobalTransferLimiter(1)
+            val observedRanges = Collections.synchronizedList(mutableListOf<String?>())
+            val nonZeroMode = AtomicInteger(0) // 0 -> 200 OK, 1 -> mismatched 206, 2 -> valid 206
+            val suffixStep = AtomicInteger(0)
+
+            LocalStreamServer(
+                limiter = limiter,
+                opener = { _, rangeHeader ->
+                    observedRanges += rangeHeader
+                    when {
+                        rangeHeader == "bytes=65536-" -> when (nonZeroMode.get()) {
+                            0 -> OpenedUpstreamStream(
+                                statusCode = 200,
+                                headers = mapOf("content-length" to fullPayload.size.toString()),
+                                bodyStream = ByteArrayInputStream(fullPayload)
+                            )
+                            else -> OpenedUpstreamStream(
+                                statusCode = 206,
+                                headers = mapOf(
+                                    "content-length" to fullPayload.size.toString(),
+                                    "content-range" to "bytes 0-9999/48234496"
+                                ),
+                                bodyStream = ByteArrayInputStream(fullPayload)
+                            )
+                        }
+                        rangeHeader == "bytes=-512" -> {
+                            val step = suffixStep.getAndIncrement()
+                            if (step == 0) {
+                                // Fail before S is resolved -> proxy MUST retry bytes=-512 (never bytes=0-)!
+                                throw IOException("transient upstream open drop before S resolved")
+                            }
+                            val slice = fullPayload.copyOfRange(9488, 10_000)
+                            OpenedUpstreamStream(
+                                statusCode = 206,
+                                headers = mapOf(
+                                    "content-length" to slice.size.toString(),
+                                    "content-range" to "bytes 9488-9999/10000"
+                                ),
+                                bodyStream = object : InputStream() {
+                                    private var pos = 0
+                                    override fun read(): Int {
+                                        if (pos >= 200) throw IOException("mid-suffix drop")
+                                        return slice[pos++].toInt() and 0xFF
+                                    }
+                                }
+                            )
+                        }
+                        rangeHeader == "bytes=9688-9999" -> {
+                            val tail = fullPayload.copyOfRange(9688, 10_000)
+                            OpenedUpstreamStream(
+                                statusCode = 206,
+                                headers = mapOf(
+                                    "content-length" to tail.size.toString(),
+                                    "content-range" to "bytes 9688-9999/10000"
+                                ),
+                                bodyStream = ByteArrayInputStream(tail)
+                            )
+                        }
+                        else -> error("Unexpected upstream range call: $rangeHeader")
+                    }
+                },
+                maxRegisteredSources = 4
+            ).use { server ->
+                val remoteTrackUrl = server.registerSource(
+                    StreamSourceRegistration(
+                        accountHash = "acctS2",
+                        trackId = "track-remote",
+                        remoteUrl = "https://media.example.invalid/remote.flac",
+                        cacheDestination = cacheManager.cacheFile("track-remote", "remote.flac"),
+                        expectedSize = fullPayload.size.toLong(),
+                        fileName = "remote.flac",
+                        cacheLimitBytes = 64L * 1024L * 1024L
+                    ),
+                    cacheManager = cacheManager
+                )
+
+                // 1a) Initial non-zero Range returning 200 OK MUST be rejected with 502 Bad Gateway
+                nonZeroMode.set(0)
+                val seek200Conn = (URL(remoteTrackUrl).openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Range", "bytes=65536-")
+                }
+                assertEquals(502, seek200Conn.responseCode)
+
+                // 1b) Initial non-zero Range returning mismatched Content-Range bytes 0-... MUST be rejected with 502
+                nonZeroMode.set(1)
+                val seekMismatchConn = (URL(remoteTrackUrl).openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Range", "bytes=65536-")
+                }
+                assertEquals(502, seekMismatchConn.responseCode)
+
+                // 1c) Invalid suffix bytes=-0 rejected with 416 without touching opener
+                val beforeInvalidCount = observedRanges.size
+                val invalidSuffixConn = (URL(remoteTrackUrl).openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Range", "bytes=-0")
+                }
+                assertEquals(416, invalidSuffixConn.responseCode)
+                assertEquals(beforeInvalidCount, observedRanges.size)
+
+                // 2) Suffix bytes=-512 retries bytes=-512 on pre-S failure, resumes at 9488+200=9688, and never caches
+                observedRanges.clear()
+                val suffixConn = (URL(remoteTrackUrl).openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Range", "bytes=-512")
+                }
+                assertEquals(206, suffixConn.responseCode)
+                assertEquals("bytes 9488-9999/10000", suffixConn.getHeaderField("Content-Range"))
+                val suffixReceived = suffixConn.inputStream.use { it.readBytes() }
+                assertArrayEquals(fullPayload.copyOfRange(9488, 10_000), suffixReceived)
+                assertEquals(listOf<String?>("bytes=-512", "bytes=-512", "bytes=9688-9999"), observedRanges.toList())
+                assertFalse(observedRanges.contains("bytes=0-"))
+                delay(40L)
+                assertNull(cacheManager.existingCachedFile("track-remote"))
+
+                // 3) Direct local-cache serving (200, explicit 206, suffix 206, 416, HEAD) without opener or remote permit!
+                val cachedFile = cacheManager.cacheFile("track-cached", "cached.flac").apply {
+                    writeBytes(fullPayload)
+                }
+                cacheManager.recordCompletedFile(
+                    trackId = "track-cached",
+                    file = cachedFile,
+                    sizeBytes = fullPayload.size.toLong(),
+                    limitBytes = 64L * 1024L * 1024L
+                )
+                val cachedStreamUrl = server.registerSource(
+                    StreamSourceRegistration(
+                        accountHash = "acctS2",
+                        trackId = "track-cached",
+                        remoteUrl = "https://media.example.invalid/never-open.flac",
+                        cacheDestination = cachedFile,
+                        expectedSize = fullPayload.size.toLong(),
+                        fileName = "cached.flac",
+                        cacheLimitBytes = 64L * 1024L * 1024L
+                    ),
+                    cacheManager = cacheManager
+                )
+                observedRanges.clear()
+                // Hold the ONLY remote permit in limiter(1) to prove local cache serving acquires 0 permits
+                limiter.withPermit {
+                    val fullCachedConn = URL(cachedStreamUrl).openConnection() as HttpURLConnection
+                    assertEquals(200, fullCachedConn.responseCode)
+                    assertArrayEquals(fullPayload, fullCachedConn.inputStream.use { it.readBytes() })
+
+                    val explicitCachedConn = (URL(cachedStreamUrl).openConnection() as HttpURLConnection).apply {
+                        setRequestProperty("Range", "bytes=100-299")
+                    }
+                    assertEquals(206, explicitCachedConn.responseCode)
+                    assertArrayEquals(fullPayload.copyOfRange(100, 300), explicitCachedConn.inputStream.use { it.readBytes() })
+
+                    val suffixCachedConn = (URL(cachedStreamUrl).openConnection() as HttpURLConnection).apply {
+                        setRequestProperty("Range", "bytes=-512")
+                    }
+                    assertEquals(206, suffixCachedConn.responseCode)
+                    assertEquals("bytes 9488-9999/10000", suffixCachedConn.getHeaderField("Content-Range"))
+                    assertArrayEquals(fullPayload.copyOfRange(9488, 10_000), suffixCachedConn.inputStream.use { it.readBytes() })
+
+                    val oobCachedConn = (URL(cachedStreamUrl).openConnection() as HttpURLConnection).apply {
+                        setRequestProperty("Range", "bytes=10000-")
+                    }
+                    assertEquals(416, oobCachedConn.responseCode)
+
+                    val headCachedConn = (URL(cachedStreamUrl).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "HEAD"
+                    }
+                    assertEquals(200, headCachedConn.responseCode)
+                    assertEquals(fullPayload.size.toString(), headCachedConn.getHeaderField("Content-Length"))
+                }
+                assertTrue("Direct local-cache serving must never invoke upstream opener", observedRanges.isEmpty())
+
+                // 4) Bounded sources map evicts oldest inactive tokens beyond maxRegisteredSources (4)
+                val urls = (0 until 5).map { idx ->
+                    server.registerSource(
+                        StreamSourceRegistration(
+                            token = "tok-$idx",
+                            accountHash = "acctCap",
+                            trackId = "track-cached",
+                            remoteUrl = "https://media.example.invalid/$idx.flac",
+                            cacheDestination = cachedFile,
+                            expectedSize = fullPayload.size.toLong(),
+                            fileName = "$idx.flac",
+                            cacheLimitBytes = 64L * 1024L * 1024L
+                        ),
+                        cacheManager = cacheManager
+                    )
+                }
+                assertEquals(4, server.registeredSourceCount())
+                assertEquals(404, (URL(urls[0]).openConnection() as HttpURLConnection).responseCode)
+                assertEquals(200, (URL(urls[4]).openConnection() as HttpURLConnection).responseCode)
+            }
+
+            // 5) HttpUrlConnectionTransport propagates IOException on truncated 2xx response body instead of ByteArray(0)
+            ServerSocket(0, 4, InetAddress.getByName("127.0.0.1")).use { truncServer ->
+                val serverThread = Thread {
+                    runCatching {
+                        truncServer.accept().use { sock ->
+                            val reqBuf = ByteArray(1024)
+                            sock.getInputStream().read(reqBuf)
+                            val partial = "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n{\"res_code\":0"
+                            sock.getOutputStream().write(partial.toByteArray(Charsets.UTF_8))
+                            sock.getOutputStream().flush()
+                        }
+                    }
+                }.apply { isDaemon = true; start() }
+
+                val transport = HttpUrlConnectionTransport()
+                var caughtIo = false
+                try {
+                    transport.send("http://127.0.0.1:${truncServer.localPort}/listFiles.action")
+                } catch (_: IOException) {
+                    caughtIo = true
+                }
+                serverThread.join(500)
+                assertTrue("Truncated 200 OK body must throw IOException, never return empty ByteArray", caughtIo)
+            }
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyPrematureZeroByteEofRetryCapCorruptIndexRebuildAndResilientLibrary(): Unit = runBlocking {
+        val tempRoot = Files.createTempDirectory("cloudtune-slice2-engines").toFile()
+        try {
+            // 1) Premature 0-byte EOF retry cap in TransferEngine (1 initial + 4 retries = 5 part opens, never infinite)
+            val partOpens = AtomicInteger(0)
+            val limiter = GlobalTransferLimiter(4)
+            val eofEngine = TransferEngine(
+                limiter = limiter,
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/4096", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(byteArrayOf(0x11))
+                        )
+                    } else {
+                        partOpens.incrementAndGet()
+                        // Immediate EOF (-1) with 0 bytes read while current <= endInclusive!
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-4095/4096", "content-length" to "4096"),
+                            bodyStream = ByteArrayInputStream(ByteArray(0))
+                        )
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/eof.flac" }
+            ).also { it.retryDelayBaseMs = 2L }
+
+            val eofCache = CacheManager(File(tempRoot, "eof-cache"))
+            var failedCleanly = false
+            withTimeout(5_000L) {
+                try {
+                    eofEngine.downloadTrackToCache(
+                        track = TrackSummary("trk-eof", "Eof.flac", "Music", 4096L),
+                        cacheManager = eofCache,
+                        parallelThreads = 1,
+                        cacheLimitBytes = 64L * 1024L * 1024L
+                    )
+                } catch (_: IOException) {
+                    failedCleanly = true
+                }
+            }
+            assertTrue("Premature 0-byte EOF must fail cleanly after retry cap", failedCleanly)
+            assertEquals(1 + TransferEngine.MAX_PART_RETRIES, partOpens.get())
+            assertNull(eofCache.existingCachedFile("trk-eof"))
+
+            // 2) Corrupt index.json rebuild preserving valid cached tracks + throttled index.json flushes
+            val rebuildDir = File(tempRoot, "rebuild-cache")
+            val fakeClock = AtomicLong(1_700_000_000_000L)
+            val cmSeed = CacheManager(rebuildDir, clockMs = { fakeClock.get() })
+            val bytesA = ByteArray(2048) { 0x3A }
+            val bytesB = ByteArray(3072) { 0x5B }
+            val fileA = cmSeed.cacheFile("track-1", "Aria - Take 1.flac").apply { writeBytes(bytesA) }
+            val fileB = cmSeed.cacheFile("31384910", "Waltz.wav").apply { writeBytes(bytesB) }
+            cmSeed.recordCompletedFile("track-1", fileA, bytesA.size.toLong(), 64L * 1024L * 1024L)
+            cmSeed.recordCompletedFile("31384910", fileB, bytesB.size.toLong(), 64L * 1024L * 1024L)
+
+            val strayPart = File(rebuildDir, "orphan.flac.part").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val strayTmp = File(rebuildDir, ".index.json.stale.tmp").apply { writeText("stale") }
+            cmSeed.indexFile.writeText("{corrupt-json-payload", Charsets.UTF_8)
+
+            val cmRebuilt = CacheManager(rebuildDir, clockMs = { fakeClock.get() })
+            assertFalse(strayPart.exists())
+            assertFalse(strayTmp.exists())
+            assertEquals((bytesA.size + bytesB.size).toLong(), cmRebuilt.usageBytes())
+            val repairedJson = JSONObject(cmRebuilt.indexFile.readText(Charsets.UTF_8))
+            assertEquals(2, repairedJson.length())
+            assertArrayEquals(bytesA, cmRebuilt.existingCachedFile("track-1")!!.readBytes())
+            assertArrayEquals(bytesB, cmRebuilt.existingCachedFile("31384910")!!.readBytes())
+
+            // Throttled flush check: < 16 hits within < 5_000ms does NOT rewrite index.json; >= 5_000ms flushes
+            cmRebuilt.flushIndexIfDirty()
+            val baselineIndexText = cmRebuilt.indexFile.readText(Charsets.UTF_8)
+            fakeClock.addAndGet(200L)
+            repeat(5) {
+                assertNotNull(cmRebuilt.existingCachedFile("31384910"))
+            }
+            assertEquals("Under-threshold hits must throttle index.json disk writes", baselineIndexText, cmRebuilt.indexFile.readText(Charsets.UTF_8))
+            fakeClock.addAndGet(CacheManager.DIRTY_FLUSH_INTERVAL_MS + 10L)
+            assertNotNull(cmRebuilt.existingCachedFile("31384910"))
+            val flushedJson = JSONObject(cmRebuilt.indexFile.readText(Charsets.UTF_8))
+            assertEquals(fakeClock.get(), flushedJson.getJSONObject("31384910").getLong("lastAccessedMs"))
+
+            // 3) Resilient per-item AccountStore.loadLibrary decoding + .migrated-v2 marker
+            val storeRoot = File(tempRoot, "acct-store")
+            val store = AccountStore(storeRoot)
+            assertTrue(File(storeRoot, AccountStore.MIGRATED_V2_MARKER).isFile)
+            val acct = "resilient@example.invalid"
+            val acctPaths = store.paths(acct)
+            acctPaths.libraryFile.writeText(
+                """[
+                    {"id":"ok-1","name":"First.flac","folderPath":"Disc 1","sizeBytes":1024,"modifiedAt":"2026-11-01"},
+                    null,
+                    "not-an-object",
+                    {"name":"MissingId.flac","sizeBytes":512},
+                    {"id":"","name":"BlankId.flac","sizeBytes":512},
+                    {"id":"ok-2","name":"Second.wav","folderPath":"Disc 2","sizeBytes":2048,"modifiedAt":null}
+                ]""",
+                Charsets.UTF_8
+            )
+            val loadedTracks = store.loadLibrary(acct)
+            assertEquals(listOf("ok-1", "ok-2"), loadedTracks.map { it.id })
+            assertEquals("2026-11-01", loadedTracks[0].modifiedAt)
+            assertNull(loadedTracks[1].modifiedAt)
+
+            // 4) Orphaned staging/ cleanup AFTER loading manifests + batch enqueueExportDownloads without .merged
+            val refTaskId = "download:keep-01"
+            val refPartsDir = File(acctPaths.stagingDir, "${Cloud189Protocol.sanitizeFileName(refTaskId)}.parts").apply { mkdirs() }
+            File(refPartsDir, "0000.part").writeBytes(byteArrayOf(1, 2, 3, 4))
+            val orphanPartsDir = File(acctPaths.stagingDir, "download_orphan-99.parts").apply { mkdirs() }
+            File(orphanPartsDir, "0000.part").writeBytes(byteArrayOf(9, 9))
+            val staleMerged = File(acctPaths.stagingDir, "download_old.merged").apply { writeBytes(byteArrayOf(7)) }
+            acctPaths.transfersFile.writeText(
+                """[{"taskId":"$refTaskId","trackId":"t-keep","fileName":"Keep.flac","relativeSubpath":"Keep.flac","totalSize":16,"partCount":1,"state":"paused"}]""",
+                Charsets.UTF_8
+            )
+
+            val batchPayload = ByteArray(1024) { (it and 0x7F).toByte() }
+            val batchEngine = TransferEngine(
+                limiter = GlobalTransferLimiter(8),
+                opener = { _, rangeHeader ->
+                    if (rangeHeader == "bytes=0-0") {
+                        OpenedUpstreamStream(
+                            statusCode = 206,
+                            headers = mapOf("content-range" to "bytes 0-0/${batchPayload.size}", "content-length" to "1"),
+                            bodyStream = ByteArrayInputStream(batchPayload.copyOfRange(0, 1))
+                        )
+                    } else {
+                        OpenedUpstreamStream(
+                            statusCode = 200,
+                            headers = mapOf("content-length" to batchPayload.size.toString()),
+                            bodyStream = ByteArrayInputStream(batchPayload)
+                        )
+                    }
+                },
+                urlResolver = { "https://media.example.invalid/$it.flac" }
+            )
+            batchEngine.restorePersistedDownloads(acct, acctPaths.stagingDir, acctPaths.transfersFile)
+            assertTrue("Referenced .parts directory must survive staging cleanup", refPartsDir.isDirectory)
+            assertFalse("Unreferenced .parts directory must be cleaned up", orphanPartsDir.exists())
+            assertFalse("Stale .merged file must be cleaned up", staleMerged.exists())
+
+            val exportedFiles = ConcurrentHashMap<String, ByteArray>()
+            val batchIds = batchEngine.enqueueExportDownloads(
+                accountId = acct,
+                items = (1..3).map { idx ->
+                    ExportDownloadItem(
+                        track = TrackSummary("b-$idx", "Batch$idx.flac", "Batch", batchPayload.size.toLong()),
+                        relativeSubpath = "Batch/Batch$idx.flac"
+                    )
+                },
+                parallelThreads = 2,
+                stagingRootDir = acctPaths.stagingDir,
+                manifestsFile = acctPaths.transfersFile,
+                exporter = object : StagedFileExporter {
+                    override suspend fun export(stagedFile: File, relativeSubpath: String, accountId: String, exportTreeUri: String?): String {
+                        exportedFiles[relativeSubpath] = stagedFile.readBytes()
+                        return relativeSubpath
+                    }
+                    override suspend fun exportParts(
+                        partFiles: List<File>,
+                        expectedTotalBytes: Long,
+                        relativeSubpath: String,
+                        accountId: String,
+                        exportTreeUri: String?
+                    ): String {
+                        val combined = ByteArray(expectedTotalBytes.toInt())
+                        var pos = 0
+                        for (p in partFiles) {
+                            val b = p.readBytes()
+                            System.arraycopy(b, 0, combined, pos, b.size)
+                            pos += b.size
+                        }
+                        exportedFiles[relativeSubpath] = combined
+                        return relativeSubpath
+                    }
+                }
+            )
+            assertEquals(3, batchIds.size)
+            repeat(50) {
+                if (batchIds.all { id -> batchEngine.snapshot().items.firstOrNull { it.id == id }?.state == "completed" }) return@repeat
+                delay(25L)
+            }
+            assertEquals(3, exportedFiles.size)
+            exportedFiles.values.forEach { assertArrayEquals(batchPayload, it) }
+            assertTrue(acctPaths.stagingDir.list().orEmpty().none { it.endsWith(".merged") })
+
+            // 5) Explicit StatusKind (never guessing from "失败" in song titles)
+            val fixture = RepresentativeFixture.fromJsonString(locateContractsFile("representative-state.json").readText(Charsets.UTF_8))
+            val errFixtureRt = CloudTuneAppRuntime.fixture(SnapshotScene.ERROR_BANNER, fixture)
+            assertEquals(StatusKind.ERROR, errFixtureRt.statusKind)
+            val musicFixtureRt = CloudTuneAppRuntime.fixture(SnapshotScene.MUSIC, fixture)
+            assertEquals(StatusKind.INFO, musicFixtureRt.statusKind)
+            musicFixtureRt.playNext(TrackSummary("song-fail-word", "失败者的飞翔.flac", "Music", 1024L))
+            assertEquals(StatusKind.INFO, musicFixtureRt.statusKind)
+            musicFixtureRt.cacheLimitDraft = "10"
+            assertFalse(musicFixtureRt.commitCacheLimitDraftAsync())
+            assertEquals(StatusKind.ERROR, musicFixtureRt.statusKind)
         } finally {
             tempRoot.deleteRecursively()
         }

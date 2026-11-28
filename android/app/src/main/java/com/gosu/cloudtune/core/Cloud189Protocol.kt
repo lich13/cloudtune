@@ -52,6 +52,19 @@ object Cloud189Protocol {
     private val qrPollDateFormatter = DateTimeFormatter
         .ofPattern("yyyy-MM-ddHH:mm:ss.SSS", Locale.US)
 
+    private val HEX_UPPER = "0123456789ABCDEF".toCharArray()
+    private val HEX_LOWER = "0123456789abcdef".toCharArray()
+
+    private fun encodeHex(bytes: ByteArray, table: CharArray): String {
+        val out = CharArray(bytes.size * 2)
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xFF
+            out[i * 2] = table[v ushr 4]
+            out[i * 2 + 1] = table[v and 0x0F]
+        }
+        return String(out)
+    }
+
     fun webLoginEntryUrl(timestampMillis: Long = System.currentTimeMillis()): String {
         val encodedReturn = URLEncoder.encode(Cloud189Constants.RETURN_URL, Charsets.UTF_8.name())
         return "${Cloud189Constants.WEB_URL}/api/portal/unifyLoginForPC.action" +
@@ -105,7 +118,7 @@ object Cloud189Protocol {
         val mac = Mac.getInstance("HmacSHA1")
         mac.init(SecretKeySpec(sessionSecret.toByteArray(Charsets.UTF_8), "HmacSHA1"))
         val bytes = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
-        val hex = bytes.joinToString("") { "%02X".format(Locale.US, it) }
+        val hex = encodeHex(bytes, HEX_UPPER)
         return requestUri to hex
     }
 
@@ -283,7 +296,7 @@ object Cloud189Protocol {
             .firstOrNull { it.isNotEmpty() && it != Cloud189Constants.DEFAULT_ACCOUNT_DISPLAY_NAME } ?: sessionKey
         val digest = MessageDigest.getInstance("SHA-256")
             .digest("cloudtune-anon-account:$seed".toByteArray(Charsets.UTF_8))
-        val hex = digest.joinToString("") { "%02x".format(Locale.US, it) }
+        val hex = encodeHex(digest, HEX_LOWER)
         return "acct:$hex"
     }
 
@@ -345,7 +358,7 @@ object Cloud189Protocol {
     fun accountBucketHash(accountId: String): String {
         val normalized = accountId.trim().lowercase(Locale.ROOT)
         val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(Locale.US, it) }
+        return encodeHex(digest, HEX_LOWER)
     }
 
     fun sanitizeFileName(raw: String): String {

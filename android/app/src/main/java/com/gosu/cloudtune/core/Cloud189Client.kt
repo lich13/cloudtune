@@ -7,11 +7,18 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
+import java.util.Collections
+import java.util.Locale
 import java.util.UUID
 import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -67,9 +74,9 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
                 readTimeout = 30_000
                 useCaches = false
                 setRequestProperty("User-Agent", Cloud189Constants.USER_AGENT)
-                setRequestProperty("Connection", "close")
             }
 
+            var keepAliveReusable = false
             try {
                 val allowCookies = Cloud189Protocol.isSameOrigin(initialUri, uri) ||
                     Cloud189Protocol.isTrustedTianyiOrigin(uri)
@@ -116,8 +123,12 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
                                 throw CloudTuneException("拒绝跨源重定向转发鉴权表单请求")
                             }
                             currentHeaders = currentHeaders.filterKeys {
-                                it.lowercase(java.util.Locale.US) !in SENSITIVE_REDIRECT_HEADERS
+                                it.lowercase(Locale.US) !in SENSITIVE_REDIRECT_HEADERS
                             }
+                        }
+                        runCatching {
+                            conn.inputStream?.use { it.readBytes() }
+                            keepAliveReusable = true
                         }
                         currentUrl = nextUri.toString()
                         if (status == 301 || status == 302 || status == 303) {
@@ -129,20 +140,36 @@ class HttpUrlConnectionTransport : CloudHttpTransport {
                     }
                 }
 
-                val bytes = runCatching {
-                    val stream = if (status in 200..399) conn.inputStream else (conn.errorStream ?: conn.inputStream)
-                    stream?.use { it.readBytes() } ?: ByteArray(0)
-                }.getOrDefault(ByteArray(0))
+                val bytes = if (status in 200..299) {
+                    val payloadBytes = conn.inputStream?.use { it.readBytes() } ?: ByteArray(0)
+                    keepAliveReusable = true
+                    payloadBytes
+                } else if (status in 300..399) {
+                    runCatching {
+                        val payloadBytes = conn.inputStream?.use { it.readBytes() } ?: ByteArray(0)
+                        keepAliveReusable = true
+                        payloadBytes
+                    }.getOrDefault(ByteArray(0))
+                } else {
+                    runCatching {
+                        val errStream = conn.errorStream
+                        val payloadBytes = errStream?.use { it.readBytes() } ?: ByteArray(0)
+                        keepAliveReusable = true
+                        payloadBytes
+                    }.getOrDefault(ByteArray(0))
+                }
 
                 val flatHeaders = mutableMapOf<String, String>()
                 for ((k, v) in rawHeaders) {
                     if (k != null && !v.isNullOrEmpty()) {
-                        flatHeaders[k.lowercase()] = v.last()
+                        flatHeaders[k.lowercase(Locale.US)] = v.last()
                     }
                 }
                 return@withContext CloudHttpResponse(status, flatHeaders, bytes)
             } finally {
-                conn.disconnect()
+                if (!keepAliveReusable) {
+                    runCatching { conn.disconnect() }
+                }
             }
         }
         throw CloudTuneException("请求重定向次数过多")
@@ -521,24 +548,48 @@ class Cloud189Client(
         }
     }
 
-    private suspend fun scanRecursive(folderId: String, folderName: String, audioOnly: Boolean): List<TrackSummary> {
-        val queue = ArrayDeque<Pair<String, String>>()
-        queue.addLast(folderId to folderName)
-        val out = mutableListOf<TrackSummary>()
+    private suspend fun scanRecursive(
+        folderId: String,
+        folderName: String,
+        audioOnly: Boolean
+    ): List<TrackSummary> = coroutineScope {
+        val scanSemaphore = Semaphore(MAX_SCAN_CONCURRENCY)
+        val collected = Collections.synchronizedList(mutableListOf<TrackSummary>())
 
-        while (queue.isNotEmpty()) {
-            val (currId, currPath) = queue.removeFirst()
+        suspend fun visitFolder(currId: String, currPath: String) {
             val leafName = currPath.substringAfterLast('/')
-            val listing = listRemoteFolder(folderId = currId, folderName = leafName, folderPath = currPath)
-            for (f in listing.folders) {
-                queue.addLast(f.id to "$currPath/${f.name}")
+            val listing = scanSemaphore.withPermit {
+                listRemoteFolder(folderId = currId, folderName = leafName, folderPath = currPath)
             }
-            val files = if (audioOnly) listing.audioFiles else (listing.audioFiles + listing.videoFiles + listing.otherFiles)
-            for (item in files) {
-                out += item.copy(folderPath = currPath)
+            val files = if (audioOnly) {
+                listing.audioFiles
+            } else {
+                listing.audioFiles + listing.videoFiles + listing.otherFiles
+            }
+            if (files.isNotEmpty()) {
+                synchronized(collected) {
+                    for (item in files) {
+                        collected += item.copy(folderPath = currPath)
+                    }
+                }
+            }
+            if (listing.folders.isNotEmpty()) {
+                coroutineScope {
+                    listing.folders.map { sub ->
+                        async {
+                            visitFolder(sub.id, "$currPath/${sub.name}")
+                        }
+                    }.awaitAll()
+                }
             }
         }
-        return out.sortedBy { "${it.folderPath}/${it.name}".lowercase() }
+
+        visitFolder(folderId, folderName)
+        collected.sortedWith(
+            compareBy<TrackSummary> { "${it.folderPath}/${it.name}".lowercase(Locale.ROOT) }
+                .thenBy { "${it.folderPath}/${it.name}" }
+                .thenBy { it.id }
+        )
     }
 
     private suspend fun exchangeRedirectUnlocked(
@@ -695,4 +746,8 @@ class Cloud189Client(
         pairs.joinToString("&") { (k, v) ->
             "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
         }
+
+    companion object {
+        private const val MAX_SCAN_CONCURRENCY = 4
+    }
 }

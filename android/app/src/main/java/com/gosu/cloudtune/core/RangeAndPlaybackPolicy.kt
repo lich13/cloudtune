@@ -29,8 +29,33 @@ class GlobalTransferLimiter(val maxPermits: Int = 8) {
     }
 }
 
-data class ParsedByteRange(val start: Long, val end: Long?) {
-    val headerValue: String get() = if (end != null) "bytes=$start-$end" else "bytes=$start-"
+data class ParsedByteRange(
+    val start: Long,
+    val end: Long?,
+    val suffixLength: Long? = null
+) {
+    val isSuffix: Boolean get() = suffixLength != null
+
+    val headerValue: String
+        get() = when {
+            suffixLength != null -> "bytes=-$suffixLength"
+            end != null -> "bytes=$start-$end"
+            else -> "bytes=$start-"
+        }
+
+    fun resolve(totalLength: Long): Pair<Long, Long>? {
+        if (totalLength <= 0L) return null
+        val sfx = suffixLength
+        if (sfx != null) {
+            if (sfx <= 0L) return null
+            val resolvedStart = if (totalLength > sfx) totalLength - sfx else 0L
+            return resolvedStart to (totalLength - 1L)
+        }
+        if (start < 0L || start >= totalLength) return null
+        val resolvedEnd = end?.let { minOf(it, totalLength - 1L) } ?: (totalLength - 1L)
+        if (resolvedEnd < start) return null
+        return start to resolvedEnd
+    }
 }
 
 data class ParsedContentRange(val start: Long, val end: Long, val totalLength: Long?)
@@ -39,25 +64,39 @@ object RangeHeaderValidator {
     fun parseRequestRange(rawHeader: String?): ParsedByteRange? {
         val raw = rawHeader?.trim() ?: return null
         if (!raw.lowercase(Locale.US).startsWith("bytes=") || raw.contains(",")) return null
-        val spec = raw.substring("bytes=".length)
+        val spec = raw.substring("bytes=".length).trim()
         val dash = spec.indexOf('-')
-        if (dash <= 0) return null
-        val start = spec.substring(0, dash).toLongOrNull() ?: return null
+        if (dash < 0) return null
+        if (dash == 0) {
+            val suffixPart = spec.substring(1)
+            if (suffixPart.isEmpty() || !suffixPart.all { it.isDigit() }) return null
+            val suffixLen = suffixPart.toLongOrNull() ?: return null
+            if (suffixLen <= 0L) return null
+            return ParsedByteRange(start = 0L, end = null, suffixLength = suffixLen)
+        }
+        val startPart = spec.substring(0, dash)
+        if (startPart.isEmpty() || !startPart.all { it.isDigit() }) return null
+        val start = startPart.toLongOrNull() ?: return null
         val endPart = spec.substring(dash + 1)
-        val end = if (endPart.isEmpty()) null else (endPart.toLongOrNull() ?: return null)
+        val end = if (endPart.isEmpty()) {
+            null
+        } else {
+            if (!endPart.all { it.isDigit() }) return null
+            endPart.toLongOrNull() ?: return null
+        }
         if (start < 0L || (end != null && end < start)) return null
-        return ParsedByteRange(start, end)
+        return ParsedByteRange(start = start, end = end, suffixLength = null)
     }
 
     /**
      * Write-through cache is ONLY permitted when `Range` is absent OR `Range: bytes=0-` (no upper bound).
-     * Probes (`bytes=0-1`) or mid-stream seeks (`bytes=65536-`) NEVER write through to cache.
+     * Probes (`bytes=0-1`), suffix ranges (`bytes=-512`), or mid-stream seeks (`bytes=65536-`) NEVER write through to cache.
      */
     fun canWriteThroughToCache(rangeHeader: String?): Boolean {
         val raw = rangeHeader?.trim().orEmpty()
         if (raw.isEmpty()) return true
         val parsed = parseRequestRange(raw) ?: return false
-        return parsed.start == 0L && parsed.end == null
+        return !parsed.isSuffix && parsed.start == 0L && parsed.end == null
     }
 
     fun parseContentRange(rawHeader: String?): ParsedContentRange? {
@@ -70,10 +109,20 @@ object RangeHeaderValidator {
         val totalPart = rest.substring(slash + 1)
         val dash = span.indexOf('-')
         if (dash <= 0) return null
-        val start = span.substring(0, dash).toLongOrNull() ?: return null
-        val end = span.substring(dash + 1).toLongOrNull() ?: return null
-        if (end < start) return null
-        val total = if (totalPart == "*") null else totalPart.toLongOrNull()
+        val startPart = span.substring(0, dash)
+        val endPart = span.substring(dash + 1)
+        if (!startPart.all { it.isDigit() } || !endPart.all { it.isDigit() }) return null
+        val start = startPart.toLongOrNull() ?: return null
+        val end = endPart.toLongOrNull() ?: return null
+        if (start < 0L || end < start) return null
+        val total = if (totalPart == "*") {
+            null
+        } else {
+            if (!totalPart.all { it.isDigit() }) return null
+            val parsedTotal = totalPart.toLongOrNull() ?: return null
+            if (parsedTotal <= end) return null
+            parsedTotal
+        }
         return ParsedContentRange(start, end, total)
     }
 
@@ -110,6 +159,31 @@ object RangeHeaderValidator {
         if (cr == null || cr.start != expectedStartOffset) {
             throw CloudTuneException("上游 Content-Range 起点与续传偏移 $expectedStartOffset 不匹配")
         }
+    }
+
+    fun validateSuffixResponse(
+        suffixLength: Long,
+        statusCode: Int,
+        contentRangeHeader: String?
+    ): ParsedContentRange {
+        if (suffixLength <= 0L) {
+            throw CloudTuneException("无效的后缀 Range 长度: $suffixLength")
+        }
+        if (statusCode != 206) {
+            throw CloudTuneException("后缀 Range 请求要求 HTTP 206，但上游返回 $statusCode")
+        }
+        val cr = parseContentRange(contentRangeHeader)
+            ?: throw CloudTuneException("上游缺少有效的 Content-Range 响应头")
+        val total = cr.totalLength
+            ?: throw CloudTuneException("上游后缀 Range 响应缺少总字节长度")
+        if (total <= 0L || cr.end + 1L != total) {
+            throw CloudTuneException("上游后缀 Content-Range 终点不匹配: $contentRangeHeader")
+        }
+        val expectedStart = if (total > suffixLength) total - suffixLength else 0L
+        if (cr.start != expectedStart) {
+            throw CloudTuneException("上游后缀 Content-Range 起点与期望偏移 $expectedStart 不匹配")
+        }
+        return cr
     }
 
     fun splitByteRanges(totalSize: Long, partCount: Int): List<Pair<Long, Long>> {

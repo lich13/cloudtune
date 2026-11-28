@@ -155,7 +155,7 @@ private fun openSystemAudioOutputSwitcher(context: Context, runtime: CloudTuneAp
             return
         }
     }
-    runtime.statusMessage = "无法打开音频输出切换面板，请在系统控制中心切换蓝牙或扬声器。"
+    runtime.setStatus("无法打开音频输出切换面板，请在系统控制中心切换蓝牙或扬声器。", StatusKind.ERROR)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -496,12 +496,11 @@ private fun InteractivePlayerSlider(
 @Composable
 private fun StatusNoticeBanner(runtime: CloudTuneAppRuntime) {
     val colors = LocalCloudTuneColors.current
-    val rawMsg = (runtime.settingsValidationError ?: runtime.busyLabel ?: runtime.statusMessage)?.takeIf { it.isNotBlank() } ?: return
-    val isError = runtime.settingsValidationError != null ||
-        rawMsg.contains("失败") ||
-        rawMsg.contains("异常") ||
-        rawMsg.contains("不受系统解码器支持") ||
-        rawMsg.contains("已停止自动重试")
+    val validationErr = runtime.settingsValidationError?.takeIf { it.isNotBlank() }
+    val busy = runtime.busyLabel?.takeIf { it.isNotBlank() }
+    val status = runtime.statusMessage?.takeIf { it.isNotBlank() }
+    val rawMsg = validationErr ?: busy ?: status ?: return
+    val isError = validationErr != null || (busy == null && runtime.statusKind == StatusKind.ERROR)
 
     Surface(
         modifier = Modifier.fillMaxWidth(),

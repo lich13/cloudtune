@@ -32,6 +32,7 @@ import com.gosu.cloudtune.core.CacheManager
 import com.gosu.cloudtune.core.Cloud189Client
 import com.gosu.cloudtune.core.Cloud189Constants
 import com.gosu.cloudtune.core.Cloud189Protocol
+import com.gosu.cloudtune.core.ExportDownloadItem
 import com.gosu.cloudtune.core.FolderBrowsePayload
 import com.gosu.cloudtune.core.FolderSelection
 import com.gosu.cloudtune.core.GlobalTransferLimiter
@@ -80,6 +81,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+enum class StatusKind {
+    INFO,
+    ERROR
+}
+
 data class PendingExternalVideoAction(
     val video: TrackSummary,
     val streamUrl: String?
@@ -122,6 +128,12 @@ class CloudTuneAppRuntime(
     var isBootstrapping by mutableStateOf(false)
     var busyLabel by mutableStateOf<String?>(null)
     var statusMessage by mutableStateOf<String?>(null)
+    var statusKind by mutableStateOf(StatusKind.INFO)
+
+    internal fun setStatus(message: String?, kind: StatusKind = StatusKind.INFO) {
+        statusMessage = message
+        statusKind = if (message.isNullOrBlank()) StatusKind.INFO else kind
+    }
 
     var isAuthenticated by mutableStateOf(false)
     var accountName by mutableStateOf<String?>(null)
@@ -419,7 +431,7 @@ class CloudTuneAppRuntime(
         }
         val prevErr = settingsValidationError
         if (prevErr != null && statusMessage == prevErr) {
-            statusMessage = null
+            setStatus(null, StatusKind.INFO)
         }
         settingsValidationError = null
     }
@@ -427,7 +439,7 @@ class CloudTuneAppRuntime(
     fun noteDraftEdited() {
         val prevErr = settingsValidationError
         if (prevErr != null && statusMessage == prevErr) {
-            statusMessage = null
+            setStatus(null, StatusKind.INFO)
         }
         settingsValidationError = null
     }
@@ -444,7 +456,7 @@ class CloudTuneAppRuntime(
             val updated = transform(committedSettings)
             committedSettings = updated
             applyDraftSync(draftSync)
-            if (successMessage != null) statusMessage = successMessage
+            if (successMessage != null) setStatus(successMessage, StatusKind.INFO)
             return true
         }
         val mutex = settingsMutexFor(acct)
@@ -462,7 +474,7 @@ class CloudTuneAppRuntime(
             }
             val saved = ioResult.getOrElse { err ->
                 if (isAuthenticated && activeAccountKey == acct) {
-                    statusMessage = "保存设置失败：${err.message ?: "磁盘写入异常"}"
+                    setStatus("保存设置失败：${err.message ?: "磁盘写入异常"}", StatusKind.ERROR)
                 }
                 return@withLock false
             }
@@ -471,7 +483,7 @@ class CloudTuneAppRuntime(
             }
             committedSettings = saved
             applyDraftSync(draftSync)
-            if (successMessage != null) statusMessage = successMessage
+            if (successMessage != null) setStatus(successMessage, StatusKind.INFO)
             true
         }
     }
@@ -481,7 +493,7 @@ class CloudTuneAppRuntime(
         if (parsed == null || parsed < AccountSettings.MIN_CACHE_LIMIT_MB) {
             val msg = "缓存上限至少设为 256 MB。"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, StatusKind.ERROR)
             return false
         }
         val expectedAccount = activeAccountKey
@@ -513,14 +525,14 @@ class CloudTuneAppRuntime(
         if (dl == null || dl !in 1..AccountSettings.MAX_DOWNLOAD_THREADS) {
             val msg = "下载线程范围是 1-${AccountSettings.MAX_DOWNLOAD_THREADS}"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, StatusKind.ERROR)
             return false
         }
         val ct = cacheThreadsDraft.trim().toIntOrNull()
         if (ct == null || ct !in 1..AccountSettings.MAX_CACHE_THREADS) {
             val msg = "缓存线程范围是 1-${AccountSettings.MAX_CACHE_THREADS}"
             settingsValidationError = msg
-            statusMessage = msg
+            setStatus(msg, StatusKind.ERROR)
             return false
         }
         return mutateAccountSettings(
@@ -614,7 +626,7 @@ class CloudTuneAppRuntime(
                         }
                     }.onFailure { err ->
                         if (authEpoch == expectedAuthEpoch) {
-                            statusMessage = "登录凭据持久化警告：${err.message}"
+                            setStatus("登录凭据持久化警告：${err.message}", StatusKind.ERROR)
                         }
                     }
                 }
@@ -639,7 +651,7 @@ class CloudTuneAppRuntime(
             } catch (e: Exception) {
                 if (authEpoch == expectedAuthEpoch) {
                     isAuthenticated = false
-                    statusMessage = e.message
+                    setStatus(e.message, StatusKind.ERROR)
                 }
             } finally {
                 if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
@@ -679,7 +691,7 @@ class CloudTuneAppRuntime(
                 if (authEpoch != startEpoch || isAuthenticated) return@launch
                 qrContent = start.qrContent
                 qrHint = start.message
-                statusMessage = start.message
+                setStatus(start.message, StatusKind.INFO)
                 val bmp = withContext(ioDispatcher) {
                     QrCodeHelper.generateQrBitmap(start.qrContent, 480)
                 }
@@ -690,7 +702,7 @@ class CloudTuneAppRuntime(
                 throw ce
             } catch (e: Exception) {
                 if (authEpoch == startEpoch) {
-                    statusMessage = e.message
+                    setStatus(e.message, StatusKind.ERROR)
                 }
             } finally {
                 if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
@@ -715,7 +727,10 @@ class CloudTuneAppRuntime(
                         return@launch
                     }
                     qrHint = poll.message
-                    statusMessage = poll.message
+                    setStatus(
+                        poll.message,
+                        if (poll.state == QrLoginState.EXPIRED) StatusKind.ERROR else StatusKind.INFO
+                    )
                     when (poll.state) {
                         QrLoginState.AUTHENTICATED -> {
                             val qrAuthEpoch: Int
@@ -774,7 +789,7 @@ class CloudTuneAppRuntime(
                                     }
                                 }.onFailure { err ->
                                     if (authEpoch == qrAuthEpoch) {
-                                        statusMessage = "登录凭据保存异常：${err.message}"
+                                        setStatus("登录凭据保存异常：${err.message}", StatusKind.ERROR)
                                     }
                                 }
                             }
@@ -811,7 +826,7 @@ class CloudTuneAppRuntime(
                     throw ce
                 } catch (e: Exception) {
                     if (authEpoch == startEpoch) {
-                        statusMessage = e.message
+                        setStatus(e.message, StatusKind.ERROR)
                     }
                     return@launch
                 }
@@ -870,7 +885,7 @@ class CloudTuneAppRuntime(
                         val warning = "登录凭据保存异常：${err.message ?: "未知错误"}"
                         credentialWarning = warning
                         if (authEpoch == loginEpoch) {
-                            statusMessage = warning
+                            setStatus(warning, StatusKind.ERROR)
                         }
                     }
                 }
@@ -895,10 +910,10 @@ class CloudTuneAppRuntime(
                 }
                 browseToSuspend(BrowserScope.CLOUD, null, listOf(BreadcrumbItem.ROOT), showBusy = false)
                 if (authEpoch == loginEpoch && isAuthenticated && activeAccountKey == identity.storageKey) {
-                    statusMessage = if (credentialWarning != null) {
-                        "天翼官方网页一键登录成功（$credentialWarning）"
+                    if (credentialWarning != null) {
+                        setStatus("天翼官方网页一键登录成功（$credentialWarning）", StatusKind.ERROR)
                     } else {
-                        "天翼官方网页一键登录成功"
+                        setStatus("天翼官方网页一键登录成功", StatusKind.INFO)
                     }
                 }
             } catch (ce: CancellationException) {
@@ -906,7 +921,10 @@ class CloudTuneAppRuntime(
             } catch (e: Exception) {
                 if (authEpoch == loginEpoch) {
                     isShowingWebLoginDialog = false
-                    statusMessage = "网页回调兑换失败（${e.message}），已自动切换二维码登录，可保存二维码到相册识别。"
+                    setStatus(
+                        "网页回调兑换失败（${e.message}），已自动切换二维码登录，可保存二维码到相册识别。",
+                        StatusKind.ERROR
+                    )
                     beginQrLogin()
                 }
             } finally {
@@ -1066,7 +1084,7 @@ class CloudTuneAppRuntime(
         )
         syncDraftsFromCommitted()
         syncQueueAvailabilityToBridge()
-        statusMessage = "已退出登录并清理当前会话"
+        setStatus("已退出登录并清理当前会话", StatusKind.INFO)
     }
 
     private suspend fun clearWebViewCookiesAndFlush() {
@@ -1191,7 +1209,7 @@ class CloudTuneAppRuntime(
             throw ce
         } catch (e: Exception) {
             if (gen == currentBrowserGeneration(scopeTarget) && isAuthenticated && activeAccountKey == expectedAccount) {
-                statusMessage = e.message
+                setStatus(e.message, StatusKind.ERROR)
             }
         } finally {
             if (assignedBusy != null && browserBusyToken == myBusyToken && busyLabel == assignedBusy) {
@@ -1222,11 +1240,11 @@ class CloudTuneAppRuntime(
 
     fun scanMusicLibrary() {
         if (!isAuthenticated) {
-            statusMessage = "请先在云盘目录中设为音乐库"
+            setStatus("请先在云盘目录中设为音乐库", StatusKind.INFO)
             return
         }
         val folder = committedSettings.musicFolder ?: run {
-            statusMessage = "请先在云盘目录中设为音乐库"
+            setStatus("请先在云盘目录中设为音乐库", StatusKind.INFO)
             return
         }
         val acct = activeAccountKey ?: return
@@ -1254,17 +1272,17 @@ class CloudTuneAppRuntime(
                     }
                 }.isSuccess
                 if (isAuthenticated && authEpoch == expectedEpoch && activeAccountKey == acct) {
-                    statusMessage = if (persistedOk) {
-                        "已载入 ${scanned.size} 首音乐"
+                    if (persistedOk) {
+                        setStatus("已载入 ${scanned.size} 首音乐", StatusKind.INFO)
                     } else {
-                        "已载入 ${scanned.size} 首音乐（本地索引保存失败）"
+                        setStatus("已载入 ${scanned.size} 首音乐（本地索引保存失败）", StatusKind.ERROR)
                     }
                 }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
                 if (isAuthenticated && authEpoch == expectedEpoch && activeAccountKey == acct) {
-                    statusMessage = e.message
+                    setStatus(e.message, StatusKind.ERROR)
                 }
             } finally {
                 if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
@@ -1281,14 +1299,14 @@ class CloudTuneAppRuntime(
         prefetchingTrackId = null
         prefetchedTrackId = null
         syncQueueAvailabilityToBridge()
-        statusMessage = "已设为下一首播放：《${track.name}》"
+        setStatus("已设为下一首播放：《${track.name}》", StatusKind.INFO)
         scheduleUpcomingPrefetch()
     }
 
     fun appendToQueue(track: TrackSummary) {
         upNextQueue = PlaybackQueueResolver.appendToQueue(upNextQueue, track)
         syncQueueAvailabilityToBridge()
-        statusMessage = "已加入待播队列：《${track.name}》"
+        setStatus("已加入待播队列：《${track.name}》", StatusKind.INFO)
     }
 
     fun removeFromQueue(trackId: String) {
@@ -1551,7 +1569,10 @@ class CloudTuneAppRuntime(
         updateUiProgressClock()
         syncQueueAvailabilityToBridge()
         scheduleUpcomingPrefetch()
-        statusMessage = if (isLoopback) "边播边缓存《${track.name}》" else "正在播放《${track.name}》"
+        setStatus(
+            if (isLoopback) "边播边缓存《${track.name}》" else "正在播放《${track.name}》",
+            StatusKind.INFO
+        )
     }
 
     internal suspend fun handleWriteThroughCompleted(
@@ -1672,18 +1693,21 @@ class CloudTuneAppRuntime(
             is PlaybackFailureAction.StopImmediatelyUnsupportedCodec -> {
                 isPlaying = false
                 updateUiProgressClock()
-                statusMessage = action.userMessage
+                setStatus(action.userMessage, StatusKind.ERROR)
             }
             PlaybackFailureAction.StopAfterMaxRetries -> {
                 isPlaying = false
                 updateUiProgressClock()
-                statusMessage = "播放异常，已停止自动重试《${track.name}》"
+                setStatus("播放异常，已停止自动重试《${track.name}》", StatusKind.ERROR)
             }
             is PlaybackFailureAction.RetryTransientAfterDelay -> {
                 isPlaying = false
                 updateUiProgressClock()
                 if (!isAuthenticated || playbackGeneration != failedGeneration) return
-                statusMessage = "播放波动，正在重试《${track.name}》(${action.attempt}/${PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS})"
+                setStatus(
+                    "播放波动，正在重试《${track.name}》(${action.attempt}/${PlaybackDecisionPolicy.MAX_RECOVERY_ATTEMPTS})",
+                    StatusKind.INFO
+                )
                 val delayMs = maxOf(0L, retryBaseDelayMs) * action.attempt
                 scope.launch {
                     if (delayMs > 0L) {
@@ -1846,7 +1870,7 @@ class CloudTuneAppRuntime(
                 throw ce
             } catch (e: Exception) {
                 if (gen == playbackGeneration && isAuthenticated && activeAccountKey == expectedAccount) {
-                    statusMessage = e.message
+                    setStatus(e.message, StatusKind.ERROR)
                 }
             } finally {
                 if (busyLabel == assignedBusy) {
@@ -1911,7 +1935,11 @@ class CloudTuneAppRuntime(
             val ok = withContext(ioDispatcher) {
                 QrCodeHelper.saveQrBitmapToGallery(targetCtx, bmp)
             }
-            statusMessage = if (ok) "二维码已保存到系统相册" else "保存二维码失败"
+            if (ok) {
+                setStatus("二维码已保存到系统相册", StatusKind.INFO)
+            } else {
+                setStatus("保存二维码失败", StatusKind.ERROR)
+            }
         }
     }
 
@@ -1969,7 +1997,7 @@ class CloudTuneAppRuntime(
                 throw ce
             } catch (e: Exception) {
                 if (extGen == externalVideoGeneration && isAuthenticated && activeAccountKey == expectedAccount) {
-                    statusMessage = "准备外部播放失败：${e.message}"
+                    setStatus("准备外部播放失败：${e.message}", StatusKind.ERROR)
                 }
             } finally {
                 if (busyLabel == assignedBusy) {
@@ -2013,7 +2041,7 @@ class CloudTuneAppRuntime(
                 throw ce
             } catch (e: Exception) {
                 if (extGen == externalVideoGeneration && isAuthenticated && activeAccountKey == acct) {
-                    statusMessage = "缓存视频失败：${e.message}"
+                    setStatus("缓存视频失败：${e.message}", StatusKind.ERROR)
                 }
             } finally {
                 if (busyLabel == assignedBusy) {
@@ -2039,7 +2067,7 @@ class CloudTuneAppRuntime(
         runCatching {
             context.startActivity(chooser)
         }.onFailure { err ->
-            statusMessage = "未能唤起外部视频播放器：${err.message}"
+            setStatus("未能唤起外部视频播放器：${err.message}", StatusKind.ERROR)
         }
     }
 
@@ -2089,6 +2117,51 @@ class CloudTuneAppRuntime(
         }
     }
 
+    private fun buildSafStagedExporter(
+        appContextRef: Context,
+        accountKey: String,
+        explicitTreeUri: String?,
+        fallbackTreeUri: String?
+    ): StagedFileExporter = object : StagedFileExporter {
+        private fun resolveEffectiveTreeUri(manifestTreeUri: String?): String? =
+            explicitTreeUri
+                ?: manifestTreeUri?.takeIf { it.isNotBlank() }
+                ?: accountStore.loadSettingsOrNull(accountKey)?.exportTreeUri
+                ?: fallbackTreeUri
+
+        override suspend fun export(
+            stagedFile: File,
+            relativeSubpath: String,
+            accountId: String,
+            exportTreeUri: String?
+        ): String {
+            return SafExporter.exportToSafTree(
+                context = appContextRef,
+                treeUriString = resolveEffectiveTreeUri(exportTreeUri),
+                stagedFile = stagedFile,
+                relativeSubpath = relativeSubpath,
+                mimeType = Cloud189Protocol.guessMimeType(relativeSubpath)
+            )
+        }
+
+        override suspend fun exportParts(
+            partFiles: List<File>,
+            expectedTotalBytes: Long,
+            relativeSubpath: String,
+            accountId: String,
+            exportTreeUri: String?
+        ): String {
+            return SafExporter.exportPartsToSafTree(
+                context = appContextRef,
+                treeUriString = resolveEffectiveTreeUri(exportTreeUri),
+                partFiles = partFiles,
+                expectedTotalBytes = expectedTotalBytes,
+                relativeSubpath = relativeSubpath,
+                mimeType = Cloud189Protocol.guessMimeType(relativeSubpath)
+            )
+        }
+    }
+
     fun enqueueDownload(
         context: Context,
         track: TrackSummary,
@@ -2102,20 +2175,9 @@ class CloudTuneAppRuntime(
         enqueueDownloadWithExporter(
             track = track,
             expectedAccount = acct,
-            exportTreeUri = pinnedTreeUri
-        ) { staged, rel, _, manifestTreeUri ->
-            val effectiveTreeUri = manifestTreeUri?.takeIf { it.isNotBlank() }
-                ?: explicitTreeUri
-                ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
-                ?: fallbackTreeUri
-            SafExporter.exportToSafTree(
-                context = appContextRef,
-                treeUriString = effectiveTreeUri,
-                stagedFile = staged,
-                relativeSubpath = rel,
-                mimeType = Cloud189Protocol.guessMimeType(track.name)
-            )
-        }
+            exportTreeUri = pinnedTreeUri,
+            exporter = buildSafStagedExporter(appContextRef, acct, explicitTreeUri, fallbackTreeUri)
+        )
     }
 
     internal fun enqueueDownloadWithExporter(
@@ -2149,7 +2211,7 @@ class CloudTuneAppRuntime(
             }
             if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
                 transferSnapshot = snap
-                statusMessage = "已添加下载任务 $taskId"
+                setStatus("已添加下载任务 $taskId", StatusKind.INFO)
             }
         }
     }
@@ -2167,20 +2229,9 @@ class CloudTuneAppRuntime(
         enqueueCurrentFolderDownloadWithExporter(
             pane = pane,
             expectedAccount = acct,
-            exportTreeUri = pinnedTreeUri
-        ) { staged, subpath, _, manifestTreeUri ->
-            val effectiveTreeUri = manifestTreeUri?.takeIf { it.isNotBlank() }
-                ?: explicitTreeUri
-                ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
-                ?: fallbackTreeUri
-            SafExporter.exportToSafTree(
-                context = appContextRef,
-                treeUriString = effectiveTreeUri,
-                stagedFile = staged,
-                relativeSubpath = subpath,
-                mimeType = Cloud189Protocol.guessMimeType(subpath)
-            )
-        }
+            exportTreeUri = pinnedTreeUri,
+            exporter = buildSafStagedExporter(appContextRef, acct, explicitTreeUri, fallbackTreeUri)
+        )
     }
 
     internal fun enqueueCurrentFolderDownloadWithExporter(
@@ -2212,40 +2263,42 @@ class CloudTuneAppRuntime(
             try {
                 val allFiles = cloudClient.scanAllFiles(b.currentFolderId, rootExportFolder)
                 if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) return@launch
+                val batchItems = allFiles.map { item ->
+                    val rel = if (item.folderPath.startsWith(rootExportFolder)) {
+                        "${item.folderPath}/${item.name}"
+                    } else {
+                        "$rootExportFolder/${item.name}"
+                    }
+                    ExportDownloadItem(track = item, relativeSubpath = rel)
+                }
                 val snap = withContext(ioDispatcher) {
+                    if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) {
+                        return@withContext transferEngine.snapshot()
+                    }
                     val paths = accountStore.paths(acct)
                     val resolvedTreeUri = exportTreeUri?.takeIf { it.isNotBlank() }
                         ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri?.takeIf { it.isNotBlank() }
                         ?: inMemoryTreeUri?.takeIf { it.isNotBlank() }
-                    for (item in allFiles) {
-                        if (authEpoch != expectedEpoch || !isAuthenticated || activeAccountKey != acct) break
-                        val rel = if (item.folderPath.startsWith(rootExportFolder)) {
-                            "${item.folderPath}/${item.name}"
-                        } else {
-                            "$rootExportFolder/${item.name}"
-                        }
-                        transferEngine.enqueueExportDownload(
-                            accountId = acct,
-                            track = item,
-                            relativeSubpath = rel,
-                            parallelThreads = threads,
-                            stagingRootDir = paths.stagingDir,
-                            manifestsFile = paths.transfersFile,
-                            exportTreeUri = resolvedTreeUri,
-                            exporter = exporter
-                        )
-                    }
+                    transferEngine.enqueueExportDownloads(
+                        accountId = acct,
+                        items = batchItems,
+                        parallelThreads = threads,
+                        stagingRootDir = paths.stagingDir,
+                        manifestsFile = paths.transfersFile,
+                        exportTreeUri = resolvedTreeUri,
+                        exporter = exporter
+                    )
                     transferEngine.snapshot()
                 }
                 if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
                     transferSnapshot = snap
-                    statusMessage = "目录下载已入队（共 ${allFiles.size} 个文件）"
+                    setStatus("目录下载已入队（共 ${batchItems.size} 个文件）", StatusKind.INFO)
                 }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
                 if (authEpoch == expectedEpoch && isAuthenticated && activeAccountKey == acct) {
-                    statusMessage = e.message
+                    setStatus(e.message, StatusKind.ERROR)
                 }
             } finally {
                 if (operationBusyToken == myBusyToken && busyLabel == assignedBusy) {
@@ -2277,22 +2330,11 @@ class CloudTuneAppRuntime(
         val acct = activeAccountKey ?: return
         val explicitTreeUri = treeUriString?.takeIf { it.isNotBlank() }
         val fallbackTreeUri = committedSettings.exportTreeUri
+        val safExporter = buildSafStagedExporter(appContextRef, acct, explicitTreeUri, fallbackTreeUri)
         scope.launch {
             val snap = withContext(ioDispatcher) {
                 val paths = accountStore.paths(acct)
-                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile) { staged, rel, _, manifestTreeUri ->
-                    val effectiveTreeUri = explicitTreeUri
-                        ?: manifestTreeUri?.takeIf { it.isNotBlank() }
-                        ?: accountStore.loadSettingsOrNull(acct)?.exportTreeUri
-                        ?: fallbackTreeUri
-                    SafExporter.exportToSafTree(
-                        context = appContextRef,
-                        treeUriString = effectiveTreeUri,
-                        stagedFile = staged,
-                        relativeSubpath = rel,
-                        mimeType = Cloud189Protocol.guessMimeType(rel)
-                    )
-                }
+                transferEngine.resumeTransfer(id, paths.stagingDir, paths.transfersFile, safExporter)
                 transferEngine.snapshot()
             }
             if (isAuthenticated && activeAccountKey == acct) {

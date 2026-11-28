@@ -2,12 +2,14 @@ import CloudTuneCore
 import CloudTuneUI
 import Foundation
 import Observation
+import SwiftUI
 import Testing
 #if os(macOS)
 import AppKit
 import WebKit
 #endif
 
+#if DEBUG
 private func repoRootURL() -> URL {
     URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
@@ -1439,5 +1441,67 @@ struct CloudTuneUITests {
             #expect(darkMetrics.meanLuminance < 0.35, "Dark snapshot \(scene.rawValue) should have pine-night dark luminance")
         }
     }
+
+    @Test("macOS live mainWindow and preferencesWindow NSAppearance Light/Dark runtime switching")
+    @MainActor
+    func verifyMacOSLiveWindowAppearanceSwitching() throws {
+        let root = repoRootURL()
+        let fixture = try RepresentativeFixture.load(from: root.appendingPathComponent("contracts/representative-state.json"))
+        let vm = CloudTuneViewModel.fixture(scene: .music, fixture: fixture)
+
+        let mainHosting = NSHostingController(rootView: MacWorkspaceView(viewModel: vm))
+        let mainWindow = NSWindow(contentViewController: mainHosting)
+        mainWindow.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
+        mainWindow.setContentSize(NSSize(width: 1280, height: 820))
+        mainWindow.isReleasedWhenClosed = false
+
+        let prefsHosting = NSHostingController(rootView: MacPreferencesView(viewModel: vm).frame(width: 520))
+        let prefsWindow = NSWindow(contentViewController: prefsHosting)
+        prefsWindow.styleMask = [.titled, .closable]
+        prefsWindow.setContentSize(NSSize(width: 520, height: 500))
+        prefsWindow.isReleasedWhenClosed = false
+
+        defer {
+            prefsWindow.orderOut(nil)
+            mainWindow.orderOut(nil)
+        }
+
+        func captureLuminance(of window: NSWindow) throws -> Double {
+            let contentView = try #require(window.contentView)
+            contentView.layoutSubtreeIfNeeded()
+            let bounds = contentView.bounds
+            let rep = try #require(contentView.bitmapImageRepForCachingDisplay(in: bounds))
+            contentView.cacheDisplay(in: bounds, to: rep)
+            let png = try #require(rep.representation(using: .png, properties: [:]))
+            return try SnapshotRenderer.analyzePNGData(png).meanLuminance
+        }
+
+        // 1) Switch both windows to explicit Light (.aqua)
+        vm.appearancePreference = .light
+        let aqua = try #require(NSAppearance(named: .aqua))
+        mainWindow.appearance = aqua
+        prefsWindow.appearance = aqua
+        RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+        #expect(mainWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua)
+        #expect(prefsWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua)
+        let mainLightLum = try captureLuminance(of: mainWindow)
+        let prefsLightLum = try captureLuminance(of: prefsWindow)
+        #expect(mainLightLum > 0.65)
+        #expect(prefsLightLum > 0.65)
+
+        // 2) Switch both windows live to Dark (.darkAqua)
+        vm.appearancePreference = .dark
+        let darkAqua = try #require(NSAppearance(named: .darkAqua))
+        mainWindow.appearance = darkAqua
+        prefsWindow.appearance = darkAqua
+        RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+        #expect(mainWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        #expect(prefsWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        let mainDarkLum = try captureLuminance(of: mainWindow)
+        let prefsDarkLum = try captureLuminance(of: prefsWindow)
+        #expect(mainDarkLum < 0.35)
+        #expect(prefsDarkLum < 0.35)
+    }
     #endif
 }
+#endif

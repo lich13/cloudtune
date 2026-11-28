@@ -407,6 +407,7 @@ package struct NowPlayingScrubberView: View {
 
     @State private var scrubPreviewSeconds: Double?
     @State private var inFlightSeekToken: UInt64 = 0
+    @State private var isSeekInFlight: Bool = false
 
     package init(
         timeline: PlaybackTimeline,
@@ -424,13 +425,23 @@ package struct NowPlayingScrubberView: View {
         scrubPreviewSeconds ?? timeline.currentTime
     }
 
+    private func handlePreviewChange(_ preview: Double?) {
+        if let preview {
+            scrubPreviewSeconds = preview
+        } else if !isSeekInFlight {
+            scrubPreviewSeconds = nil
+        }
+    }
+
     private func commitSeek(_ targetSeconds: Double) {
         scrubPreviewSeconds = targetSeconds
+        isSeekInFlight = true
         inFlightSeekToken &+= 1
         let token = inFlightSeekToken
         Task { @MainActor in
             await onSeek(targetSeconds)
             if inFlightSeekToken == token {
+                isSeekInFlight = false
                 scrubPreviewSeconds = nil
             }
         }
@@ -450,13 +461,7 @@ package struct NowPlayingScrubberView: View {
                     total: timeline.duration,
                     palette: palette,
                     touchHeight: 20,
-                    onPreviewChange: { preview in
-                        if let preview {
-                            scrubPreviewSeconds = preview
-                        } else if inFlightSeekToken == 0 {
-                            scrubPreviewSeconds = nil
-                        }
-                    },
+                    onPreviewChange: handlePreviewChange,
                     onSeek: commitSeek
                 )
 
@@ -473,13 +478,7 @@ package struct NowPlayingScrubberView: View {
                     total: timeline.duration,
                     palette: palette,
                     touchHeight: 32,
-                    onPreviewChange: { preview in
-                        if let preview {
-                            scrubPreviewSeconds = preview
-                        } else if inFlightSeekToken == 0 {
-                            scrubPreviewSeconds = nil
-                        }
-                    },
+                    onPreviewChange: handlePreviewChange,
                     onSeek: commitSeek
                 )
                 HStack {

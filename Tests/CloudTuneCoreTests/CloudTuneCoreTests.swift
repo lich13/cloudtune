@@ -500,6 +500,7 @@ struct CloudTuneCoreTests {
         #expect((revokedResp as? HTTPURLResponse)?.statusCode == 404)
     }
 
+    #if DEBUG
     @Test("Keychain CredentialStateMachine handles DarkWake deferral without false logout or retry loops")
     func verifyKeychainStateMachine() throws {
         let backend = InMemoryKeychainBackend()
@@ -527,6 +528,7 @@ struct CloudTuneCoreTests {
         #expect(recovered.issue == nil)
         #expect(backend.readCallCount == 2)
     }
+    #endif
 
     @Test("GlobalTransferSemaphore never leaks permits when queued waiters cancel or release is called extra times")
     func verifySemaphoreWaiterCancellationNoPermitLeak() async throws {
@@ -2034,7 +2036,7 @@ struct CloudTuneCoreTests {
     @Test("Slice 3: Off-MainActor NowPlayingCoordinator remote command handler invocation and live 4-part cross-restart byte-exact export resume")
     func verifyOffMainActorRemoteCommandsAndFourPartCrossRestartExportResume() async throws {
         // 1) Invoke NowPlayingCoordinator remote command handler targets directly on DispatchQueue.global()
-        #if canImport(MediaPlayer)
+        #if canImport(MediaPlayer) && DEBUG
         let recordedEvents = LockedBox<[String]>([])
         let coordinator = await MainActor.run {
             let c = NowPlayingCoordinator()

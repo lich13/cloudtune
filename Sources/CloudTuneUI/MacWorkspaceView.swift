@@ -1560,6 +1560,8 @@ package struct MacPreferencesView: View {
             }
         }
         .padding(22)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(palette.surfacePrimary)
         .preferredColorScheme(viewModel.appearancePreference.preferredColorScheme)
     }
 }

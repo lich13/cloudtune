@@ -54,7 +54,7 @@ app_dir = Path(sys.argv[1]).resolve(strict=True)
 ipa_path = Path(sys.argv[2])
 ipa_path.unlink(missing_ok=True)
 
-with zipfile.ZipFile(ipa_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+with zipfile.ZipFile(ipa_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
     for file_path in sorted(app_dir.rglob("*")):
         if file_path.is_dir():
             continue

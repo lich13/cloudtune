@@ -10,6 +10,25 @@ extension Notification.Name {
     public static let cloudTuneFocusSearch = Notification.Name("com.gosu.cloudtune.focusSearch")
 }
 
+@MainActor
+private func presentMacPanelAsync(
+    _ panel: NSSavePanel,
+    preferredWindow: NSWindow? = nil
+) async -> NSApplication.ModalResponse {
+    let hostWindow = preferredWindow
+        ?? NSApp.keyWindow.flatMap { $0.isVisible ? $0 : nil }
+        ?? NSApp.mainWindow.flatMap { $0.isVisible ? $0 : nil }
+        ?? NSApp.windows.first(where: { $0.isVisible && !$0.isSheet })
+    if let hostWindow {
+        return await panel.beginSheetModal(for: hostWindow)
+    }
+    return await withCheckedContinuation { continuation in
+        panel.begin { response in
+            continuation.resume(returning: response)
+        }
+    }
+}
+
 public enum MacShortcutFocusGuard {
     @MainActor
     public static func shouldAllowSingleKeyPlaybackShortcut(in window: NSWindow?) -> Bool {
@@ -235,7 +254,7 @@ public struct MacWorkspaceView: View {
                     HStack(spacing: 10) {
                         if let qrPNG = viewModel.qrPNGData {
                             SecondaryActionButton("保存二维码图片", systemImage: "square.and.arrow.down", palette: palette) {
-                                saveQRImageToDisk(qrPNG)
+                                Task { await saveQRImageToDisk(qrPNG) }
                             }
                         }
                         if viewModel.credentialIssue != nil {
@@ -511,8 +530,10 @@ public struct MacWorkspaceView: View {
                 }
             } else if viewModel.activeModule == .transfers {
                 SecondaryActionButton("选择导出目录", systemImage: "folder.badge.gearshape", palette: palette) {
-                    if let url = pickDirectoryViaOpenPanel() {
-                        Task { await viewModel.saveExportDirectoryBookmark(url) }
+                    Task {
+                        if let url = await pickDirectoryViaOpenPanel() {
+                            await viewModel.saveExportDirectoryBookmark(url)
+                        }
                     }
                 }
             }
@@ -980,8 +1001,8 @@ public struct MacWorkspaceView: View {
                 SecondaryActionButton("整夹下载", systemImage: "arrow.down.doc", palette: palette, isDisabled: pane.payload == nil) {
                     Task {
                         if viewModel.committedSettings.exportFolderDisplayName == nil {
-                            if let dir = pickDirectoryViaOpenPanel() {
-                                await viewModel.saveExportDirectoryBookmark(dir)
+                            if let dir = await pickDirectoryViaOpenPanel(),
+                               await viewModel.saveExportDirectoryBookmark(dir) {
                                 await viewModel.enqueueFolderDownload(from: pane, explicitDirectoryURL: dir)
                             }
                         } else {
@@ -1336,8 +1357,8 @@ public struct MacWorkspaceView: View {
 
     private func enqueueDownloadEnsuringDirectory(_ track: TrackSummary) async {
         if viewModel.committedSettings.exportFolderDisplayName == nil {
-            if let dir = pickDirectoryViaOpenPanel() {
-                await viewModel.saveExportDirectoryBookmark(dir)
+            if let dir = await pickDirectoryViaOpenPanel(),
+               await viewModel.saveExportDirectoryBookmark(dir) {
                 await viewModel.enqueueTrackDownload(track, explicitDirectoryURL: dir)
             }
         } else {
@@ -1345,21 +1366,21 @@ public struct MacWorkspaceView: View {
         }
     }
 
-    private func pickDirectoryViaOpenPanel() -> URL? {
+    private func pickDirectoryViaOpenPanel() async -> URL? {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "选择导出目录"
-        return panel.runModal() == .OK ? panel.url : nil
+        return await presentMacPanelAsync(panel) == .OK ? panel.url : nil
     }
 
-    private func saveQRImageToDisk(_ pngData: Data) {
+    private func saveQRImageToDisk(_ pngData: Data) async {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = "CloudTune-Tianyi-QRCode.png"
-        if panel.runModal() == .OK, let url = panel.url {
+        if await presentMacPanelAsync(panel) == .OK, let url = panel.url {
             do {
                 try pngData.write(to: url, options: .atomic)
                 viewModel.statusMessage = "二维码已保存至 \(url.lastPathComponent)"
@@ -1514,13 +1535,16 @@ public struct MacPreferencesView: View {
                         .truncationMode(.middle)
                     Spacer(minLength: 4)
                     SecondaryActionButton("选择目录…", systemImage: "folder.badge.gearshape", palette: palette) {
-                        let panel = NSOpenPanel()
-                        panel.canChooseDirectories = true
-                        panel.canChooseFiles = false
-                        panel.allowsMultipleSelection = false
-                        panel.canCreateDirectories = true
-                        if panel.runModal() == .OK, let dir = panel.url {
-                            Task { await viewModel.saveExportDirectoryBookmark(dir) }
+                        Task {
+                            let panel = NSOpenPanel()
+                            panel.canChooseDirectories = true
+                            panel.canChooseFiles = false
+                            panel.allowsMultipleSelection = false
+                            panel.canCreateDirectories = true
+                            panel.prompt = "选择导出目录"
+                            if await presentMacPanelAsync(panel) == .OK, let dir = panel.url {
+                                await viewModel.saveExportDirectoryBookmark(dir)
+                            }
                         }
                     }
                 }
@@ -1687,12 +1711,14 @@ struct MacExternalVideoChoiceSheet: View {
                         }
                     }
                     SecondaryActionButton("选择其他应用…", systemImage: "folder", palette: palette) {
-                        let panel = NSOpenPanel()
-                        panel.allowedContentTypes = [.application]
-                        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
-                        panel.allowsMultipleSelection = false
-                        if panel.runModal() == .OK, let appURL = panel.url {
-                            onOpenStreamInInstalledPlayer(appURL)
+                        Task {
+                            let panel = NSOpenPanel()
+                            panel.allowedContentTypes = [.application]
+                            panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+                            panel.allowsMultipleSelection = false
+                            if await presentMacPanelAsync(panel) == .OK, let appURL = panel.url {
+                                onOpenStreamInInstalledPlayer(appURL)
+                            }
                         }
                     }
                 }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum LoopMode: String, Codable, CaseIterable, Sendable {
@@ -686,12 +687,20 @@ public struct QrPollResponse: Equatable, Sendable {
     public var message: String
     public var accountName: String?
     public var redirectURL: String?
+    public var sessionEpoch: UInt64?
 
-    public init(state: QrLoginState, message: String, accountName: String? = nil, redirectURL: String? = nil) {
+    public init(
+        state: QrLoginState,
+        message: String,
+        accountName: String? = nil,
+        redirectURL: String? = nil,
+        sessionEpoch: UInt64? = nil
+    ) {
         self.state = state
         self.message = message
         self.accountName = accountName
         self.redirectURL = redirectURL
+        self.sessionEpoch = sessionEpoch
     }
 }
 
@@ -699,13 +708,19 @@ public struct NowPlayingMetadata: Equatable, Sendable {
     public var title: String
     public var artist: String?
     public var album: String?
-    public var artworkData: Data?
+    public var artworkData: Data? {
+        didSet {
+            artworkDigest = artworkData.map { SHA256.hash(data: $0) }
+        }
+    }
+    public private(set) var artworkDigest: SHA256Digest?
 
     public init(title: String, artist: String? = nil, album: String? = nil, artworkData: Data? = nil) {
         self.title = title
         self.artist = artist
         self.album = album
         self.artworkData = artworkData
+        self.artworkDigest = artworkData.map { SHA256.hash(data: $0) }
     }
 }
 

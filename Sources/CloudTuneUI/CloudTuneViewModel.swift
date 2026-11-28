@@ -244,6 +244,7 @@ public final class CloudTuneViewModel {
         _player = created
         return created
     }
+    @ObservationIgnored private weak var currentPlayerItem: AVPlayerItem?
     @ObservationIgnored private var timeObserverToken: Any?
     @ObservationIgnored private var endObserver: NSObjectProtocol?
     @ObservationIgnored private var failObserver: NSObjectProtocol?
@@ -252,6 +253,7 @@ public final class CloudTuneViewModel {
     private var qrPollTask: Task<Void, Never>?
     private var transferRefreshTask: Task<Void, Never>?
     private var retrySleepTask: Task<Void, Error>?
+    private var prefetchTask: Task<Void, Never>?
     private var prefetchedTrackId: String?
     private var prefetchingTrackId: String?
     private var authGeneration: Int = 0
@@ -275,6 +277,7 @@ public final class CloudTuneViewModel {
         accountStore: AccountScopedStore? = nil,
         keychainBackend: KeychainBackend = SystemKeychainBackend(),
         semaphore: GlobalTransferSemaphore = GlobalTransferSemaphore(maxPermits: 8),
+        upstreamFetcher: UpstreamStreamFetcher = URLSessionUpstreamStreamFetcher(),
         userDefaults: UserDefaults = .standard,
         enableLiveObservers: Bool = true
     ) {
@@ -298,7 +301,7 @@ public final class CloudTuneViewModel {
             }
         }
 
-        let engine = TransferEngine(semaphore: semaphore) { [cloudClient] trackId in
+        let engine = TransferEngine(semaphore: semaphore, fetcher: upstreamFetcher) { [cloudClient] trackId in
             try await cloudClient.resolveDownloadURL(fileId: trackId)
         }
         self.transferEngine = engine
@@ -309,6 +312,7 @@ public final class CloudTuneViewModel {
             do {
                 self.streamServer = try StreamProxyServer(
                     semaphore: semaphore,
+                    fetcher: upstreamFetcher,
                     onAccountStreamStatusUpdate: { id, accountHash, status in
                         await engine.updateExternalTransferStatus(id: id, accountHash: accountHash, status: status)
                     },
@@ -838,9 +842,9 @@ public final class CloudTuneViewModel {
         }
 
         do {
-            let sessionPayload = try await cloudClient.restoreFromRefreshCredential(storedCred)
+            let (sessionPayload, clientEpoch) = try await cloudClient.restoreSessionWithEpoch(storedCred)
             guard authGeneration == expectedAuthGen, !isAuthenticated else {
-                await cloudClient.clearSession()
+                await cloudClient.clearSession(ifEpoch: clientEpoch)
                 return
             }
             let identity = Cloud189Protocol.resolveAccountIdentity(
@@ -912,10 +916,22 @@ public final class CloudTuneViewModel {
                     self.statusMessage = poll.message
                     switch poll.state {
                     case .authenticated:
-                        let activeSession = await self.cloudClient.activeSession
-                        let persisted = await self.cloudClient.persistedCredential
+                        let clientEpoch = poll.sessionEpoch
                         guard !Task.isCancelled, self.authGeneration == expectedAuthGen else {
-                            await self.cloudClient.clearSession()
+                            if let clientEpoch {
+                                await self.cloudClient.clearSession(ifEpoch: clientEpoch)
+                            }
+                            return
+                        }
+                        guard let snapshot = await self.cloudClient.sessionSnapshot(forEpoch: clientEpoch) else {
+                            return
+                        }
+                        let activeSession = snapshot.active
+                        let persisted = snapshot.persisted
+                        guard !Task.isCancelled, self.authGeneration == expectedAuthGen else {
+                            if let clientEpoch {
+                                await self.cloudClient.clearSession(ifEpoch: clientEpoch)
+                            }
                             return
                         }
                         let identity: (storageKey: String, displayName: String)
@@ -979,12 +995,16 @@ public final class CloudTuneViewModel {
                 busyLabel = nil
             }
         }
+        qrPollTask?.cancel()
+        qrPollTask = nil
         do {
+            await cloudClient.invalidateInFlightAuth()
+            guard authGeneration == loginAuthGen else { return }
             await cloudClient.importWebCookies(cookies)
             guard authGeneration == loginAuthGen else { return }
-            let parsed = try await cloudClient.exchangeRedirectForSession(redirectURL: callbackURL.absoluteString)
+            let (parsed, clientEpoch) = try await cloudClient.exchangeRedirectForSessionWithEpoch(redirectURL: callbackURL.absoluteString)
             guard authGeneration == loginAuthGen else {
-                await cloudClient.clearSession()
+                await cloudClient.clearSession(ifEpoch: clientEpoch)
                 return
             }
             let identity = Cloud189Protocol.resolveAccountIdentity(
@@ -1110,9 +1130,10 @@ public final class CloudTuneViewModel {
         videoBrowserIdleGeneration = videoBrowserGeneration
         lastAppliedSettingsSeq = 0
         recoveryAttempts = 0
+        cancelPrefetchTask()
         prefetchedTrackId = nil
-        prefetchingTrackId = nil
         wasPlayingBeforeInterruption = false
+        currentPlayerItem = nil
         teardownPlayerAndRemoteCommands()
         _player?.pause()
         _player?.replaceCurrentItem(with: nil)
@@ -1159,6 +1180,29 @@ public final class CloudTuneViewModel {
         committedSettings = AccountSettings(appearanceMode: appearancePreference)
         syncDraftsFromCommitted()
         statusMessage = "已退出登录并清理当前会话"
+    }
+
+    public func shutdownForTermination() {
+        qrPollTask?.cancel()
+        qrPollTask = nil
+        transferRefreshTask?.cancel()
+        transferRefreshTask = nil
+        retrySleepTask?.cancel()
+        retrySleepTask = nil
+        cancelPrefetchTask()
+        currentPlayerItem = nil
+        teardownPlayerAndRemoteCommands()
+        _player?.pause()
+        _player?.replaceCurrentItem(with: nil)
+        nowPlayingCoordinator.updateNowPlaying(metadata: nil, isPlaying: false, elapsedSeconds: 0, durationSeconds: 0)
+        streamServer?.shutdownImmediate()
+        transferEngine.cancelAllImmediate()
+    }
+
+    private func cancelPrefetchTask() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        prefetchingTrackId = nil
     }
 
     // MARK: - Decoupled Cloud & Video Folder Browsers + Library
@@ -1334,10 +1378,11 @@ public final class CloudTuneViewModel {
     // MARK: - Playback, Queue & Write-Through Backfill
 
     public func playNext(_ track: TrackSummary) {
-        upNextQueue = PlaybackQueueResolver.insertPlayNext(upNext: upNextQueue, track: track)
+        cancelPrefetchTask()
         prefetchedTrackId = nil
+        upNextQueue = PlaybackQueueResolver.insertPlayNext(upNext: upNextQueue, track: track)
         statusMessage = "已设为下一首播放：《\(track.name)》"
-        Task { await maybePrefetchUpcomingTrack() }
+        triggerPrefetchIfNeeded()
     }
 
     public func appendToQueue(_ track: TrackSummary) {
@@ -1362,7 +1407,10 @@ public final class CloudTuneViewModel {
     }
 
     public func toggleShuffle() {
+        cancelPrefetchTask()
+        prefetchedTrackId = nil
         shuffle.toggle()
+        triggerPrefetchIfNeeded()
     }
 
     public func cycleLoopMode() {
@@ -1384,16 +1432,20 @@ public final class CloudTuneViewModel {
         resumeTime: Double = 0,
         isRecoveryRetry: Bool = false
     ) async {
-        guard let accountId = activeAccountKey, let cacheStore else { return }
+        guard isAuthenticated, let accountId = activeAccountKey, let capturedStore = cacheStore else { return }
         retrySleepTask?.cancel()
         retrySleepTask = nil
+        let wasPrefetchingTarget = (prefetchingTrackId == track.id)
+        if !wasPrefetchingTarget {
+            cancelPrefetchTask()
+        }
         playbackGeneration += 1
         let gen = playbackGeneration
+        currentPlayerItem = nil
         activeTrack = track
         currentTrackId = track.id
         loadingTrackId = track.id
         prefetchedTrackId = nil
-        prefetchingTrackId = nil
         if shuffle && !shuffleOrderIds.contains(track.id) && tracks.contains(where: { $0.id == track.id }) {
             shuffleOrderIds = PlaybackQueueResolver.buildShuffleOrder(tracks: tracks, anchorTrackId: track.id)
         }
@@ -1408,10 +1460,18 @@ public final class CloudTuneViewModel {
         let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
 
         do {
-            await cacheStore.setProtectedTrackIDs([track.id])
-            if let cachedURL = await cacheStore.existingCachedFile(trackId: track.id) {
-                let usage = await cacheStore.usageBytes()
-                guard gen == playbackGeneration, isAuthenticated else { return }
+            await capturedStore.setProtectedTrackIDs([track.id])
+            if let cachedURL = await capturedStore.existingCachedFile(trackId: track.id) {
+                if wasPrefetchingTarget {
+                    cancelPrefetchTask()
+                }
+                let usage = await capturedStore.usageBytes()
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == accountId,
+                      cacheStore === capturedStore else {
+                    return
+                }
                 cacheUsageBytes = usage
                 try await startAVPlayer(
                     track: track,
@@ -1419,56 +1479,100 @@ public final class CloudTuneViewModel {
                     localFileURL: cachedURL,
                     isLoopback: false,
                     resumeTime: resumeTime,
-                    generation: gen
+                    generation: gen,
+                    expectedAccount: accountId
                 )
                 return
             }
 
-            let downloadFirst = PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
-                mode: effectiveMode,
-                sizeBytes: track.sizeBytes,
-                forceStreamProxy: forceStreamProxy
-            )
+            let destURL = await capturedStore.cacheFileURL(trackId: track.id, originalFileName: track.name)
+            let hasInFlightDownload: Bool
+            if wasPrefetchingTarget {
+                hasInFlightDownload = true
+            } else {
+                hasInFlightDownload = await transferEngine.hasInFlightCacheDownload(for: destURL)
+            }
+            guard gen == playbackGeneration,
+                  isAuthenticated,
+                  activeAccountKey == accountId,
+                  cacheStore === capturedStore else {
+                return
+            }
+            if forceStreamProxy && wasPrefetchingTarget {
+                cancelPrefetchTask()
+            }
+
+            let downloadFirst = (!forceStreamProxy && hasInFlightDownload)
+                || PlaybackDecisionPolicy.shouldDownloadBeforePlayback(
+                    mode: effectiveMode,
+                    sizeBytes: track.sizeBytes,
+                    forceStreamProxy: forceStreamProxy
+                )
 
             if downloadFirst {
                 let downloadedURL = try await transferEngine.downloadTrackToCache(
                     track: track,
-                    cacheStore: cacheStore,
+                    cacheStore: capturedStore,
                     parallelThreads: committedSettings.downloadThreads,
                     cacheLimitBytes: committedSettings.cacheLimitBytes,
                     kind: "playback",
                     accountHash: accountHash
                 )
-                guard gen == playbackGeneration, isAuthenticated else { return }
-                cacheUsageBytes = await cacheStore.usageBytes()
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == accountId,
+                      cacheStore === capturedStore else {
+                    return
+                }
+                let latestUsage = await capturedStore.usageBytes()
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == accountId,
+                      cacheStore === capturedStore else {
+                    return
+                }
+                cacheUsageBytes = latestUsage
                 try await startAVPlayer(
                     track: track,
                     url: downloadedURL,
                     localFileURL: downloadedURL,
                     isLoopback: false,
                     resumeTime: resumeTime,
-                    generation: gen
+                    generation: gen,
+                    expectedAccount: accountId
                 )
             } else {
                 let remoteURL = try await cloudClient.resolveDownloadURL(fileId: track.id)
-                guard gen == playbackGeneration, isAuthenticated else { return }
-                let destURL = await cacheStore.cacheFileURL(trackId: track.id, originalFileName: track.name)
+                guard gen == playbackGeneration,
+                      isAuthenticated,
+                      activeAccountKey == accountId,
+                      cacheStore === capturedStore else {
+                    return
+                }
                 let playbackURL: URL
+                let registeredToken: String?
                 if let streamServer {
-                    playbackURL = await streamServer.registerSource(
-                        StreamSourceRegistration(
-                            accountHash: accountHash,
-                            trackId: track.id,
-                            remoteURL: remoteURL,
-                            cacheDestinationURL: destURL,
-                            expectedSize: track.sizeBytes,
-                            fileName: track.name,
-                            cacheLimitBytes: committedSettings.cacheLimitBytes
-                        ),
-                        cacheStore: cacheStore
+                    let reg = StreamSourceRegistration(
+                        accountHash: accountHash,
+                        trackId: track.id,
+                        remoteURL: remoteURL,
+                        cacheDestinationURL: destURL,
+                        expectedSize: track.sizeBytes,
+                        fileName: track.name,
+                        cacheLimitBytes: committedSettings.cacheLimitBytes
                     )
+                    playbackURL = await streamServer.registerSource(reg, cacheStore: capturedStore)
+                    guard gen == playbackGeneration,
+                          isAuthenticated,
+                          activeAccountKey == accountId,
+                          cacheStore === capturedStore else {
+                        await streamServer.revokeSource(token: reg.token)
+                        return
+                    }
+                    registeredToken = reg.token
                 } else {
                     playbackURL = remoteURL
+                    registeredToken = nil
                 }
                 try await startAVPlayer(
                     track: track,
@@ -1476,13 +1580,19 @@ public final class CloudTuneViewModel {
                     localFileURL: destURL,
                     isLoopback: true,
                     resumeTime: resumeTime,
-                    generation: gen
+                    generation: gen,
+                    expectedAccount: accountId,
+                    registeredSourceToken: registeredToken
                 )
             }
         } catch is CancellationError {
             return
         } catch {
-            guard gen == playbackGeneration, isAuthenticated else { return }
+            guard gen == playbackGeneration,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return
+            }
             await handlePlaybackPreparationFailure(
                 track: track,
                 error: error,
@@ -1498,8 +1608,18 @@ public final class CloudTuneViewModel {
         localFileURL: URL,
         isLoopback: Bool,
         resumeTime: Double,
-        generation: Int
+        generation: Int,
+        expectedAccount: String,
+        registeredSourceToken: String? = nil
     ) async throws {
+        guard generation == playbackGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            if let token = registeredSourceToken {
+                await streamServer?.revokeSource(token: token)
+            }
+            return
+        }
         if let audioSessionWarning = nowPlayingCoordinator.configureAudioSessionIfNeeded() {
             statusMessage = audioSessionWarning
         }
@@ -1517,6 +1637,8 @@ public final class CloudTuneViewModel {
             Task { @MainActor [weak self] in
                 guard let self,
                       generation == self.playbackGeneration,
+                      self.isAuthenticated,
+                      self.activeAccountKey == expectedAccount,
                       observedItem === self._player?.currentItem else { return }
                 switch currentStatus {
                 case .readyToPlay:
@@ -1524,6 +1646,17 @@ public final class CloudTuneViewModel {
                     let dur = observedItem.duration.seconds
                     if dur.isFinite && dur > 0 {
                         self.duration = dur
+                        let rawElapsed = self._player?.currentTime().seconds ?? self.currentTime
+                        let liveElapsed = (rawElapsed.isFinite && rawElapsed >= 0) ? rawElapsed : self.currentTime
+                        let rate: Double? = (self._player?.timeControlStatus == .waitingToPlayAtSpecifiedRate) ? 0.0 : nil
+                        self.nowPlayingCoordinator.updateNowPlaying(
+                            metadata: self.nowPlayingMetadata,
+                            isPlaying: self.isPlaying,
+                            elapsedSeconds: liveElapsed,
+                            durationSeconds: dur,
+                            playbackRate: rate,
+                            forceUpdate: true
+                        )
                     }
                 case .failed:
                     self.itemStatusObservation?.invalidate()
@@ -1542,11 +1675,38 @@ public final class CloudTuneViewModel {
                 }
             }
         }
+        guard generation == playbackGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            itemStatusObservation?.invalidate()
+            itemStatusObservation = nil
+            if let token = registeredSourceToken {
+                await streamServer?.revokeSource(token: token)
+            }
+            return
+        }
+        currentPlayerItem = item
         player.volume = Float(volume)
         player.replaceCurrentItem(with: item)
         if resumeTime > 0 {
             await player.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 600))
-            guard generation == playbackGeneration, isAuthenticated else { return }
+        }
+        guard generation == playbackGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            itemStatusObservation?.invalidate()
+            itemStatusObservation = nil
+            if _player?.currentItem === item {
+                _player?.pause()
+                _player?.replaceCurrentItem(with: nil)
+            }
+            if currentPlayerItem === item {
+                currentPlayerItem = nil
+            }
+            if let token = registeredSourceToken {
+                await streamServer?.revokeSource(token: token)
+            }
+            return
         }
         player.play()
         isPlaying = true
@@ -1556,14 +1716,22 @@ public final class CloudTuneViewModel {
 
         let fallbackAlbum = track.folderPath.isEmpty ? (committedSettings.musicFolder?.name ?? "天翼云盘") : track.folderPath
         let meta = await AudioMetadataReader.readMetadata(from: localFileURL, fallbackTitle: track.name, fallbackAlbum: fallbackAlbum)
-        guard generation == playbackGeneration else { return }
+        guard generation == playbackGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            return
+        }
         nowPlayingMetadata = meta
         syncRemoteCommandAvailability()
+        let rawPlayerSeconds = _player?.currentTime().seconds ?? currentTime
+        let liveElapsed = (rawPlayerSeconds.isFinite && rawPlayerSeconds >= 0) ? rawPlayerSeconds : max(0, resumeTime)
+        let rate: Double? = (hasActivePlayerObservers && _player?.timeControlStatus == .waitingToPlayAtSpecifiedRate) ? 0.0 : nil
         nowPlayingCoordinator.updateNowPlaying(
             metadata: meta,
             isPlaying: isPlaying,
-            elapsedSeconds: resumeTime,
+            elapsedSeconds: liveElapsed,
             durationSeconds: duration,
+            playbackRate: rate,
             forceUpdate: true
         )
     }
@@ -1831,14 +1999,22 @@ public final class CloudTuneViewModel {
     }
 
     public func seekPlayback(to seconds: Double) async {
+        let expectedGen = playbackGeneration
+        let expectedAccount = activeAccountKey
         let clamped = max(0, min(seconds, duration > 0 ? duration : seconds))
         currentTime = clamped
         await player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+        guard expectedGen == playbackGeneration,
+              isAuthenticated,
+              activeAccountKey == expectedAccount else {
+            return
+        }
         nowPlayingCoordinator.updateNowPlaying(
             metadata: nowPlayingMetadata,
             isPlaying: isPlaying,
             elapsedSeconds: clamped,
             durationSeconds: duration,
+            playbackRate: (hasActivePlayerObservers && _player?.timeControlStatus == .waitingToPlayAtSpecifiedRate) ? 0.0 : nil,
             forceUpdate: true
         )
     }
@@ -1846,14 +2022,15 @@ public final class CloudTuneViewModel {
     // MARK: - Video (Loopback Proxy + Safe External Handoff) & Transfers
 
     public func openVideoInApp(_ video: TrackSummary) async {
-        guard isAuthenticated else { return }
+        guard isAuthenticated, let expectedAccount = activeAccountKey else { return }
         retrySleepTask?.cancel()
         retrySleepTask = nil
+        cancelPrefetchTask()
+        prefetchedTrackId = nil
         playbackGeneration += 1
         externalVideoGeneration += 1
         pendingExternalVideoChoice = nil
         let gen = playbackGeneration
-        let expectedAccount = activeAccountKey
         recoveryAttempts = 0
         pauseIfPlaying()
         let assignedBusy = "准备视频流 \(video.name)..."
@@ -1883,6 +2060,7 @@ public final class CloudTuneViewModel {
                 return
             }
             let playbackURL: URL
+            let registeredToken: String?
             if let streamServer, let capturedStore = cacheStore, let accountId = activeAccountKey, accountId == expectedAccount {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
                 let destURL = await capturedStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
@@ -1892,24 +2070,27 @@ public final class CloudTuneViewModel {
                       cacheStore === capturedStore else {
                     return
                 }
-                playbackURL = await streamServer.registerSource(
-                    StreamSourceRegistration(
-                        accountHash: accountHash,
-                        trackId: video.id,
-                        remoteURL: remoteURL,
-                        cacheDestinationURL: destURL,
-                        expectedSize: video.sizeBytes,
-                        fileName: video.name,
-                        cacheLimitBytes: committedSettings.cacheLimitBytes
-                    ),
-                    cacheStore: capturedStore
+                let reg = StreamSourceRegistration(
+                    accountHash: accountHash,
+                    trackId: video.id,
+                    remoteURL: remoteURL,
+                    cacheDestinationURL: destURL,
+                    expectedSize: video.sizeBytes,
+                    fileName: video.name,
+                    cacheLimitBytes: committedSettings.cacheLimitBytes
                 )
+                playbackURL = await streamServer.registerSource(reg, cacheStore: capturedStore)
+                registeredToken = reg.token
             } else {
                 playbackURL = remoteURL
+                registeredToken = nil
             }
             guard gen == playbackGeneration,
                   isAuthenticated,
                   activeAccountKey == expectedAccount else {
+                if let token = registeredToken {
+                    await streamServer?.revokeSource(token: token)
+                }
                 return
             }
             activeVideoTrack = video
@@ -1933,10 +2114,9 @@ public final class CloudTuneViewModel {
         _ video: TrackSummary,
         prepareLoopbackStream: Bool = true
     ) async -> URL? {
-        guard isAuthenticated else { return nil }
+        guard isAuthenticated, let expectedAccount = activeAccountKey else { return nil }
         externalVideoGeneration += 1
         let extGen = externalVideoGeneration
-        let expectedAccount = activeAccountKey
         let assignedBusy = "检查本地视频缓存 \(video.name)..."
         busyLabel = assignedBusy
         defer {
@@ -1971,6 +2151,7 @@ public final class CloudTuneViewModel {
                 return nil
             }
             let loopbackStreamURL: URL?
+            let registeredToken: String?
             if let streamServer, let capturedStore = cacheStore, let accountId = activeAccountKey, accountId == expectedAccount {
                 let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
                 let destURL = await capturedStore.cacheFileURL(trackId: video.id, originalFileName: video.name)
@@ -1980,24 +2161,27 @@ public final class CloudTuneViewModel {
                       cacheStore === capturedStore else {
                     return nil
                 }
-                loopbackStreamURL = await streamServer.registerSource(
-                    StreamSourceRegistration(
-                        accountHash: accountHash,
-                        trackId: video.id,
-                        remoteURL: remoteURL,
-                        cacheDestinationURL: destURL,
-                        expectedSize: video.sizeBytes,
-                        fileName: video.name,
-                        cacheLimitBytes: committedSettings.cacheLimitBytes
-                    ),
-                    cacheStore: capturedStore
+                let reg = StreamSourceRegistration(
+                    accountHash: accountHash,
+                    trackId: video.id,
+                    remoteURL: remoteURL,
+                    cacheDestinationURL: destURL,
+                    expectedSize: video.sizeBytes,
+                    fileName: video.name,
+                    cacheLimitBytes: committedSettings.cacheLimitBytes
                 )
+                loopbackStreamURL = await streamServer.registerSource(reg, cacheStore: capturedStore)
+                registeredToken = reg.token
             } else {
                 loopbackStreamURL = nil
+                registeredToken = nil
             }
             guard extGen == externalVideoGeneration,
                   isAuthenticated,
                   activeAccountKey == expectedAccount else {
+                if let token = registeredToken {
+                    await streamServer?.revokeSource(token: token)
+                }
                 return nil
             }
             pendingExternalVideoChoice = PendingExternalVideoChoice(video: video, streamURL: loopbackStreamURL)
@@ -2095,20 +2279,38 @@ public final class CloudTuneViewModel {
     }
 
     public func enqueueFolderDownload(from pane: BrowserPaneState, explicitDirectoryURL: URL? = nil) async {
-        guard let payload = pane.payload, let accountId = activeAccountKey else { return }
+        guard isAuthenticated, let payload = pane.payload, let accountId = activeAccountKey else { return }
+        let expectedAuthGen = authGeneration
         let nonRootCrumbs = pane.breadcrumbs.filter { $0.id != nil && $0.id != Cloud189Constants.rootFolderId }
         let crumbPath: String? = (!payload.isRoot && nonRootCrumbs.last?.id == payload.currentFolderId)
             ? nonRootCrumbs.map(\.name).filter { !$0.isEmpty }.joined(separator: "/")
             : nil
         let rootExportFolder = (crumbPath?.isEmpty == false ? crumbPath! : payload.currentFolderName)
-        busyLabel = "扫描文件夹 \(payload.currentFolderName)..."
-        defer { busyLabel = nil }
+        let assignedBusy = "扫描文件夹 \(payload.currentFolderName)..."
+        busyLabel = assignedBusy
+        operationBusyToken += 1
+        let myBusyToken = operationBusyToken
+        defer {
+            if operationBusyToken == myBusyToken, busyLabel == assignedBusy {
+                busyLabel = nil
+            }
+        }
         do {
             let allFiles = try await cloudClient.scanAllFiles(
                 folderId: payload.currentFolderId,
                 folderName: rootExportFolder
             )
+            guard authGeneration == expectedAuthGen,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return
+            }
             for item in allFiles {
+                guard authGeneration == expectedAuthGen,
+                      isAuthenticated,
+                      activeAccountKey == accountId else {
+                    return
+                }
                 let rel = item.folderPath.hasPrefix(rootExportFolder)
                     ? "\(item.folderPath)/\(item.name)"
                     : "\(rootExportFolder)/\(item.name)"
@@ -2121,11 +2323,22 @@ public final class CloudTuneViewModel {
                     accountStore: accountStore
                 )
             }
-            transferSnapshot = await transferEngine.snapshot()
+            let latestSnap = await transferEngine.snapshot()
+            guard authGeneration == expectedAuthGen,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return
+            }
+            transferSnapshot = latestSnap
             statusMessage = "目录下载已入队（共 \(allFiles.count) 个文件）"
         } catch is CancellationError {
             return
         } catch {
+            guard authGeneration == expectedAuthGen,
+                  isAuthenticated,
+                  activeAccountKey == accountId else {
+                return
+            }
             statusMessage = error.localizedDescription
         }
     }
@@ -2145,8 +2358,9 @@ public final class CloudTuneViewModel {
         transferSnapshot = await transferEngine.snapshot()
     }
 
-    public func saveExportDirectoryBookmark(_ url: URL) async {
-        guard let accountId = activeAccountKey else { return }
+    @discardableResult
+    public func saveExportDirectoryBookmark(_ url: URL) async -> Bool {
+        guard isAuthenticated, let accountId = activeAccountKey else { return false }
         let baseSnapshot = committedSettings
         let seqBox = SettingsMutationSequenceBox()
         let sequenceGenerator = settingsSequence
@@ -2159,16 +2373,18 @@ public final class CloudTuneViewModel {
                     seqBox.store(sequenceGenerator.next())
                 }
             )
-            guard isAuthenticated, activeAccountKey == accountId else { return }
+            guard isAuthenticated, activeAccountKey == accountId else { return false }
             let seq = seqBox.load()
             if seq >= lastAppliedSettingsSeq {
                 lastAppliedSettingsSeq = seq
                 committedSettings = result.settings
             }
             statusMessage = "下载导出目录已设为 \(result.displayName)"
+            return true
         } catch {
-            guard isAuthenticated, activeAccountKey == accountId else { return }
+            guard isAuthenticated, activeAccountKey == accountId else { return false }
             statusMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -2234,56 +2450,31 @@ public final class CloudTuneViewModel {
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
             queue: .main
         ) { [weak self] cmTime in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self else { return }
                 let secs = cmTime.seconds
                 if secs.isFinite && secs >= 0 {
                     self.currentTime = secs
                 }
-                if let itemDur = self.player.currentItem?.duration.seconds, itemDur.isFinite, itemDur > 0 {
+                if let itemDur = self._player?.currentItem?.duration.seconds, itemDur.isFinite, itemDur > 0 {
                     self.duration = itemDur
                 }
-                self.nowPlayingCoordinator.updateNowPlaying(
-                    metadata: self.nowPlayingMetadata,
-                    isPlaying: self.isPlaying,
-                    elapsedSeconds: self.currentTime,
-                    durationSeconds: self.duration
-                )
-                await self.maybePrefetchUpcomingTrack()
+                self.triggerPrefetchIfNeeded()
             }
         }
 
         timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] observedPlayer, _ in
             let status = observedPlayer.timeControlStatus
-            Task { @MainActor [weak self] in
-                guard let self, self.currentTrack != nil, self.loadingTrackId == nil else { return }
-                switch status {
-                case .playing:
-                    if !self.isPlaying {
-                        self.isPlaying = true
-                        self.nowPlayingCoordinator.updateNowPlaying(
-                            metadata: self.nowPlayingMetadata,
-                            isPlaying: true,
-                            elapsedSeconds: self.currentTime,
-                            durationSeconds: self.duration,
-                            forceUpdate: true
-                        )
-                    }
-                case .paused:
-                    if self.isPlaying && observedPlayer.currentItem != nil {
-                        self.isPlaying = false
-                        self.nowPlayingCoordinator.updateNowPlaying(
-                            metadata: self.nowPlayingMetadata,
-                            isPlaying: false,
-                            elapsedSeconds: self.currentTime,
-                            durationSeconds: self.duration,
-                            forceUpdate: true
-                        )
-                    }
-                case .waitingToPlayAtSpecifiedRate:
-                    break
-                @unknown default:
-                    break
+            let rawSeconds = observedPlayer.currentTime().seconds
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    self?.handleTimeControlStatusChange(status: status, rawSeconds: rawSeconds)
+                }
+            } else {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let latestRaw = self._player?.currentTime().seconds ?? rawSeconds
+                    self.handleTimeControlStatusChange(status: status, rawSeconds: latestRaw)
                 }
             }
         }
@@ -2358,11 +2549,67 @@ public final class CloudTuneViewModel {
         syncRemoteCommandAvailability()
     }
 
+    private func handleTimeControlStatusChange(
+        status: AVPlayer.TimeControlStatus,
+        rawSeconds: Double
+    ) {
+        guard currentTrack != nil,
+              let activeItem = _player?.currentItem,
+              activeItem === currentPlayerItem else {
+            return
+        }
+        let finiteSeconds = (rawSeconds.isFinite && rawSeconds >= 0) ? rawSeconds : nil
+        switch status {
+        case .waitingToPlayAtSpecifiedRate:
+            let liveElapsed = finiteSeconds ?? currentTime
+            if let finiteSeconds {
+                currentTime = finiteSeconds
+            }
+            nowPlayingCoordinator.updateNowPlaying(
+                metadata: nowPlayingMetadata,
+                isPlaying: isPlaying,
+                elapsedSeconds: liveElapsed,
+                durationSeconds: duration,
+                playbackRate: 0.0,
+                forceUpdate: true
+            )
+        case .playing:
+            isPlaying = true
+            if let finiteSeconds {
+                currentTime = finiteSeconds
+            }
+            nowPlayingCoordinator.updateNowPlaying(
+                metadata: nowPlayingMetadata,
+                isPlaying: true,
+                elapsedSeconds: currentTime,
+                durationSeconds: duration,
+                playbackRate: 1.0,
+                forceUpdate: true
+            )
+        case .paused:
+            isPlaying = false
+            if let finiteSeconds {
+                currentTime = finiteSeconds
+            }
+            nowPlayingCoordinator.updateNowPlaying(
+                metadata: nowPlayingMetadata,
+                isPlaying: false,
+                elapsedSeconds: currentTime,
+                durationSeconds: duration,
+                playbackRate: 0.0,
+                forceUpdate: true
+            )
+        @unknown default:
+            break
+        }
+    }
+
     public func teardownPlayerAndRemoteCommands() {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        currentPlayerItem = nil
         if let token = timeObserverToken {
             _player?.removeTimeObserver(token)
             timeObserverToken = nil
@@ -2379,8 +2626,14 @@ public final class CloudTuneViewModel {
         hasActivePlayerObservers = false
     }
 
-    private func maybePrefetchUpcomingTrack() async {
-        guard isAuthenticated, loopMode != .one, let cacheStore, currentTrack != nil else { return }
+    public func triggerPrefetchIfNeeded() {
+        guard isAuthenticated,
+              loopMode != .one,
+              let capturedStore = cacheStore,
+              let expectedAccount = activeAccountKey,
+              currentTrack != nil else {
+            return
+        }
         let remaining = duration - currentTime
         let shouldPrefetch = (committedSettings.playbackMode == .downloadFirst)
             || (remaining.isFinite && remaining > 0 && remaining <= 30)
@@ -2395,30 +2648,93 @@ public final class CloudTuneViewModel {
             loopMode: loopMode
         ),
         next.id != prefetchedTrackId,
-        next.id != prefetchingTrackId else { return }
+        next.id != prefetchingTrackId else {
+            return
+        }
 
+        prefetchTask?.cancel()
         prefetchingTrackId = next.id
+        let expectedAuthGen = authGeneration
+        let expectedPlayGen = playbackGeneration
         let activeId = currentTrackId ?? ""
-        let accountHash = activeAccountKey.map { Cloud189Protocol.accountBucketHash(for: $0) }
-        await cacheStore.setProtectedTrackIDs([activeId, next.id])
-        Task { [weak self] in
+        let accountHash = Cloud189Protocol.accountBucketHash(for: expectedAccount)
+        let cacheThreads = committedSettings.cacheThreads
+        let cacheLimitBytes = committedSettings.cacheLimitBytes
+
+        let spawned = Task { @MainActor [weak self] in
             guard let self else { return }
-            do {
-                _ = try await self.transferEngine.downloadTrackToCache(
-                    track: next,
-                    cacheStore: cacheStore,
-                    parallelThreads: self.committedSettings.cacheThreads,
-                    cacheLimitBytes: self.committedSettings.cacheLimitBytes,
-                    kind: "prefetch",
-                    accountHash: accountHash
-                )
-                self.prefetchedTrackId = next.id
-            } catch {
-                // Best-effort prefetch; errors do not interrupt active playback
-            }
+            await self.performPrefetchUpcomingTrack(
+                next: next,
+                activeId: activeId,
+                expectedAuthGen: expectedAuthGen,
+                expectedPlayGen: expectedPlayGen,
+                expectedAccount: expectedAccount,
+                accountHash: accountHash,
+                capturedStore: capturedStore,
+                cacheThreads: cacheThreads,
+                cacheLimitBytes: cacheLimitBytes
+            )
+        }
+        prefetchTask = spawned
+    }
+
+    private func performPrefetchUpcomingTrack(
+        next: TrackSummary,
+        activeId: String,
+        expectedAuthGen: Int,
+        expectedPlayGen: Int,
+        expectedAccount: String,
+        accountHash: String,
+        capturedStore: CacheStore,
+        cacheThreads: Int,
+        cacheLimitBytes: UInt64
+    ) async {
+        defer {
             if self.prefetchingTrackId == next.id {
                 self.prefetchingTrackId = nil
             }
+        }
+        await capturedStore.setProtectedTrackIDs([activeId, next.id])
+        if await capturedStore.existingCachedFile(trackId: next.id) != nil {
+            guard !Task.isCancelled,
+                  self.authGeneration == expectedAuthGen,
+                  self.playbackGeneration == expectedPlayGen,
+                  self.isAuthenticated,
+                  self.activeAccountKey == expectedAccount,
+                  self.cacheStore === capturedStore else {
+                return
+            }
+            self.prefetchedTrackId = next.id
+            return
+        }
+        guard !Task.isCancelled,
+              self.authGeneration == expectedAuthGen,
+              self.playbackGeneration == expectedPlayGen,
+              self.isAuthenticated,
+              self.activeAccountKey == expectedAccount,
+              self.cacheStore === capturedStore else {
+            return
+        }
+        do {
+            _ = try await self.transferEngine.downloadTrackToCache(
+                track: next,
+                cacheStore: capturedStore,
+                parallelThreads: cacheThreads,
+                cacheLimitBytes: cacheLimitBytes,
+                kind: "prefetch",
+                accountHash: accountHash
+            )
+            guard !Task.isCancelled,
+                  self.authGeneration == expectedAuthGen,
+                  self.playbackGeneration == expectedPlayGen,
+                  self.isAuthenticated,
+                  self.activeAccountKey == expectedAccount,
+                  self.cacheStore === capturedStore else {
+                return
+            }
+            self.prefetchedTrackId = next.id
+        } catch {
+            // Best-effort prefetch; errors do not interrupt active playback
         }
     }
 }

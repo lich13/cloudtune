@@ -9,6 +9,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
     public var totalSize: UInt64
     public var partCount: Int
     public var state: String
+    public var exportBookmarkData: Data? = nil
 
     private enum CodingKeys: String, CodingKey {
         case taskId
@@ -20,6 +21,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         case totalSize
         case partCount
         case state
+        case exportBookmarkData
     }
 
     public init(
@@ -30,7 +32,8 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         relativeExportSubpath: String,
         totalSize: UInt64,
         partCount: Int,
-        state: String
+        state: String,
+        exportBookmarkData: Data? = nil
     ) {
         self.taskId = taskId
         self.accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
@@ -40,6 +43,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.totalSize = totalSize
         self.partCount = partCount
         self.state = state
+        self.exportBookmarkData = exportBookmarkData
     }
 
     public init(
@@ -50,7 +54,8 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         relativeExportSubpath: String,
         totalSize: UInt64,
         partCount: Int,
-        state: String
+        state: String,
+        exportBookmarkData: Data? = nil
     ) {
         self.taskId = taskId
         self.accountHash = accountHash
@@ -60,6 +65,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.totalSize = totalSize
         self.partCount = partCount
         self.state = state
+        self.exportBookmarkData = exportBookmarkData
     }
 
     public init(from decoder: Decoder) throws {
@@ -78,6 +84,7 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         self.totalSize = try c.decodeIfPresent(UInt64.self, forKey: .totalSize) ?? 0
         self.partCount = max(1, try c.decodeIfPresent(Int.self, forKey: .partCount) ?? 1)
         self.state = try c.decodeIfPresent(String.self, forKey: .state) ?? "paused"
+        self.exportBookmarkData = try c.decodeIfPresent(Data.self, forKey: .exportBookmarkData)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -89,6 +96,37 @@ public struct StagedDownloadManifest: Codable, Equatable, Sendable {
         try c.encode(totalSize, forKey: .totalSize)
         try c.encode(partCount, forKey: .partCount)
         try c.encode(state, forKey: .state)
+        try c.encodeIfPresent(exportBookmarkData, forKey: .exportBookmarkData)
+    }
+}
+
+private final class ActiveTaskCancellationBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellers: [UUID: @Sendable () -> Void] = [:]
+
+    func register(_ cancel: @escaping @Sendable () -> Void) -> UUID {
+        let id = UUID()
+        lock.withLock {
+            cancellers[id] = cancel
+        }
+        return id
+    }
+
+    func unregister(_ id: UUID) {
+        _ = lock.withLock {
+            cancellers.removeValue(forKey: id)
+        }
+    }
+
+    func cancelAll() {
+        let active = lock.withLock { () -> [@Sendable () -> Void] in
+            let all = Array(cancellers.values)
+            cancellers.removeAll()
+            return all
+        }
+        for cancel in active {
+            cancel()
+        }
     }
 }
 
@@ -105,6 +143,7 @@ public actor TransferEngine {
     private let semaphore: GlobalTransferSemaphore
     private let fetcher: UpstreamStreamFetcher
     private let urlResolver: @Sendable (String) async throws -> URL
+    private nonisolated let cancellationBag = ActiveTaskCancellationBag()
     private var statuses: [String: TransferStatus] = [:]
     private var statusAccountHashes: [String: String] = [:]
     private var manifests: [String: StagedDownloadManifest] = [:]
@@ -136,6 +175,15 @@ public actor TransferEngine {
 
     public func hasActiveTransfers() -> Bool {
         statuses.values.contains { $0.state == "running" || $0.state == "streaming" }
+    }
+
+    public func hasInFlightCacheDownload(for cacheFileURL: URL) -> Bool {
+        let cacheKey = cacheFileURL.standardizedFileURL.path
+        return inFlightCacheDownloads[cacheKey] != nil
+    }
+
+    public nonisolated func cancelAllImmediate() {
+        cancellationBag.cancelAll()
     }
 
     private func notifyActivityChanged(force: Bool = false) {
@@ -311,6 +359,11 @@ public actor TransferEngine {
                 cacheLimitBytes: cacheLimitBytes
             )
         }
+        let bagToken = cancellationBag.register { worker.cancel() }
+        Task { [cancellationBag] in
+            _ = await worker.result
+            cancellationBag.unregister(bagToken)
+        }
         inFlightCacheDownloads[cacheKey] = InFlightCacheDownload(
             workerID: workerID,
             cacheKey: cacheKey,
@@ -418,6 +471,10 @@ public actor TransferEngine {
         let taskId = "download:\(UUID().uuidString.lowercased())"
         let partCount = min(max(1, parallelThreads), 16)
         let accountHash = Cloud189Protocol.accountBucketHash(for: accountId)
+        let exportBookmarkData = await accountStore.captureExportBookmarkData(
+            explicitDirectoryURL: explicitDirectoryURL,
+            for: accountId
+        )
         let manifest = StagedDownloadManifest(
             taskId: taskId,
             accountHash: accountHash,
@@ -426,7 +483,8 @@ public actor TransferEngine {
             relativeExportSubpath: relativeExportSubpath,
             totalSize: track.sizeBytes,
             partCount: partCount,
-            state: "running"
+            state: "running",
+            exportBookmarkData: exportBookmarkData
         )
         manifests[taskId] = manifest
         manifestAccountKeys[taskId] = accountId
@@ -472,6 +530,13 @@ public actor TransferEngine {
 
     public func resumeTransfer(id: String, explicitDirectoryURL: URL? = nil, accountStore: AccountScopedStore) async {
         guard var m = manifests[id], let accountKey = manifestAccountKeys[id] else { return }
+        if let explicitDirectoryURL,
+           let refreshedBookmark = await accountStore.captureExportBookmarkData(
+               explicitDirectoryURL: explicitDirectoryURL,
+               for: accountKey
+           ) {
+            m.exportBookmarkData = refreshedBookmark
+        }
         m.state = "running"
         manifests[id] = m
         statusAccountHashes[id] = m.accountHash
@@ -510,7 +575,7 @@ public actor TransferEngine {
     ) {
         let id = manifest.taskId
         runningTasks[id]?.cancel()
-        runningTasks[id] = Task {
+        let task = Task<Void, Error> {
             await self.runExportWorkflow(
                 manifest: manifest,
                 accountKey: accountKey,
@@ -518,6 +583,12 @@ public actor TransferEngine {
                 accountStore: accountStore
             )
         }
+        let bagToken = cancellationBag.register { task.cancel() }
+        Task { [cancellationBag] in
+            _ = await task.result
+            cancellationBag.unregister(bagToken)
+        }
+        runningTasks[id] = task
     }
 
     private func runExportWorkflow(
@@ -565,8 +636,9 @@ public actor TransferEngine {
             try mergeParts(partsDir: partsDir, partCount: effectiveParts, into: mergedURL, expectedTotal: totalSize)
             let exportedURL = try await accountStore.exportStagedFile(
                 stagedFileURL: mergedURL,
-                relativeSubpath: manifest.relativeExportSubpath,
+                relativeSubpath: updatedManifest.relativeExportSubpath,
                 explicitDirectoryURL: explicitDirectoryURL,
+                manifestBookmarkData: updatedManifest.exportBookmarkData,
                 for: accountKey
             )
             try? fm.removeItem(at: mergedURL)

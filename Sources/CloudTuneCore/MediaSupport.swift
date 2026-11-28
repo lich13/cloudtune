@@ -2,6 +2,8 @@ import AVFoundation
 import CoreImage
 import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 #if canImport(MediaPlayer)
 import MediaPlayer
 #endif
@@ -12,6 +14,9 @@ import UIKit
 #endif
 
 public enum QRCodeGenerator {
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private static let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
     /// Fixed warm-parchment `#F6F1E8` substrate and deep-pine `#13271F` modules across light & dark themes.
     public static func generatePNGData(content: String, dimension: Int = 512) -> Data? {
         guard !content.isEmpty,
@@ -31,9 +36,7 @@ public enum QRCodeGenerator {
         let scale = max(1.0, CGFloat(dimension) / max(1.0, colored.extent.width))
         let scaled = colored.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        return context.pngRepresentation(of: scaled, format: .RGBA8, colorSpace: colorSpace)
+        return ciContext.pngRepresentation(of: scaled, format: .RGBA8, colorSpace: sRGBColorSpace)
     }
 }
 
@@ -43,43 +46,112 @@ public enum AudioMetadataReader {
         fallbackTitle: String,
         fallbackAlbum: String
     ) async -> NowPlayingMetadata {
-        var result = NowPlayingMetadata(
-            title: fallbackTitle.isEmpty ? fileURL.deletingPathExtension().lastPathComponent : fallbackTitle,
-            artist: nil,
-            album: fallbackAlbum.isEmpty ? "CloudTune" : fallbackAlbum,
-            artworkData: nil
-        )
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return result
-        }
-        let asset = AVURLAsset(url: fileURL)
-        guard let metadata = try? await asset.load(.commonMetadata) else {
-            return result
-        }
-        for item in metadata {
-            guard let key = item.commonKey else { continue }
-            switch key {
-            case .commonKeyTitle:
-                if let title = try? await item.load(.stringValue), !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.title = title
+        var resolvedTitle = fallbackTitle.isEmpty ? fileURL.deletingPathExtension().lastPathComponent : fallbackTitle
+        var resolvedArtist: String?
+        var resolvedAlbum: String? = fallbackAlbum.isEmpty ? "CloudTune" : fallbackAlbum
+        var rawArtwork: Data?
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            let asset = AVURLAsset(url: fileURL)
+            if let metadata = try? await asset.load(.commonMetadata) {
+                for item in metadata {
+                    guard let key = item.commonKey else { continue }
+                    switch key {
+                    case .commonKeyTitle:
+                        if let title = try? await item.load(.stringValue),
+                           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            resolvedTitle = title
+                        }
+                    case .commonKeyArtist:
+                        if let artist = try? await item.load(.stringValue),
+                           !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            resolvedArtist = artist
+                        }
+                    case .commonKeyAlbumName:
+                        if let album = try? await item.load(.stringValue),
+                           !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            resolvedAlbum = album
+                        }
+                    case .commonKeyArtwork:
+                        if let data = try? await item.load(.dataValue), !data.isEmpty {
+                            rawArtwork = data
+                        }
+                    default:
+                        break
+                    }
                 }
-            case .commonKeyArtist:
-                if let artist = try? await item.load(.stringValue), !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.artist = artist
-                }
-            case .commonKeyAlbumName:
-                if let album = try? await item.load(.stringValue), !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.album = album
-                }
-            case .commonKeyArtwork:
-                if let data = try? await item.load(.dataValue), !data.isEmpty {
-                    result.artworkData = data
-                }
-            default:
-                break
             }
         }
-        return result
+
+        let compactArtwork = rawArtwork.map { compactArtworkData($0) }
+        return NowPlayingMetadata(
+            title: resolvedTitle,
+            artist: resolvedArtist,
+            album: resolvedAlbum,
+            artworkData: compactArtwork
+        )
+    }
+
+    public static func compactArtworkData(_ rawArtwork: Data, maxPixelSize: Int = 1024) -> Data {
+        guard !rawArtwork.isEmpty,
+              let source = CGImageSourceCreateWithData(
+                  rawArtwork as CFData,
+                  [kCGImageSourceShouldCache: false] as CFDictionary
+              ) else {
+            return rawArtwork
+        }
+
+        var originalMaxDimension: Int?
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+           let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+           width > 0,
+           height > 0 {
+            let maxDim = max(width, height)
+            originalMaxDimension = maxDim
+            if maxDim <= maxPixelSize && rawArtwork.count <= 256 * 1024 {
+                return rawArtwork
+            }
+        }
+
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary)
+                ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return rawArtwork
+        }
+        if originalMaxDimension == nil,
+           max(cgImage.width, cgImage.height) < maxPixelSize,
+           rawArtwork.count <= 256 * 1024 {
+            return rawArtwork
+        }
+
+        let hasAlpha: Bool = switch cgImage.alphaInfo {
+        case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly:
+            true
+        case .none, .noneSkipFirst, .noneSkipLast:
+            false
+        @unknown default:
+            false
+        }
+
+        let output = NSMutableData()
+        let typeIdentifier = (hasAlpha ? UTType.png.identifier : UTType.jpeg.identifier) as CFString
+        guard let destination = CGImageDestinationCreateWithData(output, typeIdentifier, 1, nil) else {
+            return rawArtwork
+        }
+        let properties: CFDictionary? = hasAlpha
+            ? nil
+            : ([kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+        CGImageDestinationAddImage(destination, cgImage, properties)
+        guard CGImageDestinationFinalize(destination), output.length > 0 else {
+            return rawArtwork
+        }
+        return output as Data
     }
 }
 
@@ -120,6 +192,56 @@ public struct RemoteCommandCallbacks: Sendable {
     }
 }
 
+private final class RegistrationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    #if canImport(MediaPlayer)
+    private var targets: [(MPRemoteCommand, Any)] = []
+    #endif
+    private var observers: [NSObjectProtocol] = []
+
+    #if canImport(MediaPlayer)
+    func replace(targets newTargets: [(MPRemoteCommand, Any)], observers newObservers: [NSObjectProtocol]) {
+        let (oldTargets, oldObservers) = lock.withLock { () -> ([(MPRemoteCommand, Any)], [NSObjectProtocol]) in
+            let prevT = targets
+            let prevO = observers
+            targets = newTargets
+            observers = newObservers
+            return (prevT, prevO)
+        }
+        for (cmd, target) in oldTargets {
+            cmd.removeTarget(target)
+        }
+        for obs in oldObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+    #endif
+
+    func clearAll() {
+        #if canImport(MediaPlayer)
+        let (oldTargets, oldObservers) = lock.withLock { () -> ([(MPRemoteCommand, Any)], [NSObjectProtocol]) in
+            let prevT = targets
+            let prevO = observers
+            targets.removeAll()
+            observers.removeAll()
+            return (prevT, prevO)
+        }
+        for (cmd, target) in oldTargets {
+            cmd.removeTarget(target)
+        }
+        #else
+        let oldObservers = lock.withLock { () -> [NSObjectProtocol] in
+            let prevO = observers
+            observers.removeAll()
+            return prevO
+        }
+        #endif
+        for obs in oldObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+}
+
 /// Shared system media-center coordinator for BOTH macOS (Control Center / media keys while window hidden)
 /// and iOS/iPadOS (Lock Screen / Dynamic Island).
 @MainActor
@@ -130,21 +252,26 @@ public final class NowPlayingCoordinator {
         let album: String?
         let artworkDigest: SHA256Digest?
         let isPlaying: Bool
+        let effectiveRateTenths: Int
         let roundedDurationTenths: Int
     }
 
-    private var registeredTargets: [(MPRemoteCommand, Any)] = []
-    private var notificationObservers: [NSObjectProtocol] = []
+    private nonisolated let registrations = RegistrationBox()
     private var cachedArtworkDigest: SHA256Digest?
     #if canImport(MediaPlayer)
     private var cachedArtwork: MPMediaItemArtwork?
     #endif
     private var lastPublishedKey: PublishedNowPlayingKey?
     private var lastPublishedElapsed: TimeInterval = 0
+    private var lastPublishedRate: Double = 0
     private var lastPublishedUptime: TimeInterval = 0
     private var lastCommandAvailability: (next: Bool, prev: Bool, seek: Bool)?
 
     public init() {}
+
+    deinit {
+        registrations.clearAll()
+    }
 
     @discardableResult
     public func configureAudioSessionIfNeeded() -> String? {
@@ -166,7 +293,16 @@ public final class NowPlayingCoordinator {
         #if canImport(MediaPlayer)
         unregisterRemoteCommands()
         let center = MPRemoteCommandCenter.shared()
+        let installed = Self.installRemoteHandlers(center: center, callbacks: callbacks)
+        registrations.replace(targets: installed.targets, observers: installed.observers)
+        #endif
+    }
 
+    #if canImport(MediaPlayer)
+    nonisolated private static func installRemoteHandlers(
+        center: MPRemoteCommandCenter,
+        callbacks: RemoteCommandCallbacks
+    ) -> (targets: [(MPRemoteCommand, Any)], observers: [NSObjectProtocol]) {
         let playTarget = center.playCommand.addTarget { _ in
             callbacks.onPlay()
             return .success
@@ -207,7 +343,7 @@ public final class NowPlayingCoordinator {
             return .commandFailed
         }
 
-        registeredTargets = [
+        let targets: [(MPRemoteCommand, Any)] = [
             (center.playCommand, playTarget),
             (center.pauseCommand, pauseTarget),
             (center.togglePlayPauseCommand, toggleTarget),
@@ -218,11 +354,13 @@ public final class NowPlayingCoordinator {
             (center.changePlaybackPositionCommand, seekTarget)
         ]
 
+        var observers: [NSObjectProtocol] = []
         #if os(iOS)
         let nc = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
         let interruptionToken = nc.addObserver(
             forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
+            object: session,
             queue: .main
         ) { note in
             let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
@@ -242,7 +380,7 @@ public final class NowPlayingCoordinator {
         }
         let routeToken = nc.addObserver(
             forName: AVAudioSession.routeChangeNotification,
-            object: AVAudioSession.sharedInstance(),
+            object: session,
             queue: .main
         ) { note in
             guard let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
@@ -251,22 +389,14 @@ public final class NowPlayingCoordinator {
                 callbacks.onOldAudioDeviceUnavailable()
             }
         }
-        notificationObservers = [interruptionToken, routeToken]
+        observers = [interruptionToken, routeToken]
         #endif
-        #endif
+        return (targets: targets, observers: observers)
     }
+    #endif
 
     public func unregisterRemoteCommands() {
-        #if canImport(MediaPlayer)
-        for (cmd, target) in registeredTargets {
-            cmd.removeTarget(target)
-        }
-        registeredTargets.removeAll()
-        #endif
-        for obs in notificationObservers {
-            NotificationCenter.default.removeObserver(obs)
-        }
-        notificationObservers.removeAll()
+        registrations.clearAll()
         lastCommandAvailability = nil
     }
 
@@ -294,6 +424,7 @@ public final class NowPlayingCoordinator {
         isPlaying: Bool,
         elapsedSeconds: TimeInterval,
         durationSeconds: TimeInterval,
+        playbackRate: Double? = nil,
         forceUpdate: Bool = false
     ) {
         #if canImport(MediaPlayer)
@@ -303,6 +434,7 @@ public final class NowPlayingCoordinator {
                 center.nowPlayingInfo = nil
                 lastPublishedKey = nil
                 lastPublishedElapsed = 0
+                lastPublishedRate = 0
                 lastPublishedUptime = 0
                 #if os(macOS)
                 center.playbackState = .stopped
@@ -311,9 +443,12 @@ public final class NowPlayingCoordinator {
             return
         }
 
-        let digest = metadata.artworkData.map { SHA256.hash(data: $0) }
+        let digest = metadata.artworkDigest
         let safeDuration = (durationSeconds > 0 && durationSeconds.isFinite) ? durationSeconds : 0
         let safeElapsed = max(0, elapsedSeconds.isFinite ? elapsedSeconds : 0)
+        let resolvedRate = playbackRate ?? (isPlaying ? 1.0 : 0.0)
+        let effectiveRate = resolvedRate.isFinite ? max(0.0, resolvedRate) : (isPlaying ? 1.0 : 0.0)
+        let effectiveRateTenths = Int((effectiveRate * 10).rounded())
         let nowUptime = ProcessInfo.processInfo.systemUptime
         let key = PublishedNowPlayingKey(
             title: metadata.title,
@@ -321,11 +456,12 @@ public final class NowPlayingCoordinator {
             album: metadata.album,
             artworkDigest: digest,
             isPlaying: isPlaying,
+            effectiveRateTenths: effectiveRateTenths,
             roundedDurationTenths: Int((safeDuration * 10).rounded())
         )
 
         if !forceUpdate, let prevKey = lastPublishedKey, prevKey == key {
-            let expectedElapsed = lastPublishedElapsed + (isPlaying ? max(0, nowUptime - lastPublishedUptime) : 0)
+            let expectedElapsed = lastPublishedElapsed + max(0, nowUptime - lastPublishedUptime) * lastPublishedRate
             if abs(safeElapsed - expectedElapsed) < 1.5 {
                 return
             }
@@ -334,7 +470,7 @@ public final class NowPlayingCoordinator {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: metadata.title,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: safeElapsed,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
+            MPNowPlayingInfoPropertyPlaybackRate: effectiveRate
         ]
         if let artist = metadata.artist, !artist.isEmpty {
             info[MPMediaItemPropertyArtist] = artist
@@ -353,6 +489,7 @@ public final class NowPlayingCoordinator {
         center.nowPlayingInfo = info
         lastPublishedKey = key
         lastPublishedElapsed = safeElapsed
+        lastPublishedRate = effectiveRate
         lastPublishedUptime = nowUptime
         #if os(macOS)
         center.playbackState = isPlaying ? .playing : .paused
@@ -365,20 +502,41 @@ public final class NowPlayingCoordinator {
         if cachedArtworkDigest == digest, let cachedArtwork {
             return cachedArtwork
         }
-        let created = makeMediaArtwork(from: data)
+        let created = Self.makeMediaArtwork(from: data)
         cachedArtworkDigest = digest
         cachedArtwork = created
         return created
     }
 
-    private func makeMediaArtwork(from data: Data) -> MPMediaItemArtwork? {
+    nonisolated public static func makeMediaArtwork(from data: Data) -> MPMediaItemArtwork? {
+        guard !data.isEmpty,
+              let src = CGImageSourceCreateWithData(
+                  data as CFData,
+                  [kCGImageSourceShouldCache: false] as CFDictionary
+              ) else {
+            return nil
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 1024
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOptions as CFDictionary)
+                ?? CGImageSourceCreateImageAtIndex(src, 0, nil),
+              cgImage.width > 0,
+              cgImage.height > 0 else {
+            return nil
+        }
+        let boundsSize = CGSize(width: cgImage.width, height: cgImage.height)
         #if os(macOS)
-        guard let img = NSImage(data: data) else { return nil }
-        let size = img.size.width > 0 ? img.size : NSSize(width: 512, height: 512)
-        return MPMediaItemArtwork(boundsSize: size) { _ in img }
+        return MPMediaItemArtwork(boundsSize: boundsSize) { _ in
+            NSImage(cgImage: cgImage, size: boundsSize)
+        }
         #elseif os(iOS)
-        guard let img = UIImage(data: data) else { return nil }
-        return MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        return MPMediaItemArtwork(boundsSize: boundsSize) { _ in
+            UIImage(cgImage: cgImage)
+        }
         #else
         return nil
         #endif

@@ -21,6 +21,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -760,7 +761,7 @@ class TransferEngine(
             }
 
             downloadParts(id, manifest.trackId, remoteUrl, totalSize, effectiveParts, partsDir)
-            ensureActive()
+            currentCoroutineContext().ensureActive()
 
             val orderedParts = (0 until effectiveParts.coerceAtLeast(1)).map { idx ->
                 partFileForIndex(partsDir, idx)
